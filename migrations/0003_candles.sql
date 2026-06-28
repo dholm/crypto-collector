@@ -1,0 +1,91 @@
+-- SPEC-DB-001 migration 0003: candles partitioned OHLCV table (REQ-DB-011/014/015/016).
+--
+-- PK: (market_id, interval, ts) — interval in PK lets 1m and 1d coexist for same (market_id, ts).
+-- volume: NULLABLE — CoinGecko /coins/{id}/ohlc returns no volume (research §2.2, REQ-DB-011).
+-- All OHLCV columns: NUMERIC (REQ-DB-040). No DOUBLE PRECISION.
+-- Partitioning: RANGE(ts), one partition per calendar month (UTC boundaries).
+--
+-- Parent-level indexes inherited by all child partitions (REQ-DB-015):
+--   btree(market_id, interval, ts DESC) — market+interval scoped reads
+--   BRIN(ts)                            — large append-ordered time-range scans
+--
+-- @MX:ANCHOR: [AUTO] candles partition+index contract — btree(market_id, interval, ts DESC) + BRIN(ts)
+-- @MX:REASON: The interval column in the PK is invariant: removing it would collide 1m and 1d rows
+--             on the same (market_id, ts). All OHLCV read paths depend on the index shape.
+--             Changing either requires migrating all downstream candle queries (REQ-DB-011/015).
+
+CREATE TABLE IF NOT EXISTS candles (
+    market_id   BIGINT      NOT NULL
+                    REFERENCES tracked_markets(id) ON DELETE CASCADE,
+    interval    TEXT        NOT NULL,
+    ts          TIMESTAMPTZ NOT NULL,
+    open        NUMERIC     NOT NULL,
+    high        NUMERIC     NOT NULL,
+    low         NUMERIC     NOT NULL,
+    close       NUMERIC     NOT NULL,
+    -- Nullable: CoinGecko /ohlc endpoint returns no volume (REQ-DB-011).
+    -- Exchange fallback providers supply per-candle volume via their kline endpoints.
+    volume      NUMERIC,
+    vs_currency TEXT        NOT NULL,
+    source      TEXT        NOT NULL,
+    PRIMARY KEY (market_id, interval, ts)
+) PARTITION BY RANGE (ts);
+
+-- Parent-level btree: market + interval scoped reads ordered newest-first (REQ-DB-015).
+CREATE INDEX IF NOT EXISTS candles_market_id_interval_ts_idx
+    ON candles (market_id, interval, ts DESC);
+
+-- Parent-level BRIN: large append-ordered time-range scans (REQ-DB-015).
+CREATE INDEX IF NOT EXISTS candles_ts_brin
+    ON candles USING BRIN (ts);
+
+-- ── Monthly partitions: 2024-01 through 2027-12 (UTC boundaries) ──────────────
+
+CREATE TABLE IF NOT EXISTS candles_2024_01 PARTITION OF candles FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+CREATE TABLE IF NOT EXISTS candles_2024_02 PARTITION OF candles FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+CREATE TABLE IF NOT EXISTS candles_2024_03 PARTITION OF candles FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+CREATE TABLE IF NOT EXISTS candles_2024_04 PARTITION OF candles FOR VALUES FROM ('2024-04-01') TO ('2024-05-01');
+CREATE TABLE IF NOT EXISTS candles_2024_05 PARTITION OF candles FOR VALUES FROM ('2024-05-01') TO ('2024-06-01');
+CREATE TABLE IF NOT EXISTS candles_2024_06 PARTITION OF candles FOR VALUES FROM ('2024-06-01') TO ('2024-07-01');
+CREATE TABLE IF NOT EXISTS candles_2024_07 PARTITION OF candles FOR VALUES FROM ('2024-07-01') TO ('2024-08-01');
+CREATE TABLE IF NOT EXISTS candles_2024_08 PARTITION OF candles FOR VALUES FROM ('2024-08-01') TO ('2024-09-01');
+CREATE TABLE IF NOT EXISTS candles_2024_09 PARTITION OF candles FOR VALUES FROM ('2024-09-01') TO ('2024-10-01');
+CREATE TABLE IF NOT EXISTS candles_2024_10 PARTITION OF candles FOR VALUES FROM ('2024-10-01') TO ('2024-11-01');
+CREATE TABLE IF NOT EXISTS candles_2024_11 PARTITION OF candles FOR VALUES FROM ('2024-11-01') TO ('2024-12-01');
+CREATE TABLE IF NOT EXISTS candles_2024_12 PARTITION OF candles FOR VALUES FROM ('2024-12-01') TO ('2025-01-01');
+CREATE TABLE IF NOT EXISTS candles_2025_01 PARTITION OF candles FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+CREATE TABLE IF NOT EXISTS candles_2025_02 PARTITION OF candles FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+CREATE TABLE IF NOT EXISTS candles_2025_03 PARTITION OF candles FOR VALUES FROM ('2025-03-01') TO ('2025-04-01');
+CREATE TABLE IF NOT EXISTS candles_2025_04 PARTITION OF candles FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+CREATE TABLE IF NOT EXISTS candles_2025_05 PARTITION OF candles FOR VALUES FROM ('2025-05-01') TO ('2025-06-01');
+CREATE TABLE IF NOT EXISTS candles_2025_06 PARTITION OF candles FOR VALUES FROM ('2025-06-01') TO ('2025-07-01');
+CREATE TABLE IF NOT EXISTS candles_2025_07 PARTITION OF candles FOR VALUES FROM ('2025-07-01') TO ('2025-08-01');
+CREATE TABLE IF NOT EXISTS candles_2025_08 PARTITION OF candles FOR VALUES FROM ('2025-08-01') TO ('2025-09-01');
+CREATE TABLE IF NOT EXISTS candles_2025_09 PARTITION OF candles FOR VALUES FROM ('2025-09-01') TO ('2025-10-01');
+CREATE TABLE IF NOT EXISTS candles_2025_10 PARTITION OF candles FOR VALUES FROM ('2025-10-01') TO ('2025-11-01');
+CREATE TABLE IF NOT EXISTS candles_2025_11 PARTITION OF candles FOR VALUES FROM ('2025-11-01') TO ('2025-12-01');
+CREATE TABLE IF NOT EXISTS candles_2025_12 PARTITION OF candles FOR VALUES FROM ('2025-12-01') TO ('2026-01-01');
+CREATE TABLE IF NOT EXISTS candles_2026_01 PARTITION OF candles FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS candles_2026_02 PARTITION OF candles FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS candles_2026_03 PARTITION OF candles FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE IF NOT EXISTS candles_2026_04 PARTITION OF candles FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+CREATE TABLE IF NOT EXISTS candles_2026_05 PARTITION OF candles FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+CREATE TABLE IF NOT EXISTS candles_2026_06 PARTITION OF candles FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+CREATE TABLE IF NOT EXISTS candles_2026_07 PARTITION OF candles FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+CREATE TABLE IF NOT EXISTS candles_2026_08 PARTITION OF candles FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+CREATE TABLE IF NOT EXISTS candles_2026_09 PARTITION OF candles FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE IF NOT EXISTS candles_2026_10 PARTITION OF candles FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+CREATE TABLE IF NOT EXISTS candles_2026_11 PARTITION OF candles FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+CREATE TABLE IF NOT EXISTS candles_2026_12 PARTITION OF candles FOR VALUES FROM ('2026-12-01') TO ('2027-01-01');
+CREATE TABLE IF NOT EXISTS candles_2027_01 PARTITION OF candles FOR VALUES FROM ('2027-01-01') TO ('2027-02-01');
+CREATE TABLE IF NOT EXISTS candles_2027_02 PARTITION OF candles FOR VALUES FROM ('2027-02-01') TO ('2027-03-01');
+CREATE TABLE IF NOT EXISTS candles_2027_03 PARTITION OF candles FOR VALUES FROM ('2027-03-01') TO ('2027-04-01');
+CREATE TABLE IF NOT EXISTS candles_2027_04 PARTITION OF candles FOR VALUES FROM ('2027-04-01') TO ('2027-05-01');
+CREATE TABLE IF NOT EXISTS candles_2027_05 PARTITION OF candles FOR VALUES FROM ('2027-05-01') TO ('2027-06-01');
+CREATE TABLE IF NOT EXISTS candles_2027_06 PARTITION OF candles FOR VALUES FROM ('2027-06-01') TO ('2027-07-01');
+CREATE TABLE IF NOT EXISTS candles_2027_07 PARTITION OF candles FOR VALUES FROM ('2027-07-01') TO ('2027-08-01');
+CREATE TABLE IF NOT EXISTS candles_2027_08 PARTITION OF candles FOR VALUES FROM ('2027-08-01') TO ('2027-09-01');
+CREATE TABLE IF NOT EXISTS candles_2027_09 PARTITION OF candles FOR VALUES FROM ('2027-09-01') TO ('2027-10-01');
+CREATE TABLE IF NOT EXISTS candles_2027_10 PARTITION OF candles FOR VALUES FROM ('2027-10-01') TO ('2027-11-01');
+CREATE TABLE IF NOT EXISTS candles_2027_11 PARTITION OF candles FOR VALUES FROM ('2027-11-01') TO ('2027-12-01');
+CREATE TABLE IF NOT EXISTS candles_2027_12 PARTITION OF candles FOR VALUES FROM ('2027-12-01') TO ('2028-01-01');

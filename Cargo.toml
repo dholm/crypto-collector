@@ -1,0 +1,48 @@
+[package]
+name = "crypto-collector"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "crypto_collector"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crypto-collector"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Database: sqlx 0.9 with NUMERIC → Decimal mapping (REQ-DB-040).
+# Features: runtime-tokio (async pool), postgres, chrono (TIMESTAMPTZ), uuid, rust_decimal (NUMERIC), json (JSONB).
+# No compile-time query! macros used in this SPEC — migrations run via sqlx::migrate!() at runtime.
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "chrono", "uuid", "rust_decimal", "json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Numeric precision: Decimal for all prices/supplies/funding (research §3.4, REQ-DB-040).
+# serde-with-str: serialize Decimal as string to preserve full precision in JSON.
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+rust_decimal_macros = "1"
+
+# Date/time: chrono for TIMESTAMPTZ ↔ DateTime<Utc> mapping. No chrono-tz (crypto: no calendar).
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUIDs: worker/replica instance IDs, request IDs.
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Structured logging (tracing via JSON to stdout)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+uuid = { version = "1", features = ["v4"] }

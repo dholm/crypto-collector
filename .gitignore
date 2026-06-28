@@ -212,4 +212,15 @@ dist-ssr/
 .netlify/
 .firebase/
 
+# Local-only private instructions
 *.local.md
+
+# ===========================================
+# Rust Build Artifacts
+# ===========================================
+/target/
+
+# ===========================================
+# MoAI transient session state
+# ===========================================
+.moai/state/session-memo.md
