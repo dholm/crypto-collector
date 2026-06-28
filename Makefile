@@ -4,6 +4,13 @@
 IMAGE         ?= registry.helles.farm/crypto-collector:latest
 IMAGE_AARCH64 ?= registry.helles.farm/crypto-collector:aarch64
 
+# Container engine: prefer docker, fall back to podman (this project standardises
+# on podman). `cross` reads CROSS_CONTAINER_ENGINE to pick its build container,
+# defaulting to docker; exporting it keeps `build-aarch64` working on podman-only
+# hosts without manual configuration.
+CONTAINER_ENGINE ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
+export CROSS_CONTAINER_ENGINE ?= $(CONTAINER_ENGINE)
+
 # ── Help ─────────────────────────────────────────────────────────────────────
 
 help: ## Show available targets
@@ -40,10 +47,10 @@ test: ## Run unit tests
 # ── Container image ──────────────────────────────────────────────────────────
 
 image: ## Build container image (native arch)
-	podman build -f Dockerfile -t $(IMAGE) .
+	$(CONTAINER_ENGINE) build -f Dockerfile -t $(IMAGE) .
 
 push: image ## Build and push native image
-	podman push $(IMAGE)
+	$(CONTAINER_ENGINE) push $(IMAGE)
 
 # ── aarch64 cross-compilation ────────────────────────────────────────────────
 
@@ -51,10 +58,10 @@ build-aarch64: ## Cross-compile binary for aarch64 (requires `cross`)
 	cross build --target aarch64-unknown-linux-gnu --release
 
 image-aarch64: build-aarch64 ## Build aarch64 container image using pre-compiled binary (no QEMU required)
-	podman build -f Dockerfile.aarch64 -t $(IMAGE_AARCH64) .
+	$(CONTAINER_ENGINE) build -f Dockerfile.aarch64 -t $(IMAGE_AARCH64) .
 
 push-aarch64: image-aarch64 ## Build and push aarch64 image
-	podman push $(IMAGE_AARCH64)
+	$(CONTAINER_ENGINE) push $(IMAGE_AARCH64)
 
 # ── Clean ────────────────────────────────────────────────────────────────────
 

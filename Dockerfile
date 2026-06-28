@@ -8,10 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Cache dependency layer — only rebuilds when Cargo.toml/Cargo.lock change.
+# The crate declares both a [lib] (src/lib.rs) and a [[bin]] (src/main.rs), so the
+# stub must provide both files or `cargo build` errors on the missing lib target.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs && \
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && touch src/lib.rs && \
     cargo build --release && \
-    rm -f target/release/deps/crypto_collector* target/release/deps/crypto-collector*
+    rm -f target/release/deps/crypto_collector* target/release/deps/crypto-collector* \
+          target/release/deps/libcrypto_collector*
 
 # Build the real binary.
 COPY src ./src
