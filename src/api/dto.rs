@@ -160,13 +160,9 @@ pub struct UpdateMarketRequest {
     pub live_poll_interval_ms: Option<i64>,
 }
 
-/// Response DTO for a market search result.
-#[derive(Debug, Serialize)]
-pub struct MarketSearchResult {
-    pub base: String,
-    pub quote: String,
-    pub venue: Option<String>,
-}
+// MarketSearchResult is defined in the providers layer so that `CoinGeckoClient::search_markets`
+// and the API handler share one type without a circular dependency.
+pub use crate::providers::MarketSearchResult;
 
 /// Response DTO for market search page.
 #[derive(Debug, Serialize)]

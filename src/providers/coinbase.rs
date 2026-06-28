@@ -4,8 +4,8 @@
 //! capabilities in this SPEC scope. Full implementation is deferred to a future SPEC.
 
 use super::{
-    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, OhlcCandle,
-    Provider, ProviderError, SpotQuote,
+    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, MarketSearchResult,
+    OhlcCandle, Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -64,6 +64,14 @@ impl Provider for CoinbaseProvider {
         _q: &str,
         _cap: usize,
     ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        Ok(vec![])
+    }
+
+    async fn search_markets(
+        &self,
+        _q: &str,
+        _cap: usize,
+    ) -> Result<Vec<MarketSearchResult>, ProviderError> {
         Ok(vec![])
     }
 }

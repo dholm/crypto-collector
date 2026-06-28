@@ -10,8 +10,8 @@
 //! - Pacer: every outbound call acquires `upstream_request_pacer` slot before HTTP.
 
 use super::{
-    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, OhlcCandle,
-    Provider, ProviderError, SpotQuote,
+    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, MarketSearchResult,
+    OhlcCandle, Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -354,6 +354,67 @@ impl CoinGeckoClient {
             .collect();
 
         Ok(coins)
+    }
+
+    /// `GET /api/v3/search` — search market pairs (exchanges) by query string (SPEC-PROV-001 REQ-PROV-005).
+    ///
+    /// Uses the authenticated `get()` helper so the correct tier key header is attached.
+    /// Parses the `exchanges[]` array: base / target / market.identifier → `MarketSearchResult`.
+    /// Returns up to `cap` results. Empty `q` returns `Ok(vec![])` immediately.
+    ///
+    /// On upstream non-success the call degrades to `Ok(vec![])` (REQ-PROV-005) and
+    /// emits a WARN log carrying the HTTP status, query string, and a 512-char body preview
+    /// so operators can distinguish rate-limit / auth failures from a genuinely empty result.
+    pub async fn search_markets(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+        if q.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let resp = self
+            .get("/api/v3/search")
+            .query(&[("query", q)])
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Non-fatal: degrade to empty on upstream errors (REQ-PROV-005).
+            let body_text = resp.text().await.unwrap_or_default();
+            let body_preview: String = body_text.chars().take(512).collect();
+            tracing::warn!(
+                http.status = %status,
+                q = q,
+                upstream_body = %body_preview,
+                "upstream CoinGecko /search returned non-success for market search; degrading to empty result"
+            );
+            return Ok(vec![]);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("market search parse error: {e}")))?;
+
+        let markets = body["exchanges"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(cap)
+            .filter_map(|e| {
+                Some(MarketSearchResult {
+                    base: e["base"].as_str()?.to_string(),
+                    quote: e["target"].as_str()?.to_string(),
+                    venue: e["market"]["identifier"].as_str().map(|s| s.to_string()),
+                })
+            })
+            .collect();
+
+        Ok(markets)
     }
 
     /// `GET /derivatives/tickers` — all derivatives tickers.
@@ -785,6 +846,14 @@ impl Provider for CoinGeckoProvider {
         cap: usize,
     ) -> Result<Vec<CoinSearchResult>, ProviderError> {
         self.client.search_coins(q, cap).await
+    }
+
+    async fn search_markets(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+        self.client.search_markets(q, cap).await
     }
 }
 
@@ -1405,6 +1474,133 @@ mod tests {
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client.search_coins("bitcoin", 2).await.expect("search");
+
+        assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
+    }
+
+    // ── Scenario 17 (REQ-PROV-005): search_markets sends demo key and parses exchanges array ──
+
+    #[tokio::test]
+    async fn search_markets_sends_demo_key_header_and_parses_response() {
+        use wiremock::matchers::{header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "coins": [],
+            "exchanges": [
+                {
+                    "id": "binance",
+                    "name": "Binance",
+                    "market": {"identifier": "binance"},
+                    "base": "BTC",
+                    "target": "USDT",
+                    "market_type": "spot",
+                    "trade_url": "https://binance.com"
+                }
+            ],
+            "icos": [],
+            "categories": [],
+            "nfts": []
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .and(query_param("query", "btc"))
+            .and(header_exists("x-cg-demo-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: Some("test-demo-key".to_string()),
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .search_markets("btc", 10)
+            .await
+            .expect("search_markets");
+
+        assert_eq!(results.len(), 1, "expected 1 market result");
+        assert_eq!(results[0].base, "BTC");
+        assert_eq!(results[0].quote, "USDT");
+        assert_eq!(results[0].venue.as_deref(), Some("binance"));
+    }
+
+    #[tokio::test]
+    async fn search_markets_empty_query_returns_empty_without_http_call() {
+        // No wiremock server — any real HTTP call would fail with connection refused.
+        let cfg = CoinGeckoConfig {
+            base_url: "http://127.0.0.1:1".to_string(), // unreachable
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client.search_markets("", 10).await.expect("empty q");
+        assert!(results.is_empty(), "empty query must return empty vec without HTTP call");
+    }
+
+    #[tokio::test]
+    async fn search_markets_degrades_to_empty_on_non_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .search_markets("btc", 10)
+            .await
+            .expect("should degrade, not error");
+
+        assert!(
+            results.is_empty(),
+            "non-success upstream must degrade to empty (REQ-PROV-005)"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_markets_respects_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "exchanges": [
+                {"base": "BTC", "target": "USDT", "market": {"identifier": "binance"}},
+                {"base": "BTC", "target": "USDC", "market": {"identifier": "coinbase"}},
+                {"base": "BTC", "target": "EUR",  "market": {"identifier": "kraken"}}
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client.search_markets("btc", 2).await.expect("search");
 
         assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
     }

@@ -21,8 +21,7 @@ use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, MarketListKey},
     dto::{
-        MarketDto, MarketSearchPage, MarketSearchResult, Page, RegisterMarketRequest,
-        UpdateMarketRequest,
+        MarketDto, MarketSearchPage, Page, RegisterMarketRequest, UpdateMarketRequest,
     },
     ApiError, ApiResult, AppState, SearchSlotResult,
 };
@@ -152,8 +151,31 @@ pub async fn search_markets(
         return Err(ApiError::ServiceUnavailable(reason));
     }
 
-    // Slot acquired: perform the upstream market/ticker search.
-    let items = do_market_search(&state.http_client, &state.coingecko_base_url, &q, cap).await?;
+    // Slot acquired: look up the named provider and delegate the upstream call so auth,
+    // base URL, and tier are handled in one place (CoinGeckoClient::search_markets).
+    let provider = state
+        .chain
+        .iter()
+        .find(|p| p.name() == state.search_provider.as_str())
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(format!(
+                "search provider '{}' not found in chain",
+                state.search_provider
+            ))
+        })?;
+
+    let items = match provider.search_markets(&q, cap).await {
+        Ok(markets) => markets,
+        Err(e) => {
+            // Network / parse errors: degrade to empty and WARN (REQ-PROV-005).
+            tracing::warn!(
+                error = %e,
+                q = %q,
+                "search_markets provider call failed; degrading to empty result"
+            );
+            vec![]
+        }
+    };
 
     Ok(Json(MarketSearchPage { items }))
 }
@@ -336,52 +358,6 @@ fn validate_market_status(status: &str) -> ApiResult<()> {
             "invalid status '{other}': must be active, paused, or error"
         ))),
     }
-}
-
-/// Perform the upstream market pair search via CoinGecko's `/search` endpoint.
-async fn do_market_search(
-    client: &reqwest::Client,
-    base_url: &str,
-    q: &str,
-    cap: usize,
-) -> ApiResult<Vec<MarketSearchResult>> {
-    if q.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let url = format!("{base_url}/api/v3/search");
-    let resp = client
-        .get(&url)
-        .query(&[("query", q)])
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    if !resp.status().is_success() {
-        return Ok(vec![]);
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let markets = body["exchanges"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .take(cap)
-        .filter_map(|e| {
-            Some(MarketSearchResult {
-                base: e["base"].as_str()?.to_string(),
-                quote: e["target"].as_str()?.to_string(),
-                venue: e["market"]["identifier"].as_str().map(|s| s.to_string()),
-            })
-        })
-        .collect();
-
-    Ok(markets)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

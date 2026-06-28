@@ -128,6 +128,18 @@ pub struct CoinSearchResult {
     pub name: String,
 }
 
+/// Market search result returned from a provider search (SPEC-PROV-001 REQ-PROV-005).
+///
+/// Shared between the provider layer and the API layer so that
+/// `CoinGeckoClient::search_markets` and `GET /v1/markets/search` operate on one type.
+/// Fields map to CoinGecko `/search` `exchanges[]`: base/target/market.identifier.
+#[derive(Debug, Clone, Serialize)]
+pub struct MarketSearchResult {
+    pub base: String,
+    pub quote: String,
+    pub venue: Option<String>,
+}
+
 /// Normalised derivative tick (provider-level).
 #[derive(Debug, Clone)]
 pub struct DerivTick {
@@ -263,6 +275,18 @@ pub trait Provider: Send + Sync {
         q: &str,
         cap: usize,
     ) -> Result<Vec<CoinSearchResult>, ProviderError>;
+
+    /// Search for market pairs (exchanges) by query string (SPEC-PROV-001 REQ-PROV-005).
+    ///
+    /// Returns up to `cap` results. Providers that do not support market search return `Ok(vec![])`.
+    /// Upstream non-success responses degrade to empty (REQ-PROV-005) and are WARN-logged by the
+    /// client; callers should treat `Err` from this method as a network-level failure and may
+    /// choose to degrade to empty rather than propagate.
+    async fn search_markets(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<MarketSearchResult>, ProviderError>;
 }
 
 // ── Chain builder ─────────────────────────────────────────────────────────────
@@ -501,6 +525,13 @@ mod tests {
         ) -> Result<Vec<CoinSearchResult>, ProviderError> {
             Ok(vec![])
         }
+        async fn search_markets(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
     }
 
     #[async_trait]
@@ -548,6 +579,13 @@ mod tests {
             _q: &str,
             _cap: usize,
         ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn search_markets(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
             Ok(vec![])
         }
     }
@@ -660,6 +698,13 @@ mod tests {
                 _q: &str,
                 _cap: usize,
             ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+                Ok(vec![])
+            }
+            async fn search_markets(
+                &self,
+                _q: &str,
+                _cap: usize,
+            ) -> Result<Vec<MarketSearchResult>, ProviderError> {
                 Ok(vec![])
             }
         }
