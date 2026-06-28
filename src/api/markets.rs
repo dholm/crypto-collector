@@ -137,6 +137,17 @@ pub async fn register_market(
 }
 
 /// `GET /v1/markets/search?q=` — search candidate market pairs via provider (REQ-API-023/080/081).
+///
+/// # Flow (two upstream calls, two pacer slots)
+///
+/// 1. Resolve `q` → `coin_id` via provider coin search (top match).
+///    `q=BTC` resolves to `bitcoin`; a raw coin_id also resolves since CoinGecko search matches it.
+///    Empty resolve → HTTP 200 `{"items":[]}`.
+/// 2. Fetch `coin_id`'s trading pairs from `/api/v3/coins/{id}/tickers`, ranked by
+///    `converted_volume.usd` descending; stale and anomaly tickers excluded; truncated to `limit`.
+///
+/// Each upstream provider call consumes one pacer slot (REQ-API-080/081).
+/// Returns 503 when either slot is unavailable.
 pub async fn search_markets(
     State(state): State<AppState>,
     Query(params): Query<SearchMarketsParams>,
@@ -145,14 +156,14 @@ pub async fn search_markets(
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let cap = limit.min(50) as usize;
 
-    // Acquire pacer slot (REQ-API-080/081).
+    // Acquire first pacer slot for coin resolution (REQ-API-080/081).
     let slot_result = (state.search_slot_fn)(state.search_provider.clone()).await;
     if let SearchSlotResult::Unavailable(reason) = slot_result {
         return Err(ApiError::ServiceUnavailable(reason));
     }
 
-    // Slot acquired: look up the named provider and delegate the upstream call so auth,
-    // base URL, and tier are handled in one place (CoinGeckoClient::search_markets).
+    // Slot acquired: look up the named provider so auth, base URL, and tier
+    // are handled in one place (CoinGeckoClient::search_coins / fetch_coin_tickers).
     let provider = state
         .chain
         .iter()
@@ -164,14 +175,37 @@ pub async fn search_markets(
             ))
         })?;
 
-    let items = match provider.search_markets(&q, cap).await {
-        Ok(markets) => markets,
+    // Step 1: Resolve q → coin_id via provider coin search (top match only).
+    let coin_id = match provider.search_coins(&q, 1).await {
+        Ok(coins) if !coins.is_empty() => coins.into_iter().next().unwrap().coin_id,
+        Ok(_) => return Ok(Json(MarketSearchPage { items: vec![] })),
         Err(e) => {
             // Network / parse errors: degrade to empty and WARN (REQ-PROV-005).
             tracing::warn!(
                 error = %e,
                 q = %q,
-                "search_markets provider call failed; degrading to empty result"
+                "search_markets coin resolve failed; degrading to empty result"
+            );
+            return Ok(Json(MarketSearchPage { items: vec![] }));
+        }
+    };
+
+    // Acquire second pacer slot for tickers fetch (REQ-API-080/081).
+    let slot_result2 = (state.search_slot_fn)(state.search_provider.clone()).await;
+    if let SearchSlotResult::Unavailable(reason) = slot_result2 {
+        return Err(ApiError::ServiceUnavailable(reason));
+    }
+
+    // Step 2: Fetch coin's trading pairs ranked by converted USD volume.
+    let items = match provider.fetch_coin_tickers(&coin_id, cap).await {
+        Ok(tickers) => tickers,
+        Err(e) => {
+            // Network / parse errors: degrade to empty and WARN (REQ-PROV-005).
+            tracing::warn!(
+                error = %e,
+                coin_id = %coin_id,
+                q = %q,
+                "search_markets tickers fetch failed; degrading to empty result"
             );
             vec![]
         }

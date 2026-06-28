@@ -301,9 +301,9 @@ impl Provider for BinanceProvider {
         Ok(vec![])
     }
 
-    async fn search_markets(
+    async fn fetch_coin_tickers(
         &self,
-        _q: &str,
+        _coin_id: &str,
         _cap: usize,
     ) -> Result<Vec<MarketSearchResult>, ProviderError> {
         Ok(vec![])

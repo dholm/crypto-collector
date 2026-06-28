@@ -356,40 +356,43 @@ impl CoinGeckoClient {
         Ok(coins)
     }
 
-    /// `GET /api/v3/search` — search market pairs (exchanges) by query string (SPEC-PROV-001 REQ-PROV-005).
+    /// `GET /api/v3/coins/{coin_id}/tickers` — trading pairs for a coin across venues (REQ-PROV-005).
     ///
     /// Uses the authenticated `get()` helper so the correct tier key header is attached.
-    /// Parses the `exchanges[]` array: base / target / market.identifier → `MarketSearchResult`.
-    /// Returns up to `cap` results. Empty `q` returns `Ok(vec![])` immediately.
+    /// Each ticker element is mapped to `MarketSearchResult { base, quote: target, venue }`.
+    /// Tickers with `is_stale == true` or `is_anomaly == true` are excluded.
+    /// Remaining tickers are ordered by `converted_volume.usd` descending (missing = 0.0)
+    /// and truncated to `cap`. Empty `coin_id` returns `Ok(vec![])` immediately.
     ///
     /// On upstream non-success the call degrades to `Ok(vec![])` (REQ-PROV-005) and
-    /// emits a WARN log carrying the HTTP status, query string, and a 512-char body preview
+    /// emits a WARN log carrying the HTTP status, coin_id, and a 512-char body preview
     /// so operators can distinguish rate-limit / auth failures from a genuinely empty result.
-    pub async fn search_markets(
+    pub async fn fetch_coin_tickers(
         &self,
-        q: &str,
+        coin_id: &str,
         cap: usize,
     ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-        if q.is_empty() {
+        if coin_id.is_empty() {
             return Ok(vec![]);
         }
 
         let resp = self
-            .get("/api/v3/search")
-            .query(&[("query", q)])
+            .get(&format!("/api/v3/coins/{coin_id}/tickers"))
             .send()
             .await?;
 
         let status = resp.status();
         if !status.is_success() {
             // Non-fatal: degrade to empty on upstream errors (REQ-PROV-005).
+            // Log at WARN so operators can distinguish rate-limit / auth failures
+            // from a genuinely empty result set.
             let body_text = resp.text().await.unwrap_or_default();
             let body_preview: String = body_text.chars().take(512).collect();
             tracing::warn!(
                 http.status = %status,
-                q = q,
+                coin_id = coin_id,
                 upstream_body = %body_preview,
-                "upstream CoinGecko /search returned non-success for market search; degrading to empty result"
+                "upstream CoinGecko /coins/{coin_id}/tickers returned non-success; degrading to empty result"
             );
             return Ok(vec![]);
         }
@@ -397,24 +400,42 @@ impl CoinGeckoClient {
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| ProviderError::Parse(format!("market search parse error: {e}")))?;
+            .map_err(|e| ProviderError::Parse(format!("tickers parse error: {e}")))?;
 
-        let markets = body["exchanges"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let tickers = body["tickers"].as_array().cloned().unwrap_or_default();
+
+        // Parse, filter (stale/anomaly), sort by USD volume desc, truncate.
+        let mut results: Vec<(f64, MarketSearchResult)> = tickers
             .into_iter()
-            .take(cap)
-            .filter_map(|e| {
-                Some(MarketSearchResult {
-                    base: e["base"].as_str()?.to_string(),
-                    quote: e["target"].as_str()?.to_string(),
-                    venue: e["market"]["identifier"].as_str().map(|s| s.to_string()),
-                })
+            .filter_map(|t| {
+                // Require base and target; skip stale or anomaly tickers.
+                let base = t["base"].as_str()?.to_string();
+                let target = t["target"].as_str()?.to_string();
+                let is_stale = t["is_stale"].as_bool().unwrap_or(false);
+                let is_anomaly = t["is_anomaly"].as_bool().unwrap_or(false);
+                if is_stale || is_anomaly {
+                    return None;
+                }
+                let venue = t["market"]["identifier"].as_str().map(|s| s.to_string());
+                // Treat missing / null converted_volume.usd as 0.0 for ordering.
+                let volume_usd = t["converted_volume"]["usd"].as_f64().unwrap_or(0.0);
+                Some((
+                    volume_usd,
+                    MarketSearchResult {
+                        base,
+                        quote: target,
+                        venue,
+                    },
+                ))
             })
             .collect();
 
-        Ok(markets)
+        // Order by converted_volume.usd descending; NaN treated as equal.
+        results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let items = results.into_iter().take(cap).map(|(_, r)| r).collect();
+
+        Ok(items)
     }
 
     /// `GET /derivatives/tickers` — all derivatives tickers.
@@ -848,12 +869,12 @@ impl Provider for CoinGeckoProvider {
         self.client.search_coins(q, cap).await
     }
 
-    async fn search_markets(
+    async fn fetch_coin_tickers(
         &self,
-        q: &str,
+        coin_id: &str,
         cap: usize,
     ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-        self.client.search_markets(q, cap).await
+        self.client.fetch_coin_tickers(coin_id, cap).await
     }
 }
 
@@ -1478,36 +1499,41 @@ mod tests {
         assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
     }
 
-    // ── Scenario 17 (REQ-PROV-005): search_markets sends demo key and parses exchanges array ──
+    // ── Scenario 17 (REQ-PROV-005): fetch_coin_tickers sends demo key and parses tickers ──
 
     #[tokio::test]
-    async fn search_markets_sends_demo_key_header_and_parses_response() {
-        use wiremock::matchers::{header_exists, method, path, query_param};
+    async fn fetch_coin_tickers_sends_demo_key_header_and_parses_response() {
+        use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
 
+        // Two tickers: high-volume binance first, low-volume kraken second.
+        // The implementation must order by converted_volume.usd descending.
         let body = json!({
-            "coins": [],
-            "exchanges": [
+            "name": "Bitcoin",
+            "tickers": [
                 {
-                    "id": "binance",
-                    "name": "Binance",
-                    "market": {"identifier": "binance"},
+                    "base": "BTC",
+                    "target": "EUR",
+                    "market": {"identifier": "kraken", "name": "Kraken"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 1000000.0}
+                },
+                {
                     "base": "BTC",
                     "target": "USDT",
-                    "market_type": "spot",
-                    "trade_url": "https://binance.com"
+                    "market": {"identifier": "binance", "name": "Binance"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 99000000.0}
                 }
-            ],
-            "icos": [],
-            "categories": [],
-            "nfts": []
+            ]
         });
 
         Mock::given(method("GET"))
-            .and(path("/api/v3/search"))
-            .and(query_param("query", "btc"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
             .and(header_exists("x-cg-demo-api-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&body))
             .mount(&server)
@@ -1520,38 +1546,141 @@ mod tests {
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
-            .search_markets("btc", 10)
+            .fetch_coin_tickers("bitcoin", 10)
             .await
-            .expect("search_markets");
+            .expect("fetch_coin_tickers");
 
-        assert_eq!(results.len(), 1, "expected 1 market result");
+        assert_eq!(results.len(), 2, "expected 2 ticker results");
+        // High-volume binance must come first (volume-desc ordering).
         assert_eq!(results[0].base, "BTC");
         assert_eq!(results[0].quote, "USDT");
         assert_eq!(results[0].venue.as_deref(), Some("binance"));
+        assert_eq!(results[1].base, "BTC");
+        assert_eq!(results[1].quote, "EUR");
+        assert_eq!(results[1].venue.as_deref(), Some("kraken"));
     }
 
     #[tokio::test]
-    async fn search_markets_empty_query_returns_empty_without_http_call() {
-        // No wiremock server — any real HTTP call would fail with connection refused.
+    async fn fetch_coin_tickers_filters_stale_and_anomaly() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "name": "Bitcoin",
+            "tickers": [
+                {
+                    "base": "BTC",
+                    "target": "USDT",
+                    "market": {"identifier": "binance"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 50000000.0}
+                },
+                {
+                    "base": "BTC",
+                    "target": "USD",
+                    "market": {"identifier": "stale-venue"},
+                    "is_stale": true,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 99000000.0}
+                },
+                {
+                    "base": "BTC",
+                    "target": "EUR",
+                    "market": {"identifier": "anomaly-venue"},
+                    "is_stale": false,
+                    "is_anomaly": true,
+                    "converted_volume": {"usd": 80000000.0}
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
         let cfg = CoinGeckoConfig {
-            base_url: "http://127.0.0.1:1".to_string(), // unreachable
+            base_url: server.uri(),
             api_key: None,
             tier: "demo".to_string(),
         };
         let client = CoinGeckoClient::new(cfg);
-        let results = client.search_markets("", 10).await.expect("empty q");
-        assert!(results.is_empty(), "empty query must return empty vec without HTTP call");
+        let results = client
+            .fetch_coin_tickers("bitcoin", 10)
+            .await
+            .expect("fetch_coin_tickers");
+
+        assert_eq!(results.len(), 1, "stale and anomaly tickers must be excluded");
+        assert_eq!(results[0].venue.as_deref(), Some("binance"));
     }
 
     #[tokio::test]
-    async fn search_markets_degrades_to_empty_on_non_success() {
+    async fn fetch_coin_tickers_respects_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "name": "Bitcoin",
+            "tickers": [
+                {
+                    "base": "BTC", "target": "USDT",
+                    "market": {"identifier": "binance"},
+                    "is_stale": false, "is_anomaly": false,
+                    "converted_volume": {"usd": 90000000.0}
+                },
+                {
+                    "base": "BTC", "target": "USDC",
+                    "market": {"identifier": "coinbase"},
+                    "is_stale": false, "is_anomaly": false,
+                    "converted_volume": {"usd": 5000000.0}
+                },
+                {
+                    "base": "BTC", "target": "EUR",
+                    "market": {"identifier": "kraken"},
+                    "is_stale": false, "is_anomaly": false,
+                    "converted_volume": {"usd": 1000000.0}
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .fetch_coin_tickers("bitcoin", 2)
+            .await
+            .expect("fetch_coin_tickers");
+
+        assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
+        // After volume-desc sort: binance (90M) first, coinbase (5M) second.
+        assert_eq!(results[0].venue.as_deref(), Some("binance"));
+        assert_eq!(results[1].venue.as_deref(), Some("coinbase"));
+    }
+
+    #[tokio::test]
+    async fn fetch_coin_tickers_degrades_to_empty_on_non_success() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/api/v3/search"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
             .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
             .mount(&server)
             .await;
@@ -1563,7 +1692,7 @@ mod tests {
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
-            .search_markets("btc", 10)
+            .fetch_coin_tickers("bitcoin", 10)
             .await
             .expect("should degrade, not error");
 
@@ -1571,38 +1700,6 @@ mod tests {
             results.is_empty(),
             "non-success upstream must degrade to empty (REQ-PROV-005)"
         );
-    }
-
-    #[tokio::test]
-    async fn search_markets_respects_cap() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-
-        let body = json!({
-            "exchanges": [
-                {"base": "BTC", "target": "USDT", "market": {"identifier": "binance"}},
-                {"base": "BTC", "target": "USDC", "market": {"identifier": "coinbase"}},
-                {"base": "BTC", "target": "EUR",  "market": {"identifier": "kraken"}}
-            ]
-        });
-
-        Mock::given(method("GET"))
-            .and(path("/api/v3/search"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&server)
-            .await;
-
-        let cfg = CoinGeckoConfig {
-            base_url: server.uri(),
-            api_key: None,
-            tier: "demo".to_string(),
-        };
-        let client = CoinGeckoClient::new(cfg);
-        let results = client.search_markets("btc", 2).await.expect("search");
-
-        assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
     }
 
     // Live API smoke test (gated — requires real CoinGecko key)

@@ -128,11 +128,11 @@ pub struct CoinSearchResult {
     pub name: String,
 }
 
-/// Market search result returned from a provider search (SPEC-PROV-001 REQ-PROV-005).
+/// Market search result returned from a provider ticker fetch (SPEC-PROV-001 REQ-PROV-005).
 ///
 /// Shared between the provider layer and the API layer so that
-/// `CoinGeckoClient::search_markets` and `GET /v1/markets/search` operate on one type.
-/// Fields map to CoinGecko `/search` `exchanges[]`: base/target/market.identifier.
+/// `CoinGeckoClient::fetch_coin_tickers` and `GET /v1/markets/search` operate on one type.
+/// Fields map to CoinGecko `/coins/{id}/tickers`: base/target/market.identifier.
 #[derive(Debug, Clone, Serialize)]
 pub struct MarketSearchResult {
     pub base: String,
@@ -276,15 +276,15 @@ pub trait Provider: Send + Sync {
         cap: usize,
     ) -> Result<Vec<CoinSearchResult>, ProviderError>;
 
-    /// Search for market pairs (exchanges) by query string (SPEC-PROV-001 REQ-PROV-005).
+    /// Fetch trading pairs for a resolved coin ID from the provider (SPEC-PROV-001 REQ-PROV-005).
     ///
-    /// Returns up to `cap` results. Providers that do not support market search return `Ok(vec![])`.
+    /// Returns up to `cap` results ordered by converted USD volume descending, with stale and
+    /// anomaly tickers excluded. Providers that do not support ticker fetching return `Ok(vec![])`.
     /// Upstream non-success responses degrade to empty (REQ-PROV-005) and are WARN-logged by the
-    /// client; callers should treat `Err` from this method as a network-level failure and may
-    /// choose to degrade to empty rather than propagate.
-    async fn search_markets(
+    /// client; callers should treat `Err` as a network-level failure and may degrade to empty.
+    async fn fetch_coin_tickers(
         &self,
-        q: &str,
+        coin_id: &str,
         cap: usize,
     ) -> Result<Vec<MarketSearchResult>, ProviderError>;
 }
@@ -525,9 +525,9 @@ mod tests {
         ) -> Result<Vec<CoinSearchResult>, ProviderError> {
             Ok(vec![])
         }
-        async fn search_markets(
+        async fn fetch_coin_tickers(
             &self,
-            _q: &str,
+            _coin_id: &str,
             _cap: usize,
         ) -> Result<Vec<MarketSearchResult>, ProviderError> {
             Ok(vec![])
@@ -581,9 +581,9 @@ mod tests {
         ) -> Result<Vec<CoinSearchResult>, ProviderError> {
             Ok(vec![])
         }
-        async fn search_markets(
+        async fn fetch_coin_tickers(
             &self,
-            _q: &str,
+            _coin_id: &str,
             _cap: usize,
         ) -> Result<Vec<MarketSearchResult>, ProviderError> {
             Ok(vec![])
@@ -700,9 +700,9 @@ mod tests {
             ) -> Result<Vec<CoinSearchResult>, ProviderError> {
                 Ok(vec![])
             }
-            async fn search_markets(
+            async fn fetch_coin_tickers(
                 &self,
-                _q: &str,
+                _coin_id: &str,
                 _cap: usize,
             ) -> Result<Vec<MarketSearchResult>, ProviderError> {
                 Ok(vec![])
