@@ -15,9 +15,9 @@ data:
   SHUTDOWN_DRAIN_SECONDS: {{ .Values.shutdown.drainSeconds | quote }}
 
   # ── Database connection parameters (SPEC-DB-001) ─────────────────────────────
-  # DB_HOST / DB_PORT / DB_NAME are provided for reference and operator tooling.
-  # The current binary reads DATABASE_URL directly; DATABASE_URL is injected
-  # from a Kubernetes Secret (see deployment.yaml env[]) — never here.
+  # The app assembles the connection URL from DB_HOST / DB_PORT / DB_NAME plus
+  # optional DB_USERNAME / DB_PASSWORD credentials (injected via secretKeyRef in
+  # deployment.yaml). No DATABASE_URL secret is required. Credentials never here.
   DB_HOST: {{ .Values.database.host | quote }}
   DB_PORT: {{ .Values.database.port | quote }}
   DB_NAME: {{ .Values.database.name | quote }}

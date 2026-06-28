@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
 
     // ── Step 4: Database pool + migrations (SPEC-DB-001, REQ-OBS-041) ─────────
     let database_url =
-        std::env::var("DATABASE_URL").context("DATABASE_URL environment variable not set")?;
+        config::database_url().context("failed to resolve database connection settings")?;
     let pool = crypto_collector::db::connect(&database_url)
         .await
         .context("failed to connect to database and apply migrations")?;

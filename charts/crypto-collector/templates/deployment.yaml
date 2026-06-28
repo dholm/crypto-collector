@@ -92,16 +92,9 @@ spec:
           # @MX:WARN: [AUTO] Credentials must arrive exclusively via secretKeyRef.
           # @MX:REASON: Credentials in ConfigMap or image violate REQ-CFG-007 and create
           #             a security boundary breach. Add no credential values here directly.
-          {{- $hasSecrets := or .Values.database.url.secretName (or .Values.database.credentials.username.secretName (or .Values.database.credentials.password.secretName .Values.coingecko.apiKey.secretName)) }}
+          {{- $hasSecrets := or .Values.database.credentials.username.secretName (or .Values.database.credentials.password.secretName .Values.coingecko.apiKey.secretName) }}
           {{- if $hasSecrets }}
           env:
-            {{- if .Values.database.url.secretName }}
-            - name: DATABASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.database.url.secretName }}
-                  key: {{ .Values.database.url.secretKey }}
-            {{- end }}
             {{- if .Values.database.credentials.username.secretName }}
             - name: DB_USERNAME
               valueFrom:

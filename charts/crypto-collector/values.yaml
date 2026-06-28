@@ -48,31 +48,26 @@ env:
   SEARCH_PACER_TIMEOUT_MS: "2000"    # CoinGecko search slot timeout (SPEC-API-001)
 
 # ── Database connection (SPEC-DB-001) ─────────────────────────────────────────
-# The application reads DATABASE_URL directly (main.rs).  Supply the full
-# connection string from a pre-created Kubernetes Secret — never put credentials
-# in the ConfigMap (REQ-CFG-007).
+# The application assembles the connection URL from DB_HOST / DB_PORT / DB_NAME
+# (set here, exposed via the ConfigMap) plus optional DB_USERNAME / DB_PASSWORD
+# credentials. No DATABASE_URL secret is required.
 #
-# Create the secret once:
+# host / port / name are non-secret and live in the ConfigMap. Credentials, when
+# needed, come from pre-created Kubernetes Secrets — never the ConfigMap
+# (REQ-CFG-007). Create one once, for example:
 #   kubectl -n finance create secret generic crypto-collector-db \
-#     --from-literal=DATABASE_URL='postgresql://user:pass@postgres:5432/crypto_collector'
-#
-# Then set database.url.secretName below.
-#
-# host / port / name are included in the ConfigMap as DB_HOST / DB_PORT / DB_NAME
-# for reference and future app updates; they are not currently consumed by the binary.
+#     --from-literal=username='user' --from-literal=password='pass'
+# then point database.credentials.username/password at it below.
 database:
   host: "postgres"
   port: 5432
   name: "crypto_collector"
-  url:
-    # Name of the Secret containing DATABASE_URL.
-    # Required: the pod will fail at startup if DATABASE_URL is absent.
-    secretName: ""
-    secretKey: "DATABASE_URL"
-  # Optional: individual credential secrets (DB_USERNAME / DB_PASSWORD).
-  # These are injected as separate env vars for operator reference.
-  # The current binary reads DATABASE_URL and does not use DB_USERNAME / DB_PASSWORD
-  # directly; they are available for future updates or init containers.
+  # Credentials sourced from Kubernetes Secrets (optional).
+  # The connection URL is assembled by the app from DB_HOST / DB_PORT / DB_NAME
+  # plus these credentials — no DATABASE_URL secret is required.
+  # Set secretName to a non-empty string to enable injection for that credential.
+  # Each credential may reference a different secret or the same one. Both
+  # username and password must be set for credentials to be applied.
   credentials:
     username:
       secretName: ""

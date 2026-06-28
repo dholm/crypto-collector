@@ -13,10 +13,13 @@ Metrics (Prometheus):
   kubectl -n {{ .Release.Namespace }} port-forward pod/<pod-name> 9000:9000
   curl http://localhost:9000/metrics
 
-DATABASE_URL secret (required before install):
+Database connection:
+  Set database.host / database.port / database.name in values.yaml (defaults:
+  postgres / 5432 / crypto_collector). No DATABASE_URL secret is required.
+  For authenticated databases, create a credentials secret, e.g.:
   kubectl -n {{ .Release.Namespace }} create secret generic <secret-name> \
-    --from-literal=DATABASE_URL='postgresql://user:pass@postgres:5432/crypto_collector'
-  Then set database.url.secretName in values.yaml.
+    --from-literal=username='user' --from-literal=password='pass'
+  Then set database.credentials.username/password (secretName + secretKey).
 
 CoinGecko API key (optional, Pro tier):
   kubectl -n {{ .Release.Namespace }} create secret generic <secret-name> \

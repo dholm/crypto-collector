@@ -1,7 +1,65 @@
 //! Configuration loading from environment variables (SPEC-PROV-001, SPEC-OBS-001).
 //!
 //! All configuration is env-var-only — no hardcoded secrets, no config files.
-//! Mirrors SPEC-DB-001's env-var-only approach for DATABASE_URL.
+//! Mirrors SPEC-DB-001's env-var-only approach.
+
+// ── SPEC-DB-001 database connection configuration ─────────────────────────────
+
+/// Assemble the PostgreSQL connection URL (SPEC-DB-001).
+///
+/// Mirrors `ticker-collector`'s pattern: the URL is built from discrete
+/// `DB_HOST` / `DB_PORT` / `DB_NAME` parts, with optional `DB_USERNAME` /
+/// `DB_PASSWORD` credentials (sourced from Kubernetes Secrets in deployment).
+/// No `DATABASE_URL` secret is required.
+///
+/// As a convenience for local development and integration tests, an explicit
+/// non-empty `DATABASE_URL` takes precedence when set.
+///
+/// Env vars: `DATABASE_URL` (optional override), `DB_HOST` (required),
+/// `DB_PORT` (default 5432), `DB_NAME` (required), `DB_USERNAME` / `DB_PASSWORD`
+/// (optional; both must be present for credentials to be included).
+pub fn database_url() -> anyhow::Result<String> {
+    if let Ok(url) = std::env::var("DATABASE_URL") {
+        if !url.is_empty() {
+            return Ok(url);
+        }
+    }
+    let host = required("DB_HOST")?;
+    let port = parse_env_u16("DB_PORT", 5432);
+    let name = required("DB_NAME")?;
+    let username = std::env::var("DB_USERNAME").ok().filter(|s| !s.is_empty());
+    let password = std::env::var("DB_PASSWORD").ok().filter(|s| !s.is_empty());
+    Ok(build_database_url(
+        &host,
+        port,
+        &name,
+        username.as_deref(),
+        password.as_deref(),
+    ))
+}
+
+/// Pure connection-string assembly (testable without environment mutation).
+///
+/// Credentials are embedded only when both username and password are present.
+fn build_database_url(
+    host: &str,
+    port: u16,
+    name: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> String {
+    match (username, password) {
+        (Some(u), Some(p)) => format!("postgres://{u}:{p}@{host}:{port}/{name}"),
+        _ => format!("postgres://{host}:{port}/{name}"),
+    }
+}
+
+fn required(name: &str) -> anyhow::Result<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(anyhow::anyhow!("required env var {name} is not set")),
+    }
+}
 
 // ── SPEC-OBS-001 port and observability configuration ─────────────────────────
 
@@ -267,6 +325,37 @@ fn parse_env_i32(name: &str, default: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SPEC-DB-001 database URL assembly (ticker-collector pattern) ─────────
+
+    #[test]
+    fn build_database_url_with_credentials() {
+        assert_eq!(
+            build_database_url("h", 5433, "n", Some("u"), Some("p")),
+            "postgres://u:p@h:5433/n"
+        );
+    }
+
+    #[test]
+    fn build_database_url_without_credentials() {
+        assert_eq!(
+            build_database_url("localhost", 5432, "mydb", None, None),
+            "postgres://localhost:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn build_database_url_partial_credentials_are_omitted() {
+        // Username without password (or vice versa) yields a credential-less URL.
+        assert_eq!(
+            build_database_url("h", 5432, "n", Some("u"), None),
+            "postgres://h:5432/n"
+        );
+        assert_eq!(
+            build_database_url("h", 5432, "n", None, Some("p")),
+            "postgres://h:5432/n"
+        );
+    }
 
     #[test]
     fn provider_names_default_is_coingecko() {
