@@ -1,7 +1,85 @@
-//! Configuration loading from environment variables (SPEC-PROV-001).
+//! Configuration loading from environment variables (SPEC-PROV-001, SPEC-OBS-001).
 //!
-//! All provider configuration is env-var-only — no hardcoded secrets, no config files.
+//! All configuration is env-var-only — no hardcoded secrets, no config files.
 //! Mirrors SPEC-DB-001's env-var-only approach for DATABASE_URL.
+
+// ── SPEC-OBS-001 port and observability configuration ─────────────────────────
+
+/// REST API listener port (SPEC-OBS-001 REQ-OBS-001).
+///
+/// Env var: `API_PORT`. Default: 8080.
+pub fn api_port() -> u16 {
+    parse_env_u16("API_PORT", 8080)
+}
+
+/// Health endpoint listener port (SPEC-OBS-001 REQ-OBS-001).
+///
+/// Env var: `HEALTH_PORT`. Default: 8081.
+pub fn health_port() -> u16 {
+    parse_env_u16("HEALTH_PORT", 8081)
+}
+
+/// Prometheus metrics listener port (SPEC-OBS-001 REQ-OBS-001/010).
+///
+/// Env var: `METRICS_PORT`. Default: 9000.
+pub fn metrics_port() -> u16 {
+    parse_env_u16("METRICS_PORT", 9000)
+}
+
+/// Log filter specification (SPEC-OBS-001 REQ-OBS-020).
+///
+/// Env var: `RUST_LOG`. Default: `"info"`.
+/// Passed to `tracing_subscriber::EnvFilter`.
+pub fn rust_log() -> String {
+    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+}
+
+/// OTLP/gRPC exporter endpoint URL (SPEC-OBS-001 REQ-OBS-021/022).
+///
+/// Env var: `OTEL_EXPORTER_OTLP_ENDPOINT`. Unset = tracing export disabled.
+/// Example: `http://localhost:4317`.
+pub fn otel_exporter_otlp_endpoint() -> Option<String> {
+    std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Service version attached as a trace resource attribute (SPEC-OBS-001 REQ-OBS-024).
+///
+/// Env var: `OTEL_SERVICE_VERSION`. Default: Cargo package version.
+pub fn otel_service_version() -> String {
+    std::env::var("OTEL_SERVICE_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Deployment environment name (SPEC-OBS-001 REQ-OBS-024).
+///
+/// Env var: `DEPLOYMENT_ENVIRONMENT`. Default: `"unknown"`.
+/// Examples: `production`, `staging`, `development`.
+pub fn deployment_environment() -> String {
+    std::env::var("DEPLOYMENT_ENVIRONMENT").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Grace period before drain starts, in seconds (SPEC-OBS-001 REQ-OBS-030/031).
+///
+/// Env var: `SHUTDOWN_GRACE_SECONDS`. Default: 15 s (ticker-collector value, OR-OBS-1).
+/// During this window, `/healthz/ready` returns 503 while the pod is removed from kube-proxy.
+pub fn shutdown_grace_seconds() -> u64 {
+    parse_env_u64("SHUTDOWN_GRACE_SECONDS", 15)
+}
+
+/// Maximum time to wait for in-flight requests to complete, in seconds (SPEC-OBS-001 REQ-OBS-031).
+///
+/// Env var: `SHUTDOWN_DRAIN_SECONDS`. Default: 30 s (ticker-collector value, OR-OBS-1).
+pub fn shutdown_drain_seconds() -> u64 {
+    parse_env_u64("SHUTDOWN_DRAIN_SECONDS", 30)
+}
+
+/// Interval at which `tracked_coins` / `tracked_markets` gauges are refreshed (SPEC-OBS-001 REQ-OBS-013).
+///
+/// Env var: `TRACKED_GAUGE_INTERVAL_SECS`. Default: 30 s (OR-OBS-3).
+pub fn tracked_gauge_interval_secs() -> u64 {
+    parse_env_u64("TRACKED_GAUGE_INTERVAL_SECS", 30)
+}
 
 /// Provider chain names in declared fallback priority order.
 ///
@@ -158,6 +236,13 @@ pub fn metadata_refresh_interval_secs() -> u64 {
 
 // ── Internal env-var helpers ──────────────────────────────────────────────────
 
+fn parse_env_u16(name: &str, default: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn parse_env_i64(name: &str, default: i64) -> i64 {
     std::env::var(name)
         .ok()
@@ -273,5 +358,70 @@ mod tests {
         let id2 = replica_id();
         assert_eq!(id1, id2);
         assert!(!id1.is_empty());
+    }
+
+    // ── SPEC-OBS-001 port + observability config defaults ──────────────────────
+
+    #[test]
+    fn api_port_default_is_8080() {
+        if std::env::var("API_PORT").is_err() {
+            assert_eq!(api_port(), 8080);
+        }
+    }
+
+    #[test]
+    fn health_port_default_is_8081() {
+        if std::env::var("HEALTH_PORT").is_err() {
+            assert_eq!(health_port(), 8081);
+        }
+    }
+
+    #[test]
+    fn metrics_port_default_is_9000() {
+        if std::env::var("METRICS_PORT").is_err() {
+            assert_eq!(metrics_port(), 9000);
+        }
+    }
+
+    #[test]
+    fn rust_log_default_is_info() {
+        if std::env::var("RUST_LOG").is_err() {
+            assert_eq!(rust_log(), "info");
+        }
+    }
+
+    #[test]
+    fn otel_endpoint_absent_when_unset() {
+        if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+            assert!(otel_exporter_otlp_endpoint().is_none());
+        }
+    }
+
+    #[test]
+    fn deployment_environment_default_is_unknown() {
+        if std::env::var("DEPLOYMENT_ENVIRONMENT").is_err() {
+            assert_eq!(deployment_environment(), "unknown");
+        }
+    }
+
+    #[test]
+    fn shutdown_grace_seconds_default_is_15() {
+        if std::env::var("SHUTDOWN_GRACE_SECONDS").is_err() {
+            assert_eq!(shutdown_grace_seconds(), 15);
+        }
+    }
+
+    #[test]
+    fn shutdown_drain_seconds_default_is_30() {
+        if std::env::var("SHUTDOWN_DRAIN_SECONDS").is_err() {
+            assert_eq!(shutdown_drain_seconds(), 30);
+        }
+    }
+
+    #[test]
+    fn tracked_gauge_interval_secs_default_is_30() {
+        if std::env::var("TRACKED_GAUGE_INTERVAL_SECS").is_err() {
+            assert_eq!(tracked_gauge_interval_secs(), 30);
+        }
     }
 }

@@ -45,7 +45,8 @@ pub const UPSERT_LIVE_QUOTE_SQL: &str = "\
         source     = EXCLUDED.source";
 
 pub async fn upsert_live_quote(pool: &PgPool, q: &SpotQuote) -> Result<(), sqlx::Error> {
-    sqlx::query(UPSERT_LIVE_QUOTE_SQL)
+    let start = std::time::Instant::now();
+    let result = sqlx::query(UPSERT_LIVE_QUOTE_SQL)
         .bind(q.market_id)
         .bind(q.ts)
         .bind(q.price)
@@ -55,7 +56,10 @@ pub async fn upsert_live_quote(pool: &PgPool, q: &SpotQuote) -> Result<(), sqlx:
         .bind(&q.vs_currency)
         .bind(&q.source)
         .execute(pool)
-        .await?;
+        .await;
+    // REQ-OBS-015: record quote insert latency regardless of outcome.
+    metrics::histogram!("quote_insert_duration_seconds").record(start.elapsed().as_secs_f64());
+    result?;
     Ok(())
 }
 
@@ -99,6 +103,7 @@ pub async fn upsert_candles(pool: &PgPool, candles: &[OhlcCandle]) -> Result<(),
     if candles.is_empty() {
         return Ok(());
     }
+    let start = std::time::Instant::now();
     let mut tx = pool.begin().await?;
     for c in candles {
         sqlx::query(UPSERT_CANDLE_SQL)
@@ -115,7 +120,10 @@ pub async fn upsert_candles(pool: &PgPool, candles: &[OhlcCandle]) -> Result<(),
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
+    let result = tx.commit().await;
+    // REQ-OBS-015: record candle batch insert latency regardless of outcome.
+    metrics::histogram!("candle_insert_duration_seconds").record(start.elapsed().as_secs_f64());
+    result?;
     Ok(())
 }
 

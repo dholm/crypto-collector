@@ -53,6 +53,16 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# OpenTelemetry OTLP tracing (SPEC-OBS-001 REQ-OBS-021..024).
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.33"
+
+# Prometheus metrics exposition (SPEC-OBS-001 REQ-OBS-010..015).
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+
 # HTTP server: axum 0.8 + tower ecosystem (SPEC-API-001).
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["full"] }

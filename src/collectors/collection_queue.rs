@@ -388,9 +388,29 @@ async fn dispatch_item(
                 vs_currency: info.quote.to_lowercase(),
             };
 
-            let candles = chain_fetch_ohlc_local(chain, &mq, 7)
-                .await
-                .map_err(|e| e.to_string())?;
+            // REQ-OBS-012/015: instrument provider call with counter + duration histogram.
+            let fetch_start = std::time::Instant::now();
+            let candles_result = chain_fetch_ohlc_local(chain, &mq, 7).await;
+            let fetch_dur = fetch_start.elapsed().as_secs_f64();
+            let outcome = if candles_result.is_ok() {
+                "success"
+            } else {
+                "error"
+            };
+            metrics::counter!(
+                "collection_requests_total",
+                "provider" => provider_name.clone(),
+                "capability" => "ohlc",
+                "outcome" => outcome,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "collection_request_duration_seconds",
+                "provider" => provider_name,
+                "capability" => "ohlc",
+            )
+            .record(fetch_dur);
+            let candles = candles_result.map_err(|e| e.to_string())?;
 
             upsert_candles(pool, &candles)
                 .await
@@ -434,9 +454,29 @@ async fn dispatch_item(
                 vs_currency: info.quote.to_lowercase(),
             };
 
-            let quote = chain_fetch_spot_local(chain, &mq)
-                .await
-                .map_err(|e| e.to_string())?;
+            // REQ-OBS-012/015: instrument provider call.
+            let fetch_start = std::time::Instant::now();
+            let quote_result = chain_fetch_spot_local(chain, &mq).await;
+            let fetch_dur = fetch_start.elapsed().as_secs_f64();
+            let outcome = if quote_result.is_ok() {
+                "success"
+            } else {
+                "error"
+            };
+            metrics::counter!(
+                "collection_requests_total",
+                "provider" => provider_name.clone(),
+                "capability" => "spot",
+                "outcome" => outcome,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "collection_request_duration_seconds",
+                "provider" => provider_name,
+                "capability" => "spot",
+            )
+            .record(fetch_dur);
+            let quote = quote_result.map_err(|e| e.to_string())?;
 
             upsert_live_quote(pool, &quote)
                 .await
@@ -480,9 +520,29 @@ async fn dispatch_item(
                 vs_currency: info.quote.to_lowercase(),
             };
 
-            let tick = chain_fetch_derivatives(chain, &mq)
-                .await
-                .map_err(|e| e.to_string())?;
+            // REQ-OBS-012/015: instrument provider call.
+            let fetch_start = std::time::Instant::now();
+            let tick_result = chain_fetch_derivatives(chain, &mq).await;
+            let fetch_dur = fetch_start.elapsed().as_secs_f64();
+            let outcome = if tick_result.is_ok() {
+                "success"
+            } else {
+                "error"
+            };
+            metrics::counter!(
+                "collection_requests_total",
+                "provider" => provider_name.clone(),
+                "capability" => "derivatives",
+                "outcome" => outcome,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "collection_request_duration_seconds",
+                "provider" => provider_name,
+                "capability" => "derivatives",
+            )
+            .record(fetch_dur);
+            let tick = tick_result.map_err(|e| e.to_string())?;
 
             upsert_derivatives_quote(pool, &tick)
                 .await
@@ -509,9 +569,29 @@ async fn dispatch_item(
                 Ok(()) => {}
             }
 
-            let meta = chain_fetch_coin_metadata(chain, coin_id)
-                .await
-                .map_err(|e| e.to_string())?;
+            // REQ-OBS-012/015: instrument provider call.
+            let fetch_start = std::time::Instant::now();
+            let meta_result = chain_fetch_coin_metadata(chain, coin_id).await;
+            let fetch_dur = fetch_start.elapsed().as_secs_f64();
+            let outcome = if meta_result.is_ok() {
+                "success"
+            } else {
+                "error"
+            };
+            metrics::counter!(
+                "collection_requests_total",
+                "provider" => provider_name.clone(),
+                "capability" => "coin_metadata",
+                "outcome" => outcome,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "collection_request_duration_seconds",
+                "provider" => provider_name,
+                "capability" => "coin_metadata",
+            )
+            .record(fetch_dur);
+            let meta = meta_result.map_err(|e| e.to_string())?;
 
             // Revision upsert (REQ-SCHED-042): new revision only if values changed.
             upsert_coin_metadata(pool, &meta)
@@ -539,9 +619,29 @@ async fn dispatch_item(
                 Ok(()) => {}
             }
 
-            let snapshot = chain_fetch_coin_market(chain, coin_id, "usd")
-                .await
-                .map_err(|e| e.to_string())?;
+            // REQ-OBS-012/015: instrument provider call.
+            let fetch_start = std::time::Instant::now();
+            let snapshot_result = chain_fetch_coin_market(chain, coin_id, "usd").await;
+            let fetch_dur = fetch_start.elapsed().as_secs_f64();
+            let outcome = if snapshot_result.is_ok() {
+                "success"
+            } else {
+                "error"
+            };
+            metrics::counter!(
+                "collection_requests_total",
+                "provider" => provider_name.clone(),
+                "capability" => "coin_market",
+                "outcome" => outcome,
+            )
+            .increment(1);
+            metrics::histogram!(
+                "collection_request_duration_seconds",
+                "provider" => provider_name,
+                "capability" => "coin_market",
+            )
+            .record(fetch_dur);
+            let snapshot = snapshot_result.map_err(|e| e.to_string())?;
 
             upsert_coin_market_snapshot(pool, &snapshot)
                 .await
