@@ -4,6 +4,8 @@
 /// SPEC-PROV-001: config (env-var loading), pacer (credit-aware upstream throttle),
 ///                providers (Provider trait + CoinGecko/Binance/Coinbase/Kraken chain).
 /// SPEC-SCHED-001: collectors (live-quote poller, collection-queue worker, backfill worker).
+/// SPEC-API-001: api (REST API server, /v1 router, OpenAPI v3.1 deliverable).
+pub mod api;
 pub mod collectors;
 pub mod config;
 pub mod db;

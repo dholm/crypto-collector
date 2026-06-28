@@ -1,0 +1,561 @@
+//! Coin management handlers (SPEC-API-001 REQ-API-010..013).
+//!
+//! Routes:
+//! - `GET  /v1/coins`            → list_coins (keyset-paginated)
+//! - `POST /v1/coins`            → register_coin (idempotent 201/200)
+//! - `GET  /v1/coins/search?q=`  → search_coins (provider-backed, paced)
+//! - `GET  /v1/coins/{coin_id}`  → get_coin
+//! - `PATCH /v1/coins/{coin_id}` → update_coin
+//! - `DELETE /v1/coins/{coin_id}`→ delete_coin (soft-deregister)
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use serde::Deserialize;
+
+use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
+
+use super::{
+    cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
+    dto::{
+        CoinDto, CoinSearchPage, CoinSearchResult, Page, RegisterCoinRequest, UpdateCoinRequest,
+    },
+    ApiError, ApiResult, AppState, SearchSlotResult,
+};
+
+// ── Query parameter types ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ListCoinsParams {
+    pub cursor: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchCoinsParams {
+    pub q: Option<String>,
+    pub limit: Option<i64>,
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+/// `GET /v1/coins` — keyset-paginated list of tracked coins (REQ-API-012).
+pub async fn list_coins(
+    State(state): State<AppState>,
+    Query(params): Query<ListCoinsParams>,
+) -> ApiResult<impl IntoResponse> {
+    let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // Decode cursor if present (REQ-API-071).
+    let cursor_coin_id: Option<String> = params
+        .cursor
+        .as_deref()
+        .map(|c| decode_keyset_cursor::<CoinListKey>(c).map(|k| k.coin_id))
+        .transpose()
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let items =
+        match cursor_coin_id {
+            None => {
+                sqlx::query_as::<_, crate::models::coin::TrackedCoin>(
+                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error \
+                 FROM tracked_coins \
+                 ORDER BY coin_id ASC \
+                 LIMIT $1",
+            )
+            .bind(limit + 1) // fetch one extra to detect next page
+            .fetch_all(&state.pool)
+            .await?
+            }
+            Some(ref after_coin_id) => sqlx::query_as::<_, crate::models::coin::TrackedCoin>(
+                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error \
+                 FROM tracked_coins \
+                 WHERE coin_id > $1 \
+                 ORDER BY coin_id ASC \
+                 LIMIT $2",
+            )
+            .bind(after_coin_id)
+            .bind(limit + 1)
+            .fetch_all(&state.pool)
+            .await?,
+        };
+
+    let (items, next_cursor) = paginate_coins(items, limit);
+    Ok(Json(Page {
+        items: items.into_iter().map(CoinDto::from).collect(),
+        next_cursor,
+    }))
+}
+
+/// `POST /v1/coins` — register a coin for collection (idempotent; REQ-API-010/011).
+pub async fn register_coin(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterCoinRequest>,
+) -> ApiResult<impl IntoResponse> {
+    validate_coin_id(&req.coin_id)?;
+
+    // Check for existing record (idempotency: REQ-API-011).
+    let existing: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
+        "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error \
+         FROM tracked_coins WHERE coin_id = $1",
+    )
+    .bind(&req.coin_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if let Some(coin) = existing {
+        return Ok((StatusCode::OK, Json(CoinDto::from(coin))).into_response());
+    }
+
+    // Insert new record.
+    let coin: crate::models::coin::TrackedCoin = sqlx::query_as(
+        "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+         VALUES ($1, $2, $3, 'active', now()) \
+         RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error",
+    )
+    .bind(&req.coin_id)
+    .bind(&req.symbol)
+    .bind(&req.name)
+    .fetch_one(&state.pool)
+    .await?;
+
+    // Enqueue initial collection (REQ-API-010: SPEC-SCHED-001).
+    for kind in &["metadata", "market"] {
+        sqlx::query(ENQUEUE_QUEUE_SQL)
+            .bind("coin")
+            .bind(&req.coin_id)
+            .bind(kind)
+            .execute(&state.pool)
+            .await?;
+    }
+
+    Ok((StatusCode::CREATED, Json(CoinDto::from(coin))).into_response())
+}
+
+/// `GET /v1/coins/search?q=` — search candidate coins via provider (REQ-API-013/080/081).
+///
+/// # Pacing (REQ-API-080/081)
+///
+/// Acquires a pacer slot via `state.search_slot_fn` with a bounded wait.
+/// Returns 503 when the slot, cooldown, or credit budget is unavailable.
+/// The search call counts against the same per-provider credit budget as worker traffic.
+pub async fn search_coins(
+    State(state): State<AppState>,
+    Query(params): Query<SearchCoinsParams>,
+) -> ApiResult<impl IntoResponse> {
+    let q = params.q.as_deref().unwrap_or("").trim().to_string();
+    let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let cap = limit.min(50) as usize; // cap search at 50 candidates
+
+    // Acquire pacer slot (REQ-API-080/081).
+    let slot_result = (state.search_slot_fn)(state.search_provider.clone()).await;
+    if let SearchSlotResult::Unavailable(reason) = slot_result {
+        return Err(ApiError::ServiceUnavailable(reason));
+    }
+
+    // Slot acquired: issue the upstream provider search call.
+    let items = do_coin_search(&state.http_client, &state.coingecko_base_url, &q, cap).await?;
+
+    Ok(Json(CoinSearchPage { items }))
+}
+
+/// `GET /v1/coins/{coin_id}` — get one tracked coin (REQ-API-012).
+pub async fn get_coin(
+    State(state): State<AppState>,
+    Path(coin_id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let coin: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
+        "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error \
+         FROM tracked_coins WHERE coin_id = $1",
+    )
+    .bind(&coin_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match coin {
+        Some(c) => Ok(Json(CoinDto::from(c)).into_response()),
+        None => Err(ApiError::NotFound(format!("coin '{coin_id}' not found"))),
+    }
+}
+
+/// `PATCH /v1/coins/{coin_id}` — update mutable fields (REQ-API-012).
+pub async fn update_coin(
+    State(state): State<AppState>,
+    Path(coin_id): Path<String>,
+    Json(req): Json<UpdateCoinRequest>,
+) -> ApiResult<impl IntoResponse> {
+    // Validate status if provided.
+    if let Some(ref s) = req.status {
+        validate_coin_status(s)?;
+    }
+
+    let coin: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
+        "UPDATE tracked_coins \
+         SET status = COALESCE($2, status), \
+             error  = COALESCE($3, error) \
+         WHERE coin_id = $1 \
+         RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error",
+    )
+    .bind(&coin_id)
+    .bind(&req.status)
+    .bind(&req.error)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    match coin {
+        Some(c) => Ok(Json(CoinDto::from(c)).into_response()),
+        None => Err(ApiError::NotFound(format!("coin '{coin_id}' not found"))),
+    }
+}
+
+/// `DELETE /v1/coins/{coin_id}` — soft-deregister (OR-API-4 resolved: soft-delete; REQ-API-012).
+///
+/// Sets `status = 'paused'` so the workers stop collecting but historical data is retained.
+pub async fn delete_coin(
+    State(state): State<AppState>,
+    Path(coin_id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let rows_affected = sqlx::query(
+        "UPDATE tracked_coins SET status = 'paused' WHERE coin_id = $1 AND status != 'paused'",
+    )
+    .bind(&coin_id)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+
+    if rows_affected == 0 {
+        // Either not found or already paused — check which.
+        let exists: Option<(String,)> =
+            sqlx::query_as("SELECT coin_id FROM tracked_coins WHERE coin_id = $1")
+                .bind(&coin_id)
+                .fetch_optional(&state.pool)
+                .await?;
+        if exists.is_none() {
+            return Err(ApiError::NotFound(format!("coin '{coin_id}' not found")));
+        }
+    }
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Paginate a vector fetched with `limit + 1`: returns the trimmed items and optional next cursor.
+fn paginate_coins(
+    mut items: Vec<crate::models::coin::TrackedCoin>,
+    limit: i64,
+) -> (Vec<crate::models::coin::TrackedCoin>, Option<String>) {
+    let has_more = items.len() as i64 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = items.last().expect("non-empty when has_more");
+        encode_keyset_cursor(&CoinListKey {
+            coin_id: last.coin_id.clone(),
+        })
+    });
+    (items, next_cursor)
+}
+
+fn validate_coin_id(coin_id: &str) -> ApiResult<()> {
+    if coin_id.trim().is_empty() {
+        return Err(ApiError::UnprocessableEntity(
+            "coin_id must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coin_status(status: &str) -> ApiResult<()> {
+    match status {
+        "active" | "paused" | "error" => Ok(()),
+        other => Err(ApiError::UnprocessableEntity(format!(
+            "invalid status '{other}': must be active, paused, or error"
+        ))),
+    }
+}
+
+/// Perform the upstream coin search via CoinGecko's `/search` endpoint.
+///
+/// Called only after the pacer slot has been acquired (REQ-API-080).
+async fn do_coin_search(
+    client: &reqwest::Client,
+    base_url: &str,
+    q: &str,
+    cap: usize,
+) -> ApiResult<Vec<CoinSearchResult>> {
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let url = format!("{base_url}/api/v3/search");
+    let resp = client
+        .get(&url)
+        .query(&[("query", q)])
+        .send()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    if !resp.status().is_success() {
+        // Non-fatal: return empty on upstream errors (SPEC-PROV-001 REQ-PROV-005 degradation)
+        return Ok(vec![]);
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| ApiError::Internal(e.into()))?;
+
+    let coins = body["coins"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .take(cap)
+        .filter_map(|c| {
+            Some(CoinSearchResult {
+                coin_id: c["id"].as_str()?.to_string(),
+                symbol: c["symbol"].as_str()?.to_string(),
+                name: c["name"].as_str()?.to_string(),
+            })
+        })
+        .collect();
+
+    Ok(coins)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum_test::TestServer;
+
+    // Helper: build a test router with deny search slot (for offline tests).
+    fn test_server_with_deny_pacer() -> TestServer {
+        use crate::api::{build_api_router, deny_search_slot_fn, AppState};
+        use std::sync::Arc;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/crypto_collector_test")
+            .expect("lazy pool");
+
+        let state = AppState {
+            pool,
+            chain: Arc::new(vec![]),
+            search_slot_fn: deny_search_slot_fn(),
+            search_provider: "coingecko".to_string(),
+            coingecko_base_url: "https://api.coingecko.com".to_string(),
+            http_client: reqwest::Client::new(),
+        };
+
+        TestServer::new(build_api_router(state))
+    }
+
+    // Scenario 15 (REQ-API-081): search returns 503 when pacer denies.
+    #[tokio::test]
+    async fn search_coins_returns_503_when_pacer_denies() {
+        let server = test_server_with_deny_pacer();
+        let resp = server
+            .get("/v1/coins/search")
+            .add_query_param("q", "bit")
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            503,
+            "search must return 503 when pacer denies"
+        );
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["code"], "SERVICE_UNAVAILABLE",
+            "error code must be SERVICE_UNAVAILABLE"
+        );
+    }
+
+    // Scenario 15: search returns 503 without an upstream HTTP call when pacer denies.
+    #[tokio::test]
+    async fn search_markets_returns_503_when_pacer_denies() {
+        let server = test_server_with_deny_pacer();
+        let resp = server
+            .get("/v1/markets/search")
+            .add_query_param("q", "btc")
+            .await;
+        assert_eq!(resp.status_code(), 503);
+    }
+
+    // Scenario 11 (REQ-API-072): invalid limit returns 400.
+    #[tokio::test]
+    async fn list_coins_invalid_limit_returns_400() {
+        let server = test_server_with_deny_pacer();
+        let resp = server
+            .get("/v1/coins")
+            .add_query_param("limit", "9999999")
+            .await;
+        assert_eq!(resp.status_code(), 400);
+    }
+
+    // Scenario 10 (REQ-API-071): invalid cursor returns 400.
+    #[tokio::test]
+    async fn list_coins_invalid_cursor_returns_400() {
+        let server = test_server_with_deny_pacer();
+        let resp = server
+            .get("/v1/coins")
+            .add_query_param("cursor", "not!!valid!!base64@@")
+            .await;
+        assert_eq!(resp.status_code(), 400);
+    }
+
+    // Scenario 1: route /v1/coins is registered (handler exists).
+    #[test]
+    fn list_coins_handler_exists() {
+        let _ = list_coins; // compile-time proof
+    }
+
+    #[test]
+    fn register_coin_handler_exists() {
+        let _ = register_coin;
+    }
+
+    #[test]
+    fn search_coins_handler_exists() {
+        let _ = search_coins;
+    }
+
+    // validate_coin_id rejects empty
+    #[test]
+    fn validate_coin_id_rejects_empty() {
+        assert!(validate_coin_id("").is_err());
+        assert!(validate_coin_id("   ").is_err());
+    }
+
+    #[test]
+    fn validate_coin_id_accepts_valid() {
+        assert!(validate_coin_id("bitcoin").is_ok());
+        assert!(validate_coin_id("ethereum").is_ok());
+    }
+
+    // validate_coin_status accepts valid values
+    #[test]
+    fn validate_coin_status_valid() {
+        assert!(validate_coin_status("active").is_ok());
+        assert!(validate_coin_status("paused").is_ok());
+        assert!(validate_coin_status("error").is_ok());
+    }
+
+    #[test]
+    fn validate_coin_status_rejects_unknown() {
+        assert!(validate_coin_status("deleted").is_err());
+        assert!(validate_coin_status("ACTIVE").is_err());
+    }
+
+    // paginate_coins: returns correct items and next_cursor
+    #[test]
+    fn paginate_coins_has_more_returns_cursor() {
+        use chrono::Utc;
+        let mut items = vec![];
+        for i in 0..3i64 {
+            items.push(crate::models::coin::TrackedCoin {
+                coin_id: format!("coin{i}"),
+                symbol: "X".into(),
+                name: "X".into(),
+                status: "active".into(),
+                registered_at: Utc::now(),
+                last_collected_at: None,
+                error: None,
+            });
+        }
+        let (trimmed, next_cursor) = paginate_coins(items, 2);
+        assert_eq!(trimmed.len(), 2);
+        assert!(
+            next_cursor.is_some(),
+            "should have next_cursor when has_more"
+        );
+        // Decode the cursor and verify it's the last item's coin_id
+        let key: CoinListKey = decode_keyset_cursor(next_cursor.as_ref().unwrap()).unwrap();
+        assert_eq!(key.coin_id, "coin1");
+    }
+
+    #[test]
+    fn paginate_coins_no_more_returns_null_cursor() {
+        use chrono::Utc;
+        let items = vec![crate::models::coin::TrackedCoin {
+            coin_id: "bitcoin".into(),
+            symbol: "BTC".into(),
+            name: "Bitcoin".into(),
+            status: "active".into(),
+            registered_at: Utc::now(),
+            last_collected_at: None,
+            error: None,
+        }];
+        let (trimmed, next_cursor) = paginate_coins(items, 100);
+        assert_eq!(trimmed.len(), 1);
+        assert!(next_cursor.is_none(), "no next_cursor when exhausted");
+    }
+
+    // DB-gated integration tests
+    #[tokio::test]
+    #[ignore]
+    async fn db_register_coin_returns_201_and_200_on_repeat() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let state = crate::api::AppState {
+            pool: pool.clone(),
+            chain: std::sync::Arc::new(vec![]),
+            search_slot_fn: crate::api::allow_search_slot_fn(),
+            search_provider: "coingecko".into(),
+            coingecko_base_url: "https://api.coingecko.com".into(),
+            http_client: reqwest::Client::new(),
+        };
+        let server = TestServer::new(crate::api::build_api_router(state));
+
+        // First POST → 201
+        let resp = server
+            .post("/v1/coins")
+            .json(&serde_json::json!({
+                "coin_id": "test-coin-api001",
+                "symbol": "TST",
+                "name": "Test Coin"
+            }))
+            .await;
+        assert_eq!(resp.status_code(), 201);
+
+        // Second POST (same coin_id) → 200
+        let resp2 = server
+            .post("/v1/coins")
+            .json(&serde_json::json!({
+                "coin_id": "test-coin-api001",
+                "symbol": "TST",
+                "name": "Test Coin"
+            }))
+            .await;
+        assert_eq!(resp2.status_code(), 200);
+
+        // Cleanup
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = 'test-coin-api001'")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn db_get_coin_not_found_returns_404() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let state = crate::api::AppState {
+            pool,
+            chain: std::sync::Arc::new(vec![]),
+            search_slot_fn: crate::api::deny_search_slot_fn(),
+            search_provider: "coingecko".into(),
+            coingecko_base_url: "https://api.coingecko.com".into(),
+            http_client: reqwest::Client::new(),
+        };
+        let server = TestServer::new(crate::api::build_api_router(state));
+        let resp = server.get("/v1/coins/no-such-coin-xyz-9999").await;
+        assert_eq!(resp.status_code(), 404);
+    }
+}

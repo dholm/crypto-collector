@@ -3,6 +3,7 @@
 /// SPEC-DB-001: connect pool + run migrations.
 /// SPEC-PROV-001: build provider chain from PROVIDERS env var.
 /// SPEC-SCHED-001: spawn live-poller, collection-queue worker, backfill worker (REQ-SCHED-050/051).
+/// SPEC-API-001: start REST API server on API_PORT (default 8080) alongside workers.
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -42,10 +43,49 @@ async fn main() -> Result<()> {
 
     // Spawn worker supervisor (REQ-SCHED-050/051).
     let cfg = crypto_collector::collectors::WorkerConfig::from_env();
-    let supervisor =
-        crypto_collector::collectors::spawn_workers(pool, chain, cfg, shutdown_rx).await;
+    let supervisor = crypto_collector::collectors::spawn_workers(
+        pool.clone(),
+        chain.clone(),
+        cfg,
+        shutdown_rx.clone(),
+    )
+    .await;
 
-    info!("crypto-collector: workers started; waiting for shutdown signal");
+    info!("crypto-collector: workers started");
+
+    // Start the REST API server on API_PORT (SPEC-API-001).
+    // SPEC-OBS-001 will add health (8081) and metrics (9000) alongside this.
+    let api_port: u16 = std::env::var("API_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8080);
+
+    let search_provider = provider_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "coingecko".to_string());
+    let coingecko_base_url = crypto_collector::config::coingecko_base_url();
+    let search_timeout_ms: u64 = std::env::var("SEARCH_PACER_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000);
+
+    let api_state = crypto_collector::api::AppState {
+        pool: pool.clone(),
+        chain: chain.clone(),
+        search_slot_fn: crypto_collector::api::make_db_search_slot_fn(pool, search_timeout_ms),
+        search_provider,
+        coingecko_base_url,
+        http_client: reqwest::Client::new(),
+    };
+
+    let api_handle = tokio::spawn(crypto_collector::api::start_api_server(
+        api_state,
+        api_port,
+        shutdown_rx.clone(),
+    ));
+
+    info!("crypto-collector: API server started on port {api_port}; waiting for shutdown signal");
 
     // Wait for SIGTERM or SIGINT.
     #[cfg(unix)]
@@ -64,9 +104,10 @@ async fn main() -> Result<()> {
         info!("Ctrl-C received");
     }
 
-    // Broadcast shutdown to all workers.
+    // Broadcast shutdown to all workers and API server.
     shutdown_tx.send(true).ok();
     supervisor.await.ok();
+    api_handle.await.ok();
 
     info!("crypto-collector: graceful shutdown complete");
     Ok(())

@@ -1,0 +1,1053 @@
+openapi: 3.1.0
+info:
+  title: Crypto Collector API
+  description: |
+    REST API for the Crypto Collector microservice (SPEC-API-001).
+    Provides management of tracked coins and markets, plus read access to
+    spot quotes, OHLCV candles, coin metadata, coin market aggregates, and
+    derivatives data.
+
+    **Decimal encoding**: all monetary/quantity fields are JSON strings to
+    preserve full precision (OR-API-2, REQ-API-073).
+
+    **Pagination**: keyset cursors (opaque base64url, O(1)-deep, stable
+    under concurrent inserts). Default page size: 100. Max: 1000.
+  version: 0.1.0
+  contact:
+    name: Crypto Collector team
+
+servers:
+  - url: /v1
+    description: v1 API base
+
+tags:
+  - name: coins
+    description: Tracked coin registry (base assets)
+  - name: markets
+    description: Tracked market registry (trading pairs)
+  - name: quotes
+    description: Spot quote time-series
+  - name: candles
+    description: OHLCV candle time-series
+  - name: metadata
+    description: Coin metadata revisions
+  - name: coin-market
+    description: Coin market aggregate snapshots
+  - name: derivatives
+    description: Derivatives quote time-series
+
+paths:
+  # ── Coin management ──────────────────────────────────────────────────────────
+
+  /coins:
+    get:
+      operationId: listCoins
+      tags: [coins]
+      summary: List tracked coins (keyset-paginated)
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Paginated coin list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      operationId: registerCoin
+      tags: [coins]
+      summary: Register a coin for tracking (idempotent)
+      description: |
+        Returns 201 on first registration, 200 if the coin_id already exists.
+        Enqueues a metadata and market collection job on creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterCoinRequest'
+      responses:
+        '201':
+          description: Coin registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Coin'
+        '200':
+          description: Coin already registered (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Coin'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /coins/search:
+    get:
+      operationId: searchCoins
+      tags: [coins]
+      summary: Search candidate coins to add (provider-backed, paced)
+      description: |
+        Calls the upstream provider (CoinGecko /search) to find coins matching
+        the query. Requires a pacer slot; returns 503 if the slot is unavailable
+        (provider cooldown, credit exhaustion, or timeout; REQ-API-080/081).
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query string
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Search results (up to 50 regardless of limit)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinSearchPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /coins/{coin_id}:
+    parameters:
+      - $ref: '#/components/parameters/coin_id'
+    get:
+      operationId: getCoin
+      tags: [coins]
+      summary: Get a tracked coin by coin_id
+      responses:
+        '200':
+          description: Coin found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Coin'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateCoin
+      tags: [coins]
+      summary: Update mutable coin fields
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCoinRequest'
+      responses:
+        '200':
+          description: Updated coin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Coin'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteCoin
+      tags: [coins]
+      summary: Soft-deregister a coin (sets status = paused)
+      responses:
+        '204':
+          description: Coin deregistered
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /coins/{coin_id}/metadata:
+    parameters:
+      - $ref: '#/components/parameters/coin_id'
+    get:
+      operationId: getCoinMetadata
+      tags: [metadata]
+      summary: Get coin metadata (latest or as-of revision)
+      description: |
+        Without `as_of`: returns the latest revision (highest revision number).
+        With `as_of`: returns the revision with the greatest `first_seen_at <= as_of`.
+      parameters:
+        - name: as_of
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Point-in-time for as-of revision lookup
+      responses:
+        '200':
+          description: Coin metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinMetadata'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /coins/{coin_id}/market/latest:
+    parameters:
+      - $ref: '#/components/parameters/coin_id'
+    get:
+      operationId: getCoinMarketLatest
+      tags: [coin-market]
+      summary: Get the latest coin market snapshot
+      parameters:
+        - name: vs_currency
+          in: query
+          schema:
+            type: string
+            default: usd
+          description: Quote currency (e.g. usd, btc)
+      responses:
+        '200':
+          description: Latest coin market snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinMarketSnapshot'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /coins/{coin_id}/market:
+    parameters:
+      - $ref: '#/components/parameters/coin_id'
+    get:
+      operationId: listCoinMarket
+      tags: [coin-market]
+      summary: List coin market snapshot history (keyset-paginated)
+      parameters:
+        - name: vs_currency
+          in: query
+          schema:
+            type: string
+            default: usd
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200':
+          description: Paginated coin market snapshot history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinMarketSnapshotPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Market management ────────────────────────────────────────────────────────
+
+  /markets:
+    get:
+      operationId: listMarkets
+      tags: [markets]
+      summary: List tracked markets (keyset-paginated, filterable)
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+        - name: base
+          in: query
+          schema:
+            type: string
+          description: Filter by base asset (ILIKE)
+        - name: quote
+          in: query
+          schema:
+            type: string
+          description: Filter by quote asset (ILIKE)
+        - name: venue
+          in: query
+          schema:
+            type: string
+          description: Filter by venue (ILIKE; matches NULL venue when empty string)
+      responses:
+        '200':
+          description: Paginated market list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+    post:
+      operationId: registerMarket
+      tags: [markets]
+      summary: Register a market for tracking (idempotent)
+      description: |
+        Unique on (base, quote, COALESCE(venue, '')).
+        Returns 201 on first registration, 200 if already exists.
+        Enqueues spot/candles/derivatives collection on creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterMarketRequest'
+      responses:
+        '201':
+          description: Market registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '200':
+          description: Market already registered (idempotent)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /markets/search:
+    get:
+      operationId: searchMarkets
+      tags: [markets]
+      summary: Search candidate markets to add (provider-backed, paced)
+      description: |
+        Calls the upstream provider to find markets matching the query.
+        Requires a pacer slot; returns 503 if unavailable (REQ-API-080/081).
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Market search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketSearchPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /markets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: getMarket
+      tags: [markets]
+      summary: Get a tracked market by id
+      responses:
+        '200':
+          description: Market found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      operationId: updateMarket
+      tags: [markets]
+      summary: Update mutable market fields
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateMarketRequest'
+      responses:
+        '200':
+          description: Updated market
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Market'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+    delete:
+      operationId: deleteMarket
+      tags: [markets]
+      summary: Soft-deregister a market (sets status = paused)
+      responses:
+        '204':
+          description: Market deregistered
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Market read endpoints ────────────────────────────────────────────────────
+
+  /markets/{id}/quotes/latest:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: getLatestQuote
+      tags: [quotes]
+      summary: Get the newest spot quote for a market
+      responses:
+        '200':
+          description: Latest spot quote
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Quote'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /markets/{id}/quotes:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: listQuotes
+      tags: [quotes]
+      summary: List spot quote history (keyset-paginated, time-range)
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200':
+          description: Paginated spot quote history (newest first)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuotePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /markets/{id}/candles:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: listCandles
+      tags: [candles]
+      summary: List OHLCV candles (interval required, keyset-paginated)
+      description: |
+        `interval` is required. Supported values: `1m`, `5m`, `15m`, `1h`, `4h`, `1d`, `1w`
+        (OR-API-1 resolved). Absent or invalid interval → 400.
+        `volume` is nullable for CoinGecko-sourced candles (REQ-API-042).
+      parameters:
+        - name: interval
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [1m, 5m, 15m, 1h, 4h, 1d, 1w]
+          description: Candle interval (required)
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200':
+          description: Paginated OHLCV candles (newest first)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandlePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /markets/{id}/derivatives/latest:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: getLatestDerivative
+      tags: [derivatives]
+      summary: Get the newest derivatives tick for a market
+      responses:
+        '200':
+          description: Latest derivatives tick
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivativesQuote'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /markets/{id}/derivatives:
+    parameters:
+      - $ref: '#/components/parameters/market_id'
+    get:
+      operationId: listDerivatives
+      tags: [derivatives]
+      summary: List derivatives tick history (keyset-paginated, time-range)
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/start'
+        - $ref: '#/components/parameters/end'
+      responses:
+        '200':
+          description: Paginated derivatives tick history (newest first)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DerivativesQuotePage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    coin_id:
+      name: coin_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: CoinGecko coin identifier (e.g. "bitcoin")
+
+    market_id:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+      description: Numeric market identifier
+
+    cursor:
+      name: cursor
+      in: query
+      schema:
+        type: string
+      description: Opaque keyset cursor from `next_cursor` of a previous page
+
+    limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+        maximum: 1000
+        default: 100
+      description: Number of items per page (default 100, max 1000)
+
+    start:
+      name: start
+      in: query
+      schema:
+        type: string
+        format: date-time
+      description: Inclusive start of time range (ISO-8601 UTC)
+
+    end:
+      name: end
+      in: query
+      schema:
+        type: string
+        format: date-time
+      description: Inclusive end of time range (ISO-8601 UTC)
+
+  responses:
+    BadRequest:
+      description: Malformed request (invalid cursor, bad limit, unknown interval, etc.)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    NotFound:
+      description: Requested resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    UnprocessableEntity:
+      description: Request is syntactically valid but semantically invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+    ServiceUnavailable:
+      description: Upstream provider unavailable (pacer cooldown, credit exhaustion, or timeout)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+
+  schemas:
+    # ── Shared ──────────────────────────────────────────────────────────────────
+
+    ApiError:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+          example: NOT_FOUND
+        message:
+          type: string
+          description: Human-readable description
+          example: coin 'bitcoin' not found
+
+    Page:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: {}
+        next_cursor:
+          type: string
+          nullable: true
+          description: Opaque cursor for the next page; null when exhausted
+
+    DecimalString:
+      type: string
+      description: |
+        Arbitrary-precision decimal serialized as a JSON string.
+        Example: "67123.456789", "0.00000000001234", "589000000000000".
+      example: "67123.456789"
+
+    # ── Coin schemas ─────────────────────────────────────────────────────────────
+
+    Coin:
+      type: object
+      required: [coin_id, symbol, name, status, registered_at]
+      properties:
+        coin_id:
+          type: string
+          description: CoinGecko identifier
+          example: bitcoin
+        symbol:
+          type: string
+          example: btc
+        name:
+          type: string
+          example: Bitcoin
+        status:
+          type: string
+          enum: [active, paused, error]
+        registered_at:
+          type: string
+          format: date-time
+        last_collected_at:
+          type: string
+          format: date-time
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    CoinPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Coin'
+
+    RegisterCoinRequest:
+      type: object
+      required: [coin_id, symbol, name]
+      properties:
+        coin_id:
+          type: string
+        symbol:
+          type: string
+        name:
+          type: string
+
+    UpdateCoinRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, paused, error]
+        error:
+          type: string
+          nullable: true
+
+    CoinSearchResult:
+      type: object
+      required: [coin_id, symbol, name]
+      properties:
+        coin_id:
+          type: string
+        symbol:
+          type: string
+        name:
+          type: string
+
+    CoinSearchPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CoinSearchResult'
+
+    # ── Market schemas ───────────────────────────────────────────────────────────
+
+    Market:
+      type: object
+      required: [id, base, quote, kind, status, registered_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        base:
+          type: string
+          example: BTC
+        quote:
+          type: string
+          example: USD
+        venue:
+          type: string
+          nullable: true
+          description: Trading venue/exchange; null = aggregator-level pair
+          example: binance
+        coin_id:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum: [spot, perpetual, futures]
+        status:
+          type: string
+          enum: [active, paused, error]
+        registered_at:
+          type: string
+          format: date-time
+        last_collected_at:
+          type: string
+          format: date-time
+          nullable: true
+        error:
+          type: string
+          nullable: true
+        live_poll_interval_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: Per-market poll cadence override in milliseconds; null = use global default
+
+    MarketPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Market'
+
+    RegisterMarketRequest:
+      type: object
+      required: [base, quote]
+      properties:
+        base:
+          type: string
+        quote:
+          type: string
+        venue:
+          type: string
+          nullable: true
+        coin_id:
+          type: string
+          nullable: true
+        kind:
+          type: string
+          enum: [spot, perpetual, futures]
+          default: spot
+
+    UpdateMarketRequest:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [active, paused, error]
+        error:
+          type: string
+          nullable: true
+        live_poll_interval_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: Per-market poll cadence in ms; null = revert to global default
+
+    MarketSearchResult:
+      type: object
+      required: [base, quote]
+      properties:
+        base:
+          type: string
+        quote:
+          type: string
+        venue:
+          type: string
+          nullable: true
+
+    MarketSearchPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarketSearchResult'
+
+    # ── Quote schemas ────────────────────────────────────────────────────────────
+
+    Quote:
+      type: object
+      required: [market_id, ts, price, vs_currency, source]
+      properties:
+        market_id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        as_of:
+          type: string
+          format: date-time
+          nullable: true
+        price:
+          $ref: '#/components/schemas/DecimalString'
+        bid:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        ask:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        bid_size:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        ask_size:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        volume_24h:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        vs_currency:
+          type: string
+        source:
+          type: string
+
+    QuotePage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Quote'
+
+    # ── Candle schemas ───────────────────────────────────────────────────────────
+
+    Candle:
+      type: object
+      required: [market_id, interval, ts, open, high, low, close, vs_currency, source]
+      properties:
+        market_id:
+          type: integer
+          format: int64
+        interval:
+          type: string
+          enum: [1m, 5m, 15m, 1h, 4h, 1d, 1w]
+        ts:
+          type: string
+          format: date-time
+        open:
+          $ref: '#/components/schemas/DecimalString'
+        high:
+          $ref: '#/components/schemas/DecimalString'
+        low:
+          $ref: '#/components/schemas/DecimalString'
+        close:
+          $ref: '#/components/schemas/DecimalString'
+        volume:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: "Nullable: CoinGecko OHLC endpoint does not include per-candle volume"
+        vs_currency:
+          type: string
+        source:
+          type: string
+
+    CandlePage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/Candle'
+
+    # ── Coin metadata schemas ────────────────────────────────────────────────────
+
+    CoinMetadata:
+      type: object
+      required: [coin_id, revision, name, symbol, first_seen_at, last_seen_at]
+      properties:
+        coin_id:
+          type: string
+        revision:
+          type: integer
+          format: int32
+          description: 0-based revision counter; incremented only on value change
+        name:
+          type: string
+        symbol:
+          type: string
+        categories:
+          type: array
+          items:
+            type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        homepage:
+          type: string
+          nullable: true
+        links:
+          type: object
+          nullable: true
+          description: Structured links (social, repos, etc.) as JSONB
+        contract_addresses:
+          type: object
+          nullable: true
+          description: Contract addresses per blockchain as JSONB
+        max_supply:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: "Maximum supply; null for assets without hard cap (e.g. ETH)"
+        genesis_date:
+          type: string
+          format: date
+          nullable: true
+        first_seen_at:
+          type: string
+          format: date-time
+        last_seen_at:
+          type: string
+          format: date-time
+
+    # ── Coin market aggregate schemas ────────────────────────────────────────────
+
+    CoinMarketSnapshot:
+      type: object
+      required: [coin_id, vs_currency, ts, price, source]
+      properties:
+        coin_id:
+          type: string
+        vs_currency:
+          type: string
+        ts:
+          type: string
+          format: date-time
+        price:
+          $ref: '#/components/schemas/DecimalString'
+        market_cap:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        fully_diluted_valuation:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        circulating_supply:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        total_supply:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        volume_24h:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        source:
+          type: string
+
+    CoinMarketSnapshotPage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/CoinMarketSnapshot'
+
+    # ── Derivatives schemas ──────────────────────────────────────────────────────
+
+    DerivativesQuote:
+      type: object
+      required: [market_id, ts, source]
+      properties:
+        market_id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        funding_rate:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: Periodic payment rate between longs and shorts (can be negative)
+        open_interest:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: Total notional value of open positions in contract units
+        open_interest_usd:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: Open interest denominated in USD
+        mark_price:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: Exchange mark price (used for liquidation)
+        index_price:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: Broad index average (spot reference)
+        basis:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: mark_price - index_price
+        volume_24h:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+        contract_type:
+          type: string
+          nullable: true
+          example: perpetual
+        venue:
+          type: string
+          nullable: true
+        source:
+          type: string
+
+    DerivativesQuotePage:
+      allOf:
+        - $ref: '#/components/schemas/Page'
+        - type: object
+          properties:
+            items:
+              type: array
+              items:
+                $ref: '#/components/schemas/DerivativesQuote'
