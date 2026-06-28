@@ -4,8 +4,8 @@
 //! capabilities in this SPEC scope. Full implementation is deferred to a future SPEC.
 
 use super::{
-    Capability, CoinMarket, CoinMeta, DerivTick, MarketQuery, OhlcCandle, Provider, ProviderError,
-    SpotQuote,
+    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, OhlcCandle,
+    Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
 use sqlx::PgPool;
@@ -57,6 +57,14 @@ impl Provider for CoinbaseProvider {
 
     async fn fetch_derivatives(&self, _market: &MarketQuery) -> Result<DerivTick, ProviderError> {
         Err(ProviderError::NotSupported(Capability::Derivatives))
+    }
+
+    async fn search_coins(
+        &self,
+        _q: &str,
+        _cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        Ok(vec![])
     }
 }
 

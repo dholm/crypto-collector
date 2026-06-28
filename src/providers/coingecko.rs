@@ -10,8 +10,8 @@
 //! - Pacer: every outbound call acquires `upstream_request_pacer` slot before HTTP.
 
 use super::{
-    Capability, CoinMarket, CoinMeta, DerivTick, MarketQuery, OhlcCandle, Provider, ProviderError,
-    SpotQuote,
+    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, OhlcCandle,
+    Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -292,6 +292,68 @@ impl CoinGeckoClient {
         resp.json::<CgCoinDetail>()
             .await
             .map_err(|e| ProviderError::Parse(format!("coin detail parse error: {e}")))
+    }
+
+    /// `GET /api/v3/search` — search coins by name / symbol (SPEC-PROV-001 REQ-PROV-005).
+    ///
+    /// Uses the authenticated `get()` helper so the correct tier key header is attached.
+    /// Returns up to `cap` results. Empty `q` returns `Ok(vec![])` immediately.
+    ///
+    /// On upstream non-success the call degrades to `Ok(vec![])` (REQ-PROV-005) and
+    /// emits a WARN log carrying the HTTP status, query string, and a 512-char body preview
+    /// so operators can distinguish rate-limit / auth failures from a genuinely empty result.
+    pub async fn search_coins(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        if q.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let resp = self
+            .get("/api/v3/search")
+            .query(&[("query", q)])
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // Non-fatal: degrade to empty on upstream errors (REQ-PROV-005).
+            // Log at WARN so operators can distinguish rate-limit / auth failures
+            // from a genuinely empty result set.
+            let body_text = resp.text().await.unwrap_or_default();
+            let body_preview: String = body_text.chars().take(512).collect();
+            tracing::warn!(
+                http.status = %status,
+                q = q,
+                upstream_body = %body_preview,
+                "upstream CoinGecko /search returned non-success; degrading to empty result"
+            );
+            return Ok(vec![]);
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("search parse error: {e}")))?;
+
+        let coins = body["coins"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(cap)
+            .filter_map(|c| {
+                Some(CoinSearchResult {
+                    coin_id: c["id"].as_str()?.to_string(),
+                    symbol: c["symbol"].as_str()?.to_string(),
+                    name: c["name"].as_str()?.to_string(),
+                })
+            })
+            .collect();
+
+        Ok(coins)
     }
 
     /// `GET /derivatives/tickers` — all derivatives tickers.
@@ -715,6 +777,14 @@ impl Provider for CoinGeckoProvider {
             })?;
 
         normalise_deriv_ticker(ticker, market.market_id)
+    }
+
+    async fn search_coins(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        self.client.search_coins(q, cap).await
     }
 }
 
@@ -1215,6 +1285,128 @@ mod tests {
         let client = CoinGeckoClient::new(cfg);
         let result = client.fetch_markets(&[], "usd").await;
         assert!(result.is_ok(), "pro key header must be sent");
+    }
+
+    // ── Scenario 16 (REQ-PROV-005): search_coins sends demo key and parses coins array ──
+
+    #[tokio::test]
+    async fn search_coins_sends_demo_key_header_and_parses_response() {
+        use wiremock::matchers::{header_exists, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "coins": [
+                {"id": "bitcoin", "symbol": "btc", "name": "Bitcoin", "market_cap_rank": 1},
+                {"id": "bitcoin-cash", "symbol": "bch", "name": "Bitcoin Cash", "market_cap_rank": 19}
+            ],
+            "exchanges": [],
+            "icos": [],
+            "categories": [],
+            "nfts": []
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .and(query_param("query", "bitcoin"))
+            .and(header_exists("x-cg-demo-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: Some("test-demo-key".to_string()),
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .search_coins("bitcoin", 10)
+            .await
+            .expect("search_coins");
+
+        assert_eq!(results.len(), 2, "expected 2 coin results");
+        assert_eq!(results[0].coin_id, "bitcoin");
+        assert_eq!(results[0].symbol, "btc");
+        assert_eq!(results[0].name, "Bitcoin");
+        assert_eq!(results[1].coin_id, "bitcoin-cash");
+    }
+
+    #[tokio::test]
+    async fn search_coins_empty_query_returns_empty_without_http_call() {
+        // No wiremock server — any real HTTP call would fail with connection refused.
+        let cfg = CoinGeckoConfig {
+            base_url: "http://127.0.0.1:1".to_string(), // unreachable
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client.search_coins("", 10).await.expect("empty q");
+        assert!(results.is_empty(), "empty query must return empty vec without HTTP call");
+    }
+
+    #[tokio::test]
+    async fn search_coins_degrades_to_empty_on_non_success() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .search_coins("bitcoin", 10)
+            .await
+            .expect("should degrade, not error");
+
+        assert!(
+            results.is_empty(),
+            "non-success upstream must degrade to empty (REQ-PROV-005)"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_coins_respects_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "coins": [
+                {"id": "bitcoin", "symbol": "btc", "name": "Bitcoin"},
+                {"id": "bitcoin-cash", "symbol": "bch", "name": "Bitcoin Cash"},
+                {"id": "bitcoin-sv", "symbol": "bsv", "name": "Bitcoin SV"}
+            ],
+            "exchanges": []
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client.search_coins("bitcoin", 2).await.expect("search");
+
+        assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
     }
 
     // Live API smoke test (gated — requires real CoinGecko key)

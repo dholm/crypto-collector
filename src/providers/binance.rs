@@ -7,8 +7,8 @@
 //! Research §2.3 D5: "Binance is the second provider in the fallback chain for OHLC."
 
 use super::{
-    Capability, CoinMarket, CoinMeta, DerivTick, MarketQuery, OhlcCandle, Provider, ProviderError,
-    SpotQuote,
+    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, OhlcCandle,
+    Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
 use chrono::DateTime;
@@ -291,6 +291,14 @@ impl Provider for BinanceProvider {
 
     async fn fetch_derivatives(&self, _market: &MarketQuery) -> Result<DerivTick, ProviderError> {
         Err(ProviderError::NotSupported(Capability::Derivatives))
+    }
+
+    async fn search_coins(
+        &self,
+        _q: &str,
+        _cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        Ok(vec![])
     }
 }
 

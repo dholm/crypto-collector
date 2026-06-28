@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use thiserror::Error;
@@ -114,6 +115,17 @@ pub struct CoinMarket {
     pub total_supply: Option<Decimal>,
     pub volume_24h: Option<Decimal>,
     pub source: String,
+}
+
+/// Coin search result returned from a provider search (SPEC-PROV-001 REQ-PROV-005).
+///
+/// Shared between the provider layer and the API layer so that
+/// `CoinGeckoClient::search_coins` and `GET /v1/coins/search` operate on one type.
+#[derive(Debug, Clone, Serialize)]
+pub struct CoinSearchResult {
+    pub coin_id: String,
+    pub symbol: String,
+    pub name: String,
 }
 
 /// Normalised derivative tick (provider-level).
@@ -239,6 +251,18 @@ pub trait Provider: Send + Sync {
 
     /// Fetch the latest derivative tick (funding rate, OI, mark/index, basis).
     async fn fetch_derivatives(&self, market: &MarketQuery) -> Result<DerivTick, ProviderError>;
+
+    /// Search for coins by name / symbol (SPEC-PROV-001 REQ-PROV-005).
+    ///
+    /// Returns up to `cap` results. Providers that do not support coin search return `Ok(vec![])`.
+    /// Upstream non-success responses degrade to empty (REQ-PROV-005) and are WARN-logged by the
+    /// client; callers should treat `Err` from this method as a network-level failure and may
+    /// choose to degrade to empty rather than propagate.
+    async fn search_coins(
+        &self,
+        q: &str,
+        cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError>;
 }
 
 // ── Chain builder ─────────────────────────────────────────────────────────────
@@ -470,6 +494,13 @@ mod tests {
                 body: "stub error".to_string(),
             })
         }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
     }
 
     #[async_trait]
@@ -511,6 +542,13 @@ mod tests {
         }
         async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
             Err(ProviderError::NotSupported(Capability::Derivatives))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
         }
     }
 
@@ -616,6 +654,13 @@ mod tests {
                 _m: &MarketQuery,
             ) -> Result<DerivTick, ProviderError> {
                 Err(ProviderError::NotSupported(Capability::Derivatives))
+            }
+            async fn search_coins(
+                &self,
+                _q: &str,
+                _cap: usize,
+            ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+                Ok(vec![])
             }
         }
 

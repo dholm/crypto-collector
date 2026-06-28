@@ -20,9 +20,7 @@ use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
-    dto::{
-        CoinDto, CoinSearchPage, CoinSearchResult, Page, RegisterCoinRequest, UpdateCoinRequest,
-    },
+    dto::{CoinDto, CoinSearchPage, Page, RegisterCoinRequest, UpdateCoinRequest},
     ApiError, ApiResult, AppState, SearchSlotResult,
 };
 
@@ -156,8 +154,31 @@ pub async fn search_coins(
         return Err(ApiError::ServiceUnavailable(reason));
     }
 
-    // Slot acquired: issue the upstream provider search call.
-    let items = do_coin_search(&state.http_client, &state.coingecko_base_url, &q, cap).await?;
+    // Slot acquired: look up the named provider and delegate the upstream call so auth,
+    // base URL, and tier are handled in one place (CoinGeckoClient::search_coins).
+    let provider = state
+        .chain
+        .iter()
+        .find(|p| p.name() == state.search_provider.as_str())
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(format!(
+                "search provider '{}' not found in chain",
+                state.search_provider
+            ))
+        })?;
+
+    let items = match provider.search_coins(&q, cap).await {
+        Ok(coins) => coins,
+        Err(e) => {
+            // Network / parse errors: degrade to empty and WARN (REQ-PROV-005).
+            tracing::warn!(
+                error = %e,
+                q = %q,
+                "search_coins provider call failed; degrading to empty result"
+            );
+            vec![]
+        }
+    };
 
     Ok(Json(CoinSearchPage { items }))
 }
@@ -277,55 +298,6 @@ fn validate_coin_status(status: &str) -> ApiResult<()> {
             "invalid status '{other}': must be active, paused, or error"
         ))),
     }
-}
-
-/// Perform the upstream coin search via CoinGecko's `/search` endpoint.
-///
-/// Called only after the pacer slot has been acquired (REQ-API-080).
-async fn do_coin_search(
-    client: &reqwest::Client,
-    base_url: &str,
-    q: &str,
-    cap: usize,
-) -> ApiResult<Vec<CoinSearchResult>> {
-    if q.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let url = format!("{base_url}/api/v3/search");
-    let resp = client
-        .get(&url)
-        .query(&[("query", q)])
-        .send()
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    if !resp.status().is_success() {
-        // Non-fatal: return empty on upstream errors (SPEC-PROV-001 REQ-PROV-005 degradation)
-        return Ok(vec![]);
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Internal(e.into()))?;
-
-    let coins = body["coins"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .take(cap)
-        .filter_map(|c| {
-            Some(CoinSearchResult {
-                coin_id: c["id"].as_str()?.to_string(),
-                symbol: c["symbol"].as_str()?.to_string(),
-                name: c["name"].as_str()?.to_string(),
-            })
-        })
-        .collect();
-
-    Ok(coins)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

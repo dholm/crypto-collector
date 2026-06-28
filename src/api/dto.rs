@@ -84,13 +84,9 @@ pub struct UpdateCoinRequest {
     pub error: Option<String>,
 }
 
-/// Response DTO for a coin search result.
-#[derive(Debug, Serialize)]
-pub struct CoinSearchResult {
-    pub coin_id: String,
-    pub symbol: String,
-    pub name: String,
-}
+// CoinSearchResult is defined in the providers layer so that `CoinGeckoClient::search_coins`
+// and the API handler share one type without a circular dependency.
+pub use crate::providers::CoinSearchResult;
 
 /// Response DTO for coin search page.
 #[derive(Debug, Serialize)]
