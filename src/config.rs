@@ -64,6 +64,121 @@ pub fn pacer_cooldown_ms(provider: &str) -> u64 {
         .unwrap_or(60_000)
 }
 
+// ── SPEC-SCHED-001 scheduling knobs (OR-SCHED-1 resolved) ────────────────────
+
+/// Stable per-replica identifier used in `claimed_by` for lease fencing.
+///
+/// Env var: `REPLICA_ID` (optional). Defaults to a UUID v4 generated at startup.
+/// Stable for the lifetime of the process.
+pub fn replica_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("REPLICA_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string())
+    })
+}
+
+/// Live-quote poll cadence in seconds (global default, per-market may override).
+///
+/// Env var: `LIVE_QUOTE_POLL_INTERVAL_SECS`. Default: 60 s.
+/// Respects CoinGecko Demo tier budget (30 calls/min = 2 s/call; 60 s handles ~30 active markets).
+pub fn live_quote_poll_interval_secs() -> i64 {
+    parse_env_i64("LIVE_QUOTE_POLL_INTERVAL_SECS", 60)
+}
+
+/// TTL for the live-poll in-flight claim marker in seconds.
+///
+/// Env var: `LIVE_POLL_CLAIM_TTL_SECS`. Default: 120 s.
+/// Must exceed the time needed to pace + fetch one market (2 s pacer gap + network latency).
+pub fn live_poll_claim_ttl_secs() -> i64 {
+    parse_env_i64("LIVE_POLL_CLAIM_TTL_SECS", 120)
+}
+
+/// Collection-queue worker lease duration in seconds.
+///
+/// Env var: `COLLECTION_LEASE_SECONDS`. Default: 120 s.
+pub fn collection_lease_secs() -> i64 {
+    parse_env_i64("COLLECTION_LEASE_SECONDS", 120)
+}
+
+/// Collection-queue worker heartbeat renewal cadence in seconds.
+///
+/// Env var: `COLLECTION_HEARTBEAT_INTERVAL_SECONDS`. Default: 30 s.
+pub fn collection_heartbeat_interval_secs() -> u64 {
+    parse_env_u64("COLLECTION_HEARTBEAT_INTERVAL_SECONDS", 30)
+}
+
+/// Maximum claim attempts before a collection-queue row is permanently failed.
+///
+/// Env var: `COLLECTION_MAX_ATTEMPTS`. Default: 5.
+pub fn collection_max_attempts() -> i32 {
+    parse_env_i32("COLLECTION_MAX_ATTEMPTS", 5)
+}
+
+/// Sleep duration in milliseconds when the collection queue is empty.
+///
+/// Env var: `COLLECTION_IDLE_SLEEP_MS`. Default: 1 000 ms.
+pub fn collection_idle_sleep_ms() -> u64 {
+    parse_env_u64("COLLECTION_IDLE_SLEEP_MS", 1_000)
+}
+
+/// Backfill worker chunk lease duration in seconds.
+///
+/// Env var: `BACKFILL_LEASE_SECONDS`. Default: 300 s (5 min for large historical fetches).
+pub fn backfill_lease_secs() -> i64 {
+    parse_env_i64("BACKFILL_LEASE_SECONDS", 300)
+}
+
+/// Backfill worker heartbeat renewal cadence in seconds.
+///
+/// Env var: `BACKFILL_HEARTBEAT_INTERVAL_SECONDS`. Default: 60 s.
+pub fn backfill_heartbeat_interval_secs() -> u64 {
+    parse_env_u64("BACKFILL_HEARTBEAT_INTERVAL_SECONDS", 60)
+}
+
+/// Maximum chunk attempts before a backfill chunk is permanently failed.
+///
+/// Env var: `BACKFILL_MAX_ATTEMPTS`. Default: 5.
+pub fn backfill_max_attempts() -> i32 {
+    parse_env_i32("BACKFILL_MAX_ATTEMPTS", 5)
+}
+
+/// Sleep duration in milliseconds when the backfill chunk queue is empty.
+///
+/// Env var: `BACKFILL_IDLE_SLEEP_MS`. Default: 1 000 ms.
+pub fn backfill_idle_sleep_ms() -> u64 {
+    parse_env_u64("BACKFILL_IDLE_SLEEP_MS", 1_000)
+}
+
+/// Metadata periodic-refresh cadence in seconds (OR-SCHED-3 resolved).
+///
+/// Env var: `METADATA_REFRESH_INTERVAL_SECS`. Default: 86 400 s (24 h).
+pub fn metadata_refresh_interval_secs() -> u64 {
+    parse_env_u64("METADATA_REFRESH_INTERVAL_SECS", 86_400)
+}
+
+// ── Internal env-var helpers ──────────────────────────────────────────────────
+
+fn parse_env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +213,65 @@ mod tests {
         if std::env::var(key).is_err() {
             assert_eq!(pacer_cooldown_ms("testprovider"), 60_000);
         }
+    }
+
+    // ── SPEC-SCHED-001 scheduling knob defaults (OR-SCHED-1) ─────────────────
+
+    #[test]
+    fn live_quote_poll_interval_secs_default() {
+        if std::env::var("LIVE_QUOTE_POLL_INTERVAL_SECS").is_err() {
+            assert_eq!(live_quote_poll_interval_secs(), 60);
+        }
+    }
+
+    #[test]
+    fn live_poll_claim_ttl_secs_default() {
+        if std::env::var("LIVE_POLL_CLAIM_TTL_SECS").is_err() {
+            assert_eq!(live_poll_claim_ttl_secs(), 120);
+        }
+    }
+
+    #[test]
+    fn collection_lease_secs_default() {
+        if std::env::var("COLLECTION_LEASE_SECONDS").is_err() {
+            assert_eq!(collection_lease_secs(), 120);
+        }
+    }
+
+    #[test]
+    fn collection_max_attempts_default() {
+        if std::env::var("COLLECTION_MAX_ATTEMPTS").is_err() {
+            assert_eq!(collection_max_attempts(), 5);
+        }
+    }
+
+    #[test]
+    fn backfill_lease_secs_default() {
+        if std::env::var("BACKFILL_LEASE_SECONDS").is_err() {
+            assert_eq!(backfill_lease_secs(), 300);
+        }
+    }
+
+    #[test]
+    fn backfill_max_attempts_default() {
+        if std::env::var("BACKFILL_MAX_ATTEMPTS").is_err() {
+            assert_eq!(backfill_max_attempts(), 5);
+        }
+    }
+
+    #[test]
+    fn metadata_refresh_interval_default() {
+        if std::env::var("METADATA_REFRESH_INTERVAL_SECS").is_err() {
+            assert_eq!(metadata_refresh_interval_secs(), 86_400);
+        }
+    }
+
+    #[test]
+    fn replica_id_is_stable_within_process() {
+        // Calling replica_id() twice returns the same value.
+        let id1 = replica_id();
+        let id2 = replica_id();
+        assert_eq!(id1, id2);
+        assert!(!id1.is_empty());
     }
 }

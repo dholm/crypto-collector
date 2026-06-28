@@ -3,6 +3,8 @@
 /// SPEC-DB-001: db (pool + migration runner) and models (schema-mapped structs).
 /// SPEC-PROV-001: config (env-var loading), pacer (credit-aware upstream throttle),
 ///                providers (Provider trait + CoinGecko/Binance/Coinbase/Kraken chain).
+/// SPEC-SCHED-001: collectors (live-quote poller, collection-queue worker, backfill worker).
+pub mod collectors;
 pub mod config;
 pub mod db;
 pub mod models;
