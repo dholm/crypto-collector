@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crypto-collector.fullname" . }}
+  labels:
+    {{- include "crypto-collector.labels" . | nindent 4 }}
+data:
+  # ── Port and observability (SPEC-OBS-001) ────────────────────────────────────
+  {{- range $key, $val := .Values.env }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+
+  # ── Shutdown timing (SPEC-OBS-001 REQ-OBS-030..033) ─────────────────────────
+  SHUTDOWN_GRACE_SECONDS: {{ .Values.shutdown.graceSeconds | quote }}
+  SHUTDOWN_DRAIN_SECONDS: {{ .Values.shutdown.drainSeconds | quote }}
+
+  # ── Database connection parameters (SPEC-DB-001) ─────────────────────────────
+  # DB_HOST / DB_PORT / DB_NAME are provided for reference and operator tooling.
+  # The current binary reads DATABASE_URL directly; DATABASE_URL is injected
+  # from a Kubernetes Secret (see deployment.yaml env[]) — never here.
+  DB_HOST: {{ .Values.database.host | quote }}
+  DB_PORT: {{ .Values.database.port | quote }}
+  DB_NAME: {{ .Values.database.name | quote }}
+
+  # ── Provider chain (SPEC-PROV-001) ───────────────────────────────────────────
+  PROVIDERS: {{ .Values.providers | quote }}
+
+  # ── CoinGecko provider (SPEC-PROV-001) ────────────────────────────────────────
+  COINGECKO_TIER: {{ .Values.coingecko.tier | quote }}
+  {{- if .Values.coingecko.baseUrl }}
+  COINGECKO_BASE_URL: {{ .Values.coingecko.baseUrl | quote }}
+  {{- end }}
+  # COINGECKO_API_KEY is injected via secretKeyRef — never here (REQ-CFG-007).
+
+  # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
+  PACER_COINGECKO_COOLDOWN_MS: {{ .Values.pacer.coingeckoCooldownMs | quote }}
+
+  # ── Scheduling knobs (SPEC-SCHED-001) ─────────────────────────────────────────
+  LIVE_QUOTE_POLL_INTERVAL_SECS: {{ .Values.schedule.liveQuotePollIntervalSecs | quote }}
+  LIVE_POLL_CLAIM_TTL_SECS: {{ .Values.schedule.livePollClaimTtlSecs | quote }}
+  COLLECTION_LEASE_SECONDS: {{ .Values.schedule.collectionLeaseSeconds | quote }}
+  COLLECTION_HEARTBEAT_INTERVAL_SECONDS: {{ .Values.schedule.collectionHeartbeatIntervalSeconds | quote }}
+  COLLECTION_MAX_ATTEMPTS: {{ .Values.schedule.collectionMaxAttempts | quote }}
+  COLLECTION_IDLE_SLEEP_MS: {{ .Values.schedule.collectionIdleSleepMs | quote }}
+  BACKFILL_LEASE_SECONDS: {{ .Values.schedule.backfillLeaseSeconds | quote }}
+  BACKFILL_HEARTBEAT_INTERVAL_SECONDS: {{ .Values.schedule.backfillHeartbeatIntervalSeconds | quote }}
+  BACKFILL_MAX_ATTEMPTS: {{ .Values.schedule.backfillMaxAttempts | quote }}
+  BACKFILL_IDLE_SLEEP_MS: {{ .Values.schedule.backfillIdleSleepMs | quote }}
+  METADATA_REFRESH_INTERVAL_SECS: {{ .Values.schedule.metadataRefreshIntervalSecs | quote }}
+
+  # ── OpenTelemetry (SPEC-OBS-001) ─────────────────────────────────────────────
+  {{- if and .Values.otel.enabled .Values.otel.endpoint }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.otel.endpoint | quote }}
+  {{- end }}
+  {{- if .Values.otel.enabled }}
+  OTEL_SERVICE_NAME: "crypto-collector"
+  {{- if .Values.otel.environment }}
+  DEPLOYMENT_ENVIRONMENT: {{ .Values.otel.environment | quote }}
+  {{- end }}
+  {{- end }}

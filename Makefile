@@ -1,0 +1,62 @@
+.DEFAULT_GOAL := help
+.PHONY: help build build-release check lint fmt fmt-check test image push build-aarch64 image-aarch64 push-aarch64 clean
+
+IMAGE         ?= registry.helles.farm/crypto-collector:latest
+IMAGE_AARCH64 ?= registry.helles.farm/crypto-collector:aarch64
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+help: ## Show available targets
+	@grep -E '^[a-zA-Z0-9_-]+:.*## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
+
+# ── Source ───────────────────────────────────────────────────────────────────
+
+build: ## Compile (debug)
+	cargo build
+
+build-release: ## Compile (release)
+	cargo build --release
+
+check: ## Cargo check (no codegen)
+	cargo check --all-targets --all-features
+
+lint: ## fmt-check + clippy -D warnings + helm lint --strict
+	cargo fmt --check
+	cargo clippy --all-targets --all-features -- -D warnings
+	helm lint --strict charts/crypto-collector
+
+fmt: ## Format source code
+	cargo fmt --all
+
+fmt-check: ## Check formatting (CI)
+	cargo fmt --all -- --check
+
+# ── Unit tests ───────────────────────────────────────────────────────────────
+
+test: ## Run unit tests
+	cargo test
+
+# ── Container image ──────────────────────────────────────────────────────────
+
+image: ## Build container image (native arch)
+	podman build -f Dockerfile -t $(IMAGE) .
+
+push: image ## Build and push native image
+	podman push $(IMAGE)
+
+# ── aarch64 cross-compilation ────────────────────────────────────────────────
+
+build-aarch64: ## Cross-compile binary for aarch64 (requires `cross`)
+	cross build --target aarch64-unknown-linux-gnu --release
+
+image-aarch64: build-aarch64 ## Build aarch64 container image using pre-compiled binary (no QEMU required)
+	podman build -f Dockerfile.aarch64 -t $(IMAGE_AARCH64) .
+
+push-aarch64: image-aarch64 ## Build and push aarch64 image
+	podman push $(IMAGE_AARCH64)
+
+# ── Clean ────────────────────────────────────────────────────────────────────
+
+clean: ## Remove build artefacts
+	cargo clean

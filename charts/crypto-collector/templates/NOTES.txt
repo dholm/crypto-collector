@@ -1,0 +1,24 @@
+crypto-collector deployed to namespace {{ .Release.Namespace }}.
+
+API endpoint (ClusterIP):
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "crypto-collector.fullname" . }} 8080:80
+  curl http://localhost:8080/v1/coins
+
+Health checks:
+  kubectl -n {{ .Release.Namespace }} port-forward pod/<pod-name> 8081:8081
+  curl http://localhost:8081/healthz/ready
+  curl http://localhost:8081/healthz/live
+
+Metrics (Prometheus):
+  kubectl -n {{ .Release.Namespace }} port-forward pod/<pod-name> 9000:9000
+  curl http://localhost:9000/metrics
+
+DATABASE_URL secret (required before install):
+  kubectl -n {{ .Release.Namespace }} create secret generic <secret-name> \
+    --from-literal=DATABASE_URL='postgresql://user:pass@postgres:5432/crypto_collector'
+  Then set database.url.secretName in values.yaml.
+
+CoinGecko API key (optional, Pro tier):
+  kubectl -n {{ .Release.Namespace }} create secret generic <secret-name> \
+    --from-literal=COINGECKO_API_KEY='<your-key>'
+  Then set coingecko.apiKey.secretName in values.yaml.

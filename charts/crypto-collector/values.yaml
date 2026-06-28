@@ -1,0 +1,182 @@
+replicaCount: 2
+
+image:
+  repository: registry.helles.farm/crypto-collector
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Image pull secrets for private registries.
+# Each entry references an existing Secret of type kubernetes.io/dockerconfigjson.
+# Leave empty to pull from a public/unauthenticated registry.
+imagePullSecrets: []
+# - name: registry-helles-farm-creds
+
+# ── Shutdown timing (REQ-DEPLOY-027) ─────────────────────────────────────────
+# SHUTDOWN_GRACE_SECONDS: readiness flips to 503; old endpoint entries drain.
+# SHUTDOWN_DRAIN_SECONDS: hard deadline for in-flight requests after grace.
+# terminationGracePeriodSeconds = grace + drain + 5 (buffer for process exit
+# bookkeeping) — SIGKILL must not fire while in-flight requests are still draining.
+shutdown:
+  graceSeconds: 15
+  drainSeconds: 30
+# terminationGracePeriodSeconds = 15 + 30 + 5 = 50
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# ── Non-secret environment variables (REQ-DEPLOY-026) ────────────────────────
+# These are rendered into a ConfigMap and mounted via envFrom.
+# Env vars: API_PORT, HEALTH_PORT, METRICS_PORT, RUST_LOG, TRACKED_GAUGE_INTERVAL_SECS,
+#           SEARCH_PACER_TIMEOUT_MS.  All other knobs are exposed via their dedicated
+#           sections below (providers, schedule, otel) and merged into the same ConfigMap.
+env:
+  API_PORT: "8080"           # REST API listener port (SPEC-OBS-001)
+  HEALTH_PORT: "8081"        # Health probe listener port (SPEC-OBS-001)
+  METRICS_PORT: "9000"       # Prometheus metrics listener port (SPEC-OBS-001)
+  RUST_LOG: "info"           # tracing-subscriber log filter (SPEC-OBS-001)
+  TRACKED_GAUGE_INTERVAL_SECS: "30"  # tracked_coins/tracked_markets gauge refresh (SPEC-OBS-001)
+  SEARCH_PACER_TIMEOUT_MS: "2000"    # CoinGecko search slot timeout (SPEC-API-001)
+
+# ── Database connection (SPEC-DB-001) ─────────────────────────────────────────
+# The application reads DATABASE_URL directly (main.rs).  Supply the full
+# connection string from a pre-created Kubernetes Secret — never put credentials
+# in the ConfigMap (REQ-CFG-007).
+#
+# Create the secret once:
+#   kubectl -n finance create secret generic crypto-collector-db \
+#     --from-literal=DATABASE_URL='postgresql://user:pass@postgres:5432/crypto_collector'
+#
+# Then set database.url.secretName below.
+#
+# host / port / name are included in the ConfigMap as DB_HOST / DB_PORT / DB_NAME
+# for reference and future app updates; they are not currently consumed by the binary.
+database:
+  host: "postgres"
+  port: 5432
+  name: "crypto_collector"
+  url:
+    # Name of the Secret containing DATABASE_URL.
+    # Required: the pod will fail at startup if DATABASE_URL is absent.
+    secretName: ""
+    secretKey: "DATABASE_URL"
+  # Optional: individual credential secrets (DB_USERNAME / DB_PASSWORD).
+  # These are injected as separate env vars for operator reference.
+  # The current binary reads DATABASE_URL and does not use DB_USERNAME / DB_PASSWORD
+  # directly; they are available for future updates or init containers.
+  credentials:
+    username:
+      secretName: ""
+      secretKey: ""
+    password:
+      secretName: ""
+      secretKey: ""
+
+# ── CoinGecko provider (SPEC-PROV-001) ───────────────────────────────────────
+coingecko:
+  # Tier determines default base URL and API key header.
+  # Values: "demo" (default) or "pro".
+  tier: "demo"
+  # Override the tier-derived base URL.  Leave empty to use the tier default:
+  #   demo → https://api.coingecko.com
+  #   pro  → https://pro-api.coingecko.com
+  baseUrl: ""
+  # CoinGecko API key — required for Pro; optional for Demo.
+  # Injected via secretKeyRef; never stored in the ConfigMap.
+  apiKey:
+    secretName: ""
+    secretKey: "COINGECKO_API_KEY"
+
+# ── Provider chain (SPEC-PROV-001) ────────────────────────────────────────────
+# PROVIDERS env var: comma-separated fallback order (first name tried first).
+# Valid names: coingecko, binance, coinbase, kraken.
+providers: "coingecko"
+
+# ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
+# Fleet-wide cooldown in milliseconds after the provider returns HTTP 429.
+# Maps to PACER_<PROVIDER>_COOLDOWN_MS.
+pacer:
+  coingeckoCooldownMs: "60000"   # PACER_COINGECKO_COOLDOWN_MS — default 60 s
+
+# ── Scheduling knobs (SPEC-SCHED-001) ─────────────────────────────────────────
+schedule:
+  # Live-quote poll cadence (LIVE_QUOTE_POLL_INTERVAL_SECS). Default: 60 s.
+  # Respects CoinGecko Demo tier budget (~30 calls/min = 2 s/call, 60 s covers ~30 markets).
+  liveQuotePollIntervalSecs: "60"
+
+  # TTL for the live-poll in-flight claim marker (LIVE_POLL_CLAIM_TTL_SECS). Default: 120 s.
+  livePollClaimTtlSecs: "120"
+
+  # Collection-queue worker lease duration (COLLECTION_LEASE_SECONDS). Default: 120 s.
+  collectionLeaseSeconds: "120"
+
+  # Collection-queue heartbeat renewal cadence (COLLECTION_HEARTBEAT_INTERVAL_SECONDS). Default: 30 s.
+  collectionHeartbeatIntervalSeconds: "30"
+
+  # Maximum claim attempts before a collection-queue row is permanently failed (COLLECTION_MAX_ATTEMPTS). Default: 5.
+  collectionMaxAttempts: "5"
+
+  # Sleep in ms when the collection queue is empty (COLLECTION_IDLE_SLEEP_MS). Default: 1000 ms.
+  collectionIdleSleepMs: "1000"
+
+  # Backfill chunk lease duration (BACKFILL_LEASE_SECONDS). Default: 300 s (5 min for large fetches).
+  backfillLeaseSeconds: "300"
+
+  # Backfill heartbeat renewal cadence (BACKFILL_HEARTBEAT_INTERVAL_SECONDS). Default: 60 s.
+  backfillHeartbeatIntervalSeconds: "60"
+
+  # Maximum chunk attempts before a backfill chunk is permanently failed (BACKFILL_MAX_ATTEMPTS). Default: 5.
+  backfillMaxAttempts: "5"
+
+  # Sleep in ms when the backfill chunk queue is empty (BACKFILL_IDLE_SLEEP_MS). Default: 1000 ms.
+  backfillIdleSleepMs: "1000"
+
+  # Metadata periodic-refresh cadence (METADATA_REFRESH_INTERVAL_SECS). Default: 86400 s (24 h).
+  metadataRefreshIntervalSecs: "86400"
+
+# ── Liveness and readiness probes (REQ-DEPLOY-024) ───────────────────────────
+# Both probes target the health port (HEALTH_PORT / containerPort: 8081).
+probes:
+  liveness:
+    path: /healthz/live
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    failureThreshold: 3
+    timeoutSeconds: 2
+  readiness:
+    path: /healthz/ready
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    failureThreshold: 3
+    timeoutSeconds: 2
+
+# ── Horizontal Pod Autoscaler (REQ-DEPLOY-028) ───────────────────────────────
+# Disabled by default; minReplicas >= 2 when enabled.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+# ── PodMonitor for Prometheus Operator (REQ-DEPLOY-025) ──────────────────────
+# Disabled by default; scrapes the metrics port (:9000 /metrics).
+podMonitor:
+  enabled: false
+  interval: 30s
+
+# ── OpenTelemetry Collector integration (SPEC-OBS-001) ───────────────────────
+# Set otel.enabled: true and otel.endpoint to send traces to an OTel Collector.
+otel:
+  enabled: false
+  endpoint: ""         # e.g. "http://opentelemetry-collector.monitoring.svc.cluster.local:4317"
+  protocol: grpc       # grpc or http
+  environment: ""      # DEPLOYMENT_ENVIRONMENT resource attribute (e.g. "production", "staging")

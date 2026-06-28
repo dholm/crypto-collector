@@ -1,0 +1,146 @@
+{{- $gracePlusDrain := add .Values.shutdown.graceSeconds .Values.shutdown.drainSeconds }}
+{{- $terminationGrace := add $gracePlusDrain 5 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "crypto-collector.fullname" . }}
+  labels:
+    {{- include "crypto-collector.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  minReadySeconds: 5
+  selector:
+    matchLabels:
+      {{- include "crypto-collector.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "crypto-collector.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Prometheus scrape annotations (REQ-DEPLOY-025)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # terminationGracePeriodSeconds = graceSeconds + drainSeconds + 5 s buffer
+      # graceSeconds: readiness → 503; kube-proxy endpoint removal propagates
+      # drainSeconds: hard deadline for in-flight requests
+      # +5: process bookkeeping before kernel sends SIGKILL
+      #
+      # @MX:WARN: [AUTO] terminationGracePeriodSeconds must be >= grace + drain + buffer
+      # @MX:REASON: If SIGKILL fires before drain completes, in-flight requests are dropped
+      #             mid-rollout. Computed from values.shutdown.graceSeconds +
+      #             values.shutdown.drainSeconds + 5 (REQ-DEPLOY-027, SPEC-OBS-001 REQ-OBS-033).
+      terminationGracePeriodSeconds: {{ $terminationGrace }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Pod security context (REQ-DEPLOY-023)
+      #
+      # @MX:NOTE: [AUTO] Non-root + readOnlyRootFilesystem + drop-all-caps is the hardening contract.
+      #           If the binary ever needs scratch space, add an emptyDir volume (OR-DEPLOY-3).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if gt (int .Values.replicaCount) 1 }}
+      # Preferred pod anti-affinity spreads replicas across nodes (REQ-DEPLOY-022)
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "crypto-collector.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Container security context (REQ-DEPLOY-023)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+            - name: metrics
+              containerPort: 9000
+              protocol: TCP
+          # Non-secret configuration from ConfigMap (REQ-DEPLOY-026)
+          envFrom:
+            - configMapRef:
+                name: {{ include "crypto-collector.fullname" . }}
+          # Secret-backed environment variables (REQ-DEPLOY-026, REQ-CFG-007)
+          #
+          # @MX:WARN: [AUTO] Credentials must arrive exclusively via secretKeyRef.
+          # @MX:REASON: Credentials in ConfigMap or image violate REQ-CFG-007 and create
+          #             a security boundary breach. Add no credential values here directly.
+          {{- $hasSecrets := or .Values.database.url.secretName (or .Values.database.credentials.username.secretName (or .Values.database.credentials.password.secretName .Values.coingecko.apiKey.secretName)) }}
+          {{- if $hasSecrets }}
+          env:
+            {{- if .Values.database.url.secretName }}
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.url.secretName }}
+                  key: {{ .Values.database.url.secretKey }}
+            {{- end }}
+            {{- if .Values.database.credentials.username.secretName }}
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.credentials.username.secretName }}
+                  key: {{ .Values.database.credentials.username.secretKey }}
+            {{- end }}
+            {{- if .Values.database.credentials.password.secretName }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.credentials.password.secretName }}
+                  key: {{ .Values.database.credentials.password.secretKey }}
+            {{- end }}
+            {{- if .Values.coingecko.apiKey.secretName }}
+            - name: COINGECKO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.coingecko.apiKey.secretName }}
+                  key: {{ .Values.coingecko.apiKey.secretKey }}
+            {{- end }}
+          {{- end }}
+          # Liveness probe: /healthz/live on health port (REQ-DEPLOY-024)
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+          # Readiness probe: /healthz/ready on health port (REQ-DEPLOY-024)
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

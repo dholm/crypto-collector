@@ -1,0 +1,8 @@
+.git/
+target/
+.moai/
+.claude/
+*.md
+.env*
+tests/
+api/
