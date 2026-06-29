@@ -6,9 +6,7 @@
 use chrono::Utc;
 use crypto_collector::models::{
     coin::{CoinMarketSnapshot, TrackedCoin},
-    derivatives::DerivativesQuote,
     queue::{BackfillChunk, BackfillJob, CollectionQueueItem, UpstreamRequestPacer},
-    quote::{Candle, LiveQuote},
 };
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -112,55 +110,6 @@ fn tracked_coin_deserializes_from_json() {
 }
 
 #[test]
-fn live_quote_decimal_fields_serialize_as_string() {
-    // Prices must be serialized as strings (serde-with-str feature) to preserve precision
-    let quote = LiveQuote {
-        market_id: 1,
-        ts: Utc::now(),
-        as_of: None,
-        price: dec!(42000.123456789),
-        bid: Some(dec!(41999.999)),
-        ask: Some(dec!(42000.001)),
-        bid_size: None,
-        ask_size: None,
-        volume_24h: Some(dec!(1234567890.12345)),
-        vs_currency: "usd".to_string(),
-        source: "coingecko".to_string(),
-    };
-    let json = serde_json::to_string(&quote).expect("should serialize");
-    // With serde-with-str, Decimal serializes as a quoted string
-    assert!(
-        json.contains("42000.123456789"),
-        "price must appear exactly in JSON: {json}"
-    );
-}
-
-#[test]
-fn candle_with_null_volume_serializes() {
-    // REQ-DB-011: volume is nullable (CoinGecko OHLC has no volume)
-    let candle = Candle {
-        market_id: 1,
-        interval: "1h".to_string(),
-        ts: Utc::now(),
-        open: dec!(41000.0),
-        high: dec!(42500.0),
-        low: dec!(40500.0),
-        close: dec!(42000.0),
-        volume: None, // nullable
-        vs_currency: "usd".to_string(),
-        source: "coingecko".to_string(),
-    };
-    let json = serde_json::to_string(&candle).expect("should serialize");
-    assert!(json.contains("\"interval\":\"1h\""), "interval in JSON");
-    // volume: null should appear since None serializes as null (no skip_serializing_if)
-    // But we want it in the JSON to confirm the field exists
-    assert!(
-        json.contains("volume"),
-        "volume field must be present in JSON"
-    );
-}
-
-#[test]
 fn coin_market_snapshot_has_aggregate_fields() {
     // REQ-DB-012/022: aggregates are time-series, not revisions
     let snapshot = CoinMarketSnapshot {
@@ -185,43 +134,6 @@ fn coin_market_snapshot_has_aggregate_fields() {
         json.contains("fully_diluted_valuation"),
         "fdv in snapshot JSON"
     );
-}
-
-#[test]
-fn derivatives_quote_all_nullable_observables() {
-    // REQ-DB-013: all per-tick derivative observables in one row
-    let quote = DerivativesQuote {
-        market_id: 1,
-        ts: Utc::now(),
-        funding_rate: Some(dec!(-0.0001)),
-        open_interest: Some(dec!(12345678.90)),
-        open_interest_usd: Some(dec!(500000000.0)),
-        mark_price: Some(dec!(42001.5)),
-        index_price: Some(dec!(42000.0)),
-        basis: Some(dec!(1.5)),
-        volume_24h: Some(dec!(987654321.0)),
-        contract_type: Some("perpetual".to_string()),
-        venue: Some("binance".to_string()),
-        source: "coingecko".to_string(),
-    };
-    let json = serde_json::to_string(&quote).expect("should serialize");
-    assert!(
-        json.contains("funding_rate"),
-        "funding_rate in derivatives JSON"
-    );
-    assert!(
-        json.contains("open_interest"),
-        "open_interest in derivatives JSON"
-    );
-    assert!(
-        json.contains("mark_price"),
-        "mark_price in derivatives JSON"
-    );
-    assert!(
-        json.contains("index_price"),
-        "index_price in derivatives JSON"
-    );
-    assert!(json.contains("basis"), "basis in derivatives JSON");
 }
 
 #[test]

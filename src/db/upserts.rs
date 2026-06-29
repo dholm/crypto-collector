@@ -17,7 +17,7 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use crate::models::quote::CoinCandle;
-use crate::providers::{CoinMarket, CoinMeta, DerivTick, OhlcCandle, SpotQuote};
+use crate::providers::{CoinMarket, CoinMeta, OhlcCandle, SpotQuote};
 
 // ── @MX annotation ────────────────────────────────────────────────────────────
 // @MX:NOTE: [AUTO] All upserts use ON CONFLICT DO UPDATE on natural keys (REQ-SCHED-040).
@@ -26,46 +26,7 @@ use crate::providers::{CoinMarket, CoinMeta, DerivTick, OhlcCandle, SpotQuote};
 //   ON CONFLICT requires the full PK including the partition key (ts).
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-040
 
-// ── live_quotes ───────────────────────────────────────────────────────────────
-
-/// Upsert a live spot quote. Natural key: `(market_id, ts)`.
-///
-/// On conflict, overwrites price/bid/ask/volume/source (market data changed).
-/// `bid_size`, `ask_size`, and `as_of` are not in `SpotQuote`; they are left NULL on insert.
-///
-// @MX:NOTE: [AUTO] upsert_live_quote — idempotent on (market_id, ts); exact-once persistence
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-040
-pub const UPSERT_LIVE_QUOTE_SQL: &str = "\
-    INSERT INTO live_quotes \
-        (market_id, ts, price, bid, ask, volume_24h, vs_currency, source) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-    ON CONFLICT (market_id, ts) DO UPDATE SET \
-        price      = EXCLUDED.price, \
-        bid        = EXCLUDED.bid, \
-        ask        = EXCLUDED.ask, \
-        volume_24h = EXCLUDED.volume_24h, \
-        source     = EXCLUDED.source";
-
-pub async fn upsert_live_quote(pool: &PgPool, q: &SpotQuote) -> Result<(), sqlx::Error> {
-    let start = std::time::Instant::now();
-    let result = sqlx::query(UPSERT_LIVE_QUOTE_SQL)
-        .bind(q.market_id)
-        .bind(q.ts)
-        .bind(q.price)
-        .bind(q.bid)
-        .bind(q.ask)
-        .bind(q.volume_24h)
-        .bind(&q.vs_currency)
-        .bind(&q.source)
-        .execute(pool)
-        .await;
-    // REQ-OBS-015: record quote insert latency regardless of outcome.
-    metrics::histogram!("quote_insert_duration_seconds").record(start.elapsed().as_secs_f64());
-    result?;
-    Ok(())
-}
-
-// ── candles ───────────────────────────────────────────────────────────────────
+// ── candles (legacy — still used by backfill.rs; TODO: repurpose for coin_candles once backfill is rebased) ──
 
 /// Upsert a single OHLCV candle. Natural key: `(market_id, interval, ts)`.
 ///
@@ -288,48 +249,6 @@ pub async fn upsert_coin_market_snapshot(pool: &PgPool, m: &CoinMarket) -> Resul
     Ok(())
 }
 
-// ── derivatives_quotes ────────────────────────────────────────────────────────
-
-/// Upsert a derivatives tick. Natural key: `(market_id, ts)`.
-///
-// @MX:NOTE: [AUTO] upsert_derivatives — idempotent on (market_id, ts)
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-040
-pub const UPSERT_DERIVATIVES_SQL: &str = "\
-    INSERT INTO derivatives_quotes \
-        (market_id, ts, funding_rate, open_interest, open_interest_usd, \
-         mark_price, index_price, basis, volume_24h, contract_type, venue, source) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-    ON CONFLICT (market_id, ts) DO UPDATE SET \
-        funding_rate      = EXCLUDED.funding_rate, \
-        open_interest     = EXCLUDED.open_interest, \
-        open_interest_usd = EXCLUDED.open_interest_usd, \
-        mark_price        = EXCLUDED.mark_price, \
-        index_price       = EXCLUDED.index_price, \
-        basis             = EXCLUDED.basis, \
-        volume_24h        = EXCLUDED.volume_24h, \
-        contract_type     = EXCLUDED.contract_type, \
-        venue             = EXCLUDED.venue, \
-        source            = EXCLUDED.source";
-
-pub async fn upsert_derivatives_quote(pool: &PgPool, d: &DerivTick) -> Result<(), sqlx::Error> {
-    sqlx::query(UPSERT_DERIVATIVES_SQL)
-        .bind(d.market_id)
-        .bind(d.ts)
-        .bind(d.funding_rate)
-        .bind(d.open_interest)
-        .bind(d.open_interest_usd)
-        .bind(d.mark_price)
-        .bind(d.index_price)
-        .bind(d.basis)
-        .bind(d.volume_24h)
-        .bind(&d.contract_type)
-        .bind(&d.venue)
-        .bind(&d.source)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
 // ── coin_metadata (revision pattern) ─────────────────────────────────────────
 
 /// Snapshot of an existing `coin_metadata` revision for change detection.
@@ -542,34 +461,10 @@ mod tests {
     // ── SQL shape assertions for upsert constants ─────────────────────────────
 
     #[test]
-    fn live_quote_upsert_sql_has_conflict_target() {
-        assert!(
-            UPSERT_LIVE_QUOTE_SQL.contains("ON CONFLICT (market_id, ts) DO UPDATE"),
-            "live_quote upsert must use natural key (market_id, ts)"
-        );
-    }
-
-    #[test]
-    fn candle_upsert_sql_has_interval_in_conflict_target() {
-        assert!(
-            UPSERT_CANDLE_SQL.contains("ON CONFLICT (market_id, interval, ts) DO UPDATE"),
-            "candle upsert must use natural key (market_id, interval, ts)"
-        );
-    }
-
-    #[test]
     fn coin_market_upsert_sql_has_conflict_target() {
         assert!(
             UPSERT_COIN_MARKET_SQL.contains("ON CONFLICT (coin_id, vs_currency, ts) DO UPDATE"),
             "coin_market upsert must use natural key (coin_id, vs_currency, ts)"
-        );
-    }
-
-    #[test]
-    fn derivatives_upsert_sql_has_conflict_target() {
-        assert!(
-            UPSERT_DERIVATIVES_SQL.contains("ON CONFLICT (market_id, ts) DO UPDATE"),
-            "derivatives upsert must use natural key (market_id, ts)"
         );
     }
 

@@ -4,5 +4,5 @@ pub mod upserts;
 pub use pool::connect;
 pub use upserts::{
     metadata_has_changed, upsert_candle, upsert_candles, upsert_coin_market_snapshot,
-    upsert_coin_metadata, upsert_derivatives_quote, upsert_live_quote, LatestMetadata,
+    upsert_coin_metadata, LatestMetadata,
 };

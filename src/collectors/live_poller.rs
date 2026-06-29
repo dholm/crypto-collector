@@ -3,15 +3,15 @@
 //! # Short-transaction discipline (REQ-SCHED-003/004)
 //!
 //! The claim transaction:
-//! 1. SELECTs due + not-in-flight active markets with `FOR UPDATE SKIP LOCKED`.
+//! 1. SELECTs due + not-in-flight active coins with `FOR UPDATE SKIP LOCKED`.
 //! 2. Sets `live_poll_claimed_until = now() + claim_ttl` (the marker, NOT `last_polled_at`).
 //! 3. COMMITs — row locks released BEFORE any network call.
 //!
-//! After the claim tx commits, the worker iterates the returned market IDs:
+//! After the claim tx commits, the worker iterates the returned coin IDs:
 //! - Acquires a pacer slot (outside any transaction).
 //! - Fetches via the provider chain (outside any transaction).
-//! - On success: INSERT live_quotes + UPDATE last_polled_at, clear marker.
-//! - On transient failure: clear marker only (market immediately due next cycle).
+//! - On success: INSERT coin_quotes + UPDATE last_polled_at, clear marker.
+//! - On transient failure: clear marker only (coin immediately due next cycle).
 //!
 //! A crashed replica's marker self-expires at `claim_ttl` (REQ-SCHED-007).
 
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
-use crate::db::upserts::upsert_live_quote;
+use crate::db::upserts::upsert_coin_quote;
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{Capability, MarketQuery, Provider, ProviderError};
 
@@ -81,8 +81,9 @@ pub fn pacer_should_skip(err: &AcquireSlotError) -> bool {
 
 /// Claim SQL for the live-quote poll loop (REQ-SCHED-003/004/007).
 ///
-/// Uses a CTE to SELECT eligible markets (status='active', due, not-in-flight) with
+/// Uses a CTE to SELECT eligible coins (status='active', due, not-in-flight) with
 /// `FOR UPDATE SKIP LOCKED`, then UPDATEs `live_poll_claimed_until` in one atomic statement.
+/// RETURNING provides coin_id + symbol so no second query is needed (short-tx discipline).
 ///
 /// $1 = global default cadence as `"<n> seconds"` INTERVAL string (REQ-SCHED-002).
 /// $2 = claim TTL as `"<n> seconds"` INTERVAL string (REQ-SCHED-007).
@@ -90,95 +91,91 @@ pub fn pacer_should_skip(err: &AcquireSlotError) -> bool {
 /// INVARIANT: sets `live_poll_claimed_until` (the in-flight marker), NOT `last_polled_at`.
 /// INVARIANT: this SQL runs inside a short tx that commits BEFORE any provider call.
 ///
-// @MX:ANCHOR: [AUTO] LIVE_POLLER_CLAIM_SQL — due+not-in-flight predicate; marker-on-claim in short tx
-// @MX:REASON: fan_in >= 3: claim_due_markets(), SQL-shape tests, DB integration test.
+// @MX:ANCHOR: [AUTO] LIVE_COIN_CLAIM_SQL — due+not-in-flight predicate; marker-on-claim in short tx
+// @MX:REASON: fan_in >= 3: claim_due_coins(), SQL-shape tests, DB integration test.
 //             REQ-SCHED-003: sets live_poll_claimed_until NOT last_polled_at.
 //             REQ-SCHED-004: claim tx commits/releases locks BEFORE any provider network call.
 //             REQ-SCHED-007: self-expiring marker = cross-replica in-flight dedup.
 // @MX:WARN: [AUTO] do NOT add any provider or network call inside the transaction that runs this SQL
 // @MX:REASON: holding a row lock across network I/O serialises all replicas through one DB lock cycle
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-003 REQ-SCHED-004 REQ-SCHED-007
-pub const LIVE_POLLER_CLAIM_SQL: &str = "\
+pub const LIVE_COIN_CLAIM_SQL: &str = "\
     WITH claimed AS (\
-        SELECT id FROM tracked_markets \
+        SELECT coin_id FROM tracked_coins \
         WHERE status = 'active' \
           AND (last_polled_at IS NULL \
                OR last_polled_at + COALESCE(live_poll_interval, $1::interval) <= now()) \
           AND (live_poll_claimed_until IS NULL OR live_poll_claimed_until <= now()) \
         FOR UPDATE SKIP LOCKED\
     ) \
-    UPDATE tracked_markets \
+    UPDATE tracked_coins \
     SET live_poll_claimed_until = now() + $2::interval \
     FROM claimed \
-    WHERE tracked_markets.id = claimed.id \
-    RETURNING tracked_markets.id";
+    WHERE tracked_coins.coin_id = claimed.coin_id \
+    RETURNING tracked_coins.coin_id, tracked_coins.symbol";
 
 /// Success UPDATE: advance `last_polled_at` and clear the marker (REQ-SCHED-005).
 ///
 /// INVARIANT: runs OUTSIDE the claim transaction (cursor advances only on success).
 ///
-// @MX:WARN: [AUTO] LIVE_POLLER_SUCCESS_SQL — sets last_polled_at; must run OUTSIDE claim tx
+// @MX:WARN: [AUTO] LIVE_COIN_SUCCESS_SQL — sets last_polled_at; must run OUTSIDE claim tx
 // @MX:REASON: REQ-SCHED-005: last_polled_at advances ONLY after a reached success.
 //             REQ-SCHED-006: transient failure must NOT advance last_polled_at (see FAILURE_CLEAR_SQL).
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-005
-pub const LIVE_POLLER_SUCCESS_SQL: &str = "\
-    UPDATE tracked_markets \
+pub const LIVE_COIN_SUCCESS_SQL: &str = "\
+    UPDATE tracked_coins \
     SET last_polled_at = now(), live_poll_claimed_until = NULL \
-    WHERE id = $1";
+    WHERE coin_id = $1";
 
 /// Transient-failure UPDATE: clear the marker only, leave `last_polled_at` unchanged (REQ-SCHED-006).
 ///
-/// The market becomes immediately due again on the next cycle (fast retry).
+/// The coin becomes immediately due again on the next cycle (fast retry).
 ///
-// @MX:WARN: [AUTO] LIVE_POLLER_FAILURE_CLEAR_SQL — clears marker WITHOUT advancing last_polled_at
+// @MX:WARN: [AUTO] LIVE_COIN_FAILURE_CLEAR_SQL — clears marker WITHOUT advancing last_polled_at
 // @MX:REASON: REQ-SCHED-006: transient failure must NOT advance cursor. Clearing the marker
-//             makes the market due again next cycle (fast retry). last_polled_at must remain
-//             unchanged so the market is re-claimed rather than silently skipped.
+//             makes the coin due again next cycle (fast retry). last_polled_at must remain
+//             unchanged so the coin is re-claimed rather than silently skipped.
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-006
-pub const LIVE_POLLER_FAILURE_CLEAR_SQL: &str = "\
-    UPDATE tracked_markets \
+pub const LIVE_COIN_FAILURE_CLEAR_SQL: &str = "\
+    UPDATE tracked_coins \
     SET live_poll_claimed_until = NULL \
-    WHERE id = $1";
+    WHERE coin_id = $1";
 
 // ── DB functions ──────────────────────────────────────────────────────────────
 
-/// Row returned by the claim query; holds the market context needed to build a
+/// Row returned by the coin claim query; holds the context needed to build a
 /// `MarketQuery` for the provider call outside the claim transaction.
 #[derive(Debug, sqlx::FromRow)]
-pub struct ClaimedMarket {
-    pub id: i64,
-    pub coin_id: Option<String>,
-    pub base: String,
-    pub quote: String,
-    pub venue: Option<String>,
+pub struct ClaimedCoin {
+    pub coin_id: String,
+    pub symbol: String,
 }
 
-/// Claim due, active, not-in-flight markets in a short transaction.
+/// Claim due, active, not-in-flight coins in a short transaction.
 ///
 /// Sets `live_poll_claimed_until = now() + claim_ttl` (the marker) and commits.
 /// Row locks are released by the commit — no connection or tx is held after return.
-/// Network I/O MUST NOT be performed before calling this function's result is acted on.
+/// The RETURNING clause provides coin_id + symbol so no second query is needed.
+/// Network I/O MUST NOT be performed before this function's result is acted on.
 ///
-/// Returns the market context rows needed for subsequent provider calls.
+/// Returns the coin context rows needed for subsequent provider calls.
 ///
-// @MX:ANCHOR: [AUTO] claim_due_markets — short-tx claim; returns before any network I/O
+// @MX:ANCHOR: [AUTO] claim_due_coins — short-tx claim; RETURNING avoids second query; commits before network I/O
 // @MX:REASON: fan_in >= 3: live poller loop, DB integration tests, SQL-shape tests.
-//             REQ-SCHED-004: tx.commit() is called before returning the market list.
+//             REQ-SCHED-004: tx.commit() is called before returning the coin list.
 //             The caller is responsible for keeping all network calls outside any open tx.
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-003 REQ-SCHED-004
-pub async fn claim_due_markets(
+pub async fn claim_due_coins(
     pool: &PgPool,
     global_interval_secs: i64,
     claim_ttl_secs: i64,
-) -> Result<Vec<ClaimedMarket>, sqlx::Error> {
+) -> Result<Vec<ClaimedCoin>, sqlx::Error> {
     let global_pg = secs_to_pg_interval(global_interval_secs);
     let ttl_pg = secs_to_pg_interval(claim_ttl_secs);
 
-    // Short transaction: SELECT + UPDATE + COMMIT before returning.
+    // Short transaction: SELECT + UPDATE (with RETURNING) + COMMIT before returning.
     let mut tx = pool.begin().await?;
-    // The full claim SQL sets the marker; we also need market context for the provider call.
-    // We run the claim to get IDs, then fetch market context in a separate query.
-    let ids: Vec<(i64,)> = sqlx::query_as(LIVE_POLLER_CLAIM_SQL)
+    let coins: Vec<ClaimedCoin> = sqlx::query_as(LIVE_COIN_CLAIM_SQL)
         .bind(&global_pg) // $1: global interval
         .bind(&ttl_pg) // $2: claim TTL
         .fetch_all(&mut *tx)
@@ -186,38 +183,22 @@ pub async fn claim_due_markets(
     // COMMIT — row locks released BEFORE any provider call (REQ-SCHED-004).
     tx.commit().await?;
 
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Fetch market context outside the claim tx (REQ-SCHED-004: no tx held).
-    let market_ids: Vec<i64> = ids.into_iter().map(|(id,)| id).collect();
-    // Use ANY($1) to look up all claimed markets in one query.
-    let markets: Vec<ClaimedMarket> = sqlx::query_as(
-        "SELECT id, coin_id, base, quote, venue \
-         FROM tracked_markets \
-         WHERE id = ANY($1)",
-    )
-    .bind(&market_ids)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(markets)
+    Ok(coins)
 }
 
 /// Mark a successful poll: advance `last_polled_at`, clear the in-flight marker.
-pub async fn mark_poll_success(pool: &PgPool, market_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(LIVE_POLLER_SUCCESS_SQL)
-        .bind(market_id)
+pub async fn mark_coin_poll_success(pool: &PgPool, coin_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(LIVE_COIN_SUCCESS_SQL)
+        .bind(coin_id)
         .execute(pool)
         .await?;
     Ok(())
 }
 
 /// Clear the in-flight marker after a transient failure (leaves `last_polled_at` unchanged).
-pub async fn clear_poll_marker(pool: &PgPool, market_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query(LIVE_POLLER_FAILURE_CLEAR_SQL)
-        .bind(market_id)
+pub async fn clear_coin_poll_marker(pool: &PgPool, coin_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(LIVE_COIN_FAILURE_CLEAR_SQL)
+        .bind(coin_id)
         .execute(pool)
         .await?;
     Ok(())
@@ -228,7 +209,7 @@ pub async fn clear_poll_marker(pool: &PgPool, market_id: i64) -> Result<(), sqlx
 /// Run the live-quote poll loop until `shutdown` is signalled (REQ-SCHED-001/008/050).
 ///
 /// No calendar, market-hours, or phase gate — collection is continuous (REQ-SCHED-008).
-/// Each tick claims due markets in a short tx, then paces + fetches outside the tx.
+/// Each tick claims due coins in a short tx, then paces + fetches outside the tx.
 pub async fn run_live_poller(
     pool: PgPool,
     chain: Arc<Vec<Arc<dyn Provider>>>,
@@ -265,29 +246,29 @@ pub async fn run_live_poller(
     Ok(())
 }
 
-/// Execute one poll cycle: claim due markets, then fetch+persist outside the tx.
+/// Execute one poll cycle: claim due coins, then fetch+persist outside the tx.
 async fn poll_cycle(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     global_interval_secs: i64,
     claim_ttl_secs: i64,
 ) -> Result<()> {
-    let markets = match claim_due_markets(pool, global_interval_secs, claim_ttl_secs).await {
-        Ok(ms) => ms,
+    let coins = match claim_due_coins(pool, global_interval_secs, claim_ttl_secs).await {
+        Ok(cs) => cs,
         Err(e) => {
             error!("live_poller: claim error: {e}");
             return Ok(()); // non-fatal: next cycle will retry
         }
     };
 
-    for market in markets {
+    for coin in coins {
         let mq = MarketQuery {
-            market_id: market.id,
-            coin_id: market.coin_id.clone(),
-            base: market.base.clone(),
-            quote: market.quote.clone(),
-            venue: market.venue.clone(),
-            vs_currency: market.quote.to_lowercase(),
+            market_id: 0, // dummy; coin-keyed path does not use market_id
+            coin_id: Some(coin.coin_id.clone()),
+            base: coin.symbol.clone(),
+            quote: "USDT".to_string(),
+            venue: None,
+            vs_currency: "usd".to_string(),
         };
 
         // Find the first provider supporting Spot for pacing (REQ-SCHED-041).
@@ -295,10 +276,10 @@ async fn poll_cycle(
             Some(p) => p.name().to_string(),
             None => {
                 warn!(
-                    "live_poller: no provider supports Spot for market {}",
-                    market.id
+                    "live_poller: no provider supports Spot for coin {}",
+                    coin.coin_id
                 );
-                let _ = clear_poll_marker(pool, market.id).await;
+                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
                 continue;
             }
         };
@@ -308,13 +289,13 @@ async fn poll_cycle(
             Ok(()) => {}
             Err(ref e) if pacer_should_skip(e) => {
                 // Cooldown or credit exhaustion — release the marker, skip for now.
-                warn!("live_poller: pacer skip for market {}: {e}", market.id);
-                let _ = clear_poll_marker(pool, market.id).await;
+                warn!("live_poller: pacer skip for coin {}: {e}", coin.coin_id);
+                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
                 continue;
             }
             Err(e) => {
-                error!("live_poller: pacer error for market {}: {e}", market.id);
-                let _ = clear_poll_marker(pool, market.id).await;
+                error!("live_poller: pacer error for coin {}: {e}", coin.coin_id);
+                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
                 continue;
             }
         }
@@ -324,28 +305,34 @@ async fn poll_cycle(
 
         match fetch_result {
             Ok(quote) => {
-                // Persist (idempotent upsert, REQ-SCHED-040).
-                if let Err(e) = upsert_live_quote(pool, &quote).await {
-                    error!("live_poller: upsert error for market {}: {e}", market.id);
-                    let _ = clear_poll_marker(pool, market.id).await;
+                // Persist coin-keyed quote (idempotent upsert, REQ-SCHED-040).
+                if let Err(e) = upsert_coin_quote(pool, &coin.coin_id, &quote).await {
+                    error!("live_poller: upsert error for coin {}: {e}", coin.coin_id);
+                    let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
                     continue;
                 }
                 // Advance cursor and clear marker (REQ-SCHED-005).
-                if let Err(e) = mark_poll_success(pool, market.id).await {
+                if let Err(e) = mark_coin_poll_success(pool, &coin.coin_id).await {
                     error!(
-                        "live_poller: success mark error for market {}: {e}",
-                        market.id
+                        "live_poller: success mark error for coin {}: {e}",
+                        coin.coin_id
                     );
                 }
             }
             Err(e) if is_transient_provider_error(&e) => {
-                // Transient failure: clear marker only, market stays due (REQ-SCHED-006).
-                warn!("live_poller: transient error for market {}: {e}", market.id);
-                let _ = clear_poll_marker(pool, market.id).await;
+                // Transient failure: clear marker only, coin stays due (REQ-SCHED-006).
+                warn!(
+                    "live_poller: transient error for coin {}: {e}",
+                    coin.coin_id
+                );
+                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
             }
             Err(e) => {
-                error!("live_poller: permanent error for market {}: {e}", market.id);
-                let _ = clear_poll_marker(pool, market.id).await;
+                error!(
+                    "live_poller: permanent error for coin {}: {e}",
+                    coin.coin_id
+                );
+                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
             }
         }
     }
@@ -468,7 +455,7 @@ mod tests {
     #[test]
     fn claim_sql_contains_for_update_skip_locked() {
         assert!(
-            LIVE_POLLER_CLAIM_SQL.contains("FOR UPDATE SKIP LOCKED"),
+            LIVE_COIN_CLAIM_SQL.contains("FOR UPDATE SKIP LOCKED"),
             "claim SQL must use FOR UPDATE SKIP LOCKED for multi-replica safety"
         );
     }
@@ -476,7 +463,7 @@ mod tests {
     #[test]
     fn claim_sql_filters_status_active() {
         assert!(
-            LIVE_POLLER_CLAIM_SQL.contains("status = 'active'"),
+            LIVE_COIN_CLAIM_SQL.contains("status = 'active'"),
             "claim SQL must filter status='active' (REQ-SCHED-003)"
         );
     }
@@ -485,19 +472,19 @@ mod tests {
     fn claim_sql_has_due_predicate() {
         // Due predicate: last_polled_at IS NULL OR last_polled_at + COALESCE(...) <= now()
         assert!(
-            LIVE_POLLER_CLAIM_SQL.contains("last_polled_at IS NULL"),
+            LIVE_COIN_CLAIM_SQL.contains("last_polled_at IS NULL"),
             "claim SQL must include NULL last_polled_at check"
         );
         assert!(
-            LIVE_POLLER_CLAIM_SQL.contains("COALESCE(live_poll_interval"),
-            "claim SQL must use COALESCE(live_poll_interval, ...) for per-market override"
+            LIVE_COIN_CLAIM_SQL.contains("COALESCE(live_poll_interval"),
+            "claim SQL must use COALESCE(live_poll_interval, ...) for per-coin override"
         );
     }
 
     #[test]
     fn claim_sql_has_not_in_flight_predicate() {
         assert!(
-            LIVE_POLLER_CLAIM_SQL
+            LIVE_COIN_CLAIM_SQL
                 .contains("live_poll_claimed_until IS NULL OR live_poll_claimed_until <= now()"),
             "claim SQL must include not-in-flight predicate (REQ-SCHED-003/007)"
         );
@@ -507,12 +494,32 @@ mod tests {
     fn claim_sql_sets_marker_not_cursor() {
         // Must SET live_poll_claimed_until, must NOT SET last_polled_at.
         assert!(
-            LIVE_POLLER_CLAIM_SQL.contains("live_poll_claimed_until = now()"),
+            LIVE_COIN_CLAIM_SQL.contains("live_poll_claimed_until = now()"),
             "claim SQL must set live_poll_claimed_until (the marker)"
         );
         assert!(
-            !LIVE_POLLER_CLAIM_SQL.contains("last_polled_at = now()"),
+            !LIVE_COIN_CLAIM_SQL.contains("last_polled_at = now()"),
             "claim SQL must NOT advance last_polled_at (cursor advances only on success)"
+        );
+    }
+
+    #[test]
+    fn claim_sql_targets_tracked_coins() {
+        assert!(
+            LIVE_COIN_CLAIM_SQL.contains("tracked_coins"),
+            "claim SQL must target tracked_coins table"
+        );
+        assert!(
+            !LIVE_COIN_CLAIM_SQL.contains("tracked_markets"),
+            "claim SQL must not reference tracked_markets"
+        );
+    }
+
+    #[test]
+    fn claim_sql_returns_coin_id_and_symbol() {
+        assert!(
+            LIVE_COIN_CLAIM_SQL.contains("RETURNING tracked_coins.coin_id, tracked_coins.symbol"),
+            "claim SQL must RETURN coin_id and symbol to avoid a second query"
         );
     }
 
@@ -521,11 +528,11 @@ mod tests {
     #[test]
     fn success_sql_advances_last_polled_at_and_clears_marker() {
         assert!(
-            LIVE_POLLER_SUCCESS_SQL.contains("last_polled_at = now()"),
+            LIVE_COIN_SUCCESS_SQL.contains("last_polled_at = now()"),
             "success SQL must advance last_polled_at (REQ-SCHED-005)"
         );
         assert!(
-            LIVE_POLLER_SUCCESS_SQL.contains("live_poll_claimed_until = NULL"),
+            LIVE_COIN_SUCCESS_SQL.contains("live_poll_claimed_until = NULL"),
             "success SQL must clear the in-flight marker (REQ-SCHED-005)"
         );
     }
@@ -533,11 +540,11 @@ mod tests {
     #[test]
     fn failure_clear_sql_does_not_advance_last_polled_at() {
         assert!(
-            LIVE_POLLER_FAILURE_CLEAR_SQL.contains("live_poll_claimed_until = NULL"),
+            LIVE_COIN_FAILURE_CLEAR_SQL.contains("live_poll_claimed_until = NULL"),
             "failure-clear SQL must clear the marker (REQ-SCHED-006)"
         );
         assert!(
-            !LIVE_POLLER_FAILURE_CLEAR_SQL.contains("last_polled_at"),
+            !LIVE_COIN_FAILURE_CLEAR_SQL.contains("last_polled_at"),
             "failure-clear SQL must NOT touch last_polled_at (REQ-SCHED-006)"
         );
     }
@@ -576,16 +583,16 @@ mod tests {
 
     // ── DB-gated integration tests (require live DATABASE_URL) ────────────────
 
-    /// Scenario 5 / REQ-SCHED-007: two concurrent claim calls produce disjoint market sets.
+    /// Scenario 5 / REQ-SCHED-007: two concurrent claim calls produce disjoint coin sets.
     #[tokio::test]
     #[ignore]
     async fn db_concurrent_claims_produce_disjoint_sets() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
         let pool = crate::db::connect(&url).await.expect("connect");
 
-        // Reset: clear all markers and set some markets as due.
+        // Reset: clear all markers and set some coins as due.
         sqlx::query(
-            "UPDATE tracked_markets \
+            "UPDATE tracked_coins \
              SET live_poll_claimed_until = NULL, last_polled_at = NULL \
              WHERE status = 'active'",
         )
@@ -596,20 +603,26 @@ mod tests {
         // Run two claims concurrently.
         let pool2 = pool.clone();
         let (r1, r2) = tokio::join!(
-            claim_due_markets(&pool, 60, 120),
-            claim_due_markets(&pool2, 60, 120),
+            claim_due_coins(&pool, 60, 120),
+            claim_due_coins(&pool2, 60, 120),
         );
 
-        let ids1: std::collections::HashSet<i64> =
-            r1.expect("claim 1").iter().map(|m| m.id).collect();
-        let ids2: std::collections::HashSet<i64> =
-            r2.expect("claim 2").iter().map(|m| m.id).collect();
+        let ids1: std::collections::HashSet<String> = r1
+            .expect("claim 1")
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        let ids2: std::collections::HashSet<String> = r2
+            .expect("claim 2")
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
 
-        // No market should be in both sets (SKIP LOCKED guarantees disjoint claims).
+        // No coin should be in both sets (SKIP LOCKED guarantees disjoint claims).
         let intersection: std::collections::HashSet<_> = ids1.intersection(&ids2).collect();
         assert!(
             intersection.is_empty(),
-            "concurrent claims must produce disjoint market sets; overlap: {intersection:?}"
+            "concurrent claims must produce disjoint coin sets; overlap: {intersection:?}"
         );
     }
 }

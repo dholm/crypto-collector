@@ -23,8 +23,9 @@ use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
 use crate::db::upserts::{
-    upsert_candles, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_live_quote,
+    upsert_coin_candle, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_coin_quote,
 };
+use crate::models::quote::CoinCandle;
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{
     Capability, CoinMarket, CoinMeta, MarketQuery, OhlcCandle, Provider, ProviderError, SpotQuote,
@@ -138,16 +139,6 @@ pub struct ClaimedQueueItem {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Market context needed to build a `MarketQuery` for provider dispatch.
-#[derive(Debug)]
-struct MarketInfo {
-    id: i64,
-    coin_id: Option<String>,
-    base: String,
-    quote: String,
-    venue: Option<String>,
-}
-
 // ── DB functions ──────────────────────────────────────────────────────────────
 
 /// Claim one `collection_queue` item via `FOR UPDATE SKIP LOCKED`.
@@ -232,22 +223,15 @@ pub async fn enqueue_queue_item(
     Ok(result.rows_affected() > 0)
 }
 
-// ── Market context lookup ─────────────────────────────────────────────────────
+// ── Coin context lookup ───────────────────────────────────────────────────────
 
-async fn fetch_market_info(pool: &PgPool, market_id: i64) -> Result<Option<MarketInfo>> {
-    type MarketRow = (i64, Option<String>, String, String, Option<String>);
-    let row: Option<MarketRow> =
-        sqlx::query_as("SELECT id, coin_id, base, quote, venue FROM tracked_markets WHERE id = $1")
-            .bind(market_id)
+async fn fetch_coin_symbol(pool: &PgPool, coin_id: &str) -> Result<Option<String>> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT symbol FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
             .fetch_optional(pool)
             .await?;
-    Ok(row.map(|(id, coin_id, base, quote, venue)| MarketInfo {
-        id,
-        coin_id,
-        base,
-        quote,
-        venue,
-    }))
+    Ok(row.map(|(s,)| s))
 }
 
 // ── Chain dispatch helpers ────────────────────────────────────────────────────
@@ -334,16 +318,13 @@ async fn dispatch_item(
     item: &ClaimedQueueItem,
 ) -> Result<bool, String> {
     match (item.target_kind.as_str(), item.kind.as_str()) {
-        ("market", "candles") => {
-            let market_id: i64 = item
-                .target_id
-                .parse()
-                .map_err(|_| format!("invalid market_id: {}", item.target_id))?;
+        ("coin", "candles") => {
+            let coin_id = &item.target_id;
 
-            let info = fetch_market_info(pool, market_id)
+            let symbol = fetch_coin_symbol(pool, coin_id)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("market {market_id} not found"))?;
+                .ok_or_else(|| format!("coin {coin_id} not found"))?;
 
             let cap = Capability::Ohlc;
             let provider_name = match first_provider_for_cap(chain, cap) {
@@ -361,12 +342,12 @@ async fn dispatch_item(
             }
 
             let mq = MarketQuery {
-                market_id: info.id,
-                coin_id: info.coin_id,
-                base: info.base.clone(),
-                quote: info.quote.clone(),
-                venue: info.venue,
-                vs_currency: info.quote.to_lowercase(),
+                market_id: 0, // dummy; coin-keyed dispatch does not use market_id
+                coin_id: Some(coin_id.clone()),
+                base: symbol,
+                quote: "USDT".to_string(),
+                venue: None,
+                vs_currency: "usd".to_string(),
             };
 
             // REQ-OBS-012/015: instrument provider call with counter + duration histogram.
@@ -393,23 +374,34 @@ async fn dispatch_item(
             .record(fetch_dur);
             let candles = candles_result.map_err(|e| e.to_string())?;
 
-            upsert_candles(pool, &candles)
-                .await
-                .map_err(|e| e.to_string())?;
+            for c in &candles {
+                let candle = CoinCandle {
+                    coin_id: coin_id.clone(),
+                    vs_currency: c.vs_currency.clone(),
+                    interval: c.interval.clone(),
+                    ts: c.ts,
+                    open: c.open,
+                    high: c.high,
+                    low: c.low,
+                    close: c.close,
+                    volume: c.volume,
+                    source: c.source.clone(),
+                };
+                upsert_coin_candle(pool, &candle)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
 
             Ok(true)
         }
 
-        ("market", "spot") => {
-            let market_id: i64 = item
-                .target_id
-                .parse()
-                .map_err(|_| format!("invalid market_id: {}", item.target_id))?;
+        ("coin", "spot") => {
+            let coin_id = &item.target_id;
 
-            let info = fetch_market_info(pool, market_id)
+            let symbol = fetch_coin_symbol(pool, coin_id)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("market {market_id} not found"))?;
+                .ok_or_else(|| format!("coin {coin_id} not found"))?;
 
             let cap = Capability::Spot;
             let provider_name = match first_provider_for_cap(chain, cap) {
@@ -427,12 +419,12 @@ async fn dispatch_item(
             }
 
             let mq = MarketQuery {
-                market_id: info.id,
-                coin_id: info.coin_id,
-                base: info.base.clone(),
-                quote: info.quote.clone(),
-                venue: info.venue,
-                vs_currency: info.quote.to_lowercase(),
+                market_id: 0, // dummy; coin-keyed dispatch does not use market_id
+                coin_id: Some(coin_id.clone()),
+                base: symbol,
+                quote: "USDT".to_string(),
+                venue: None,
+                vs_currency: "usd".to_string(),
             };
 
             // REQ-OBS-012/015: instrument provider call.
@@ -459,7 +451,7 @@ async fn dispatch_item(
             .record(fetch_dur);
             let quote = quote_result.map_err(|e| e.to_string())?;
 
-            upsert_live_quote(pool, &quote)
+            upsert_coin_quote(pool, coin_id, &quote)
                 .await
                 .map_err(|e| e.to_string())?;
 
