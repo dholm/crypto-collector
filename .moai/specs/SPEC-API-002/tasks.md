@@ -40,7 +40,7 @@ Decision confirmed: T-A and T-B are in scope. Migration 0011 must not be deploye
 
 ---
 
-## Completion Status (2026-06-29, commit `be27841`)
+## Completion Status (2026-06-29, commit `be27841` + `0933160`)
 
 **Consumer-side API tasks (complete):**
 - T-001 ✓ DONE
@@ -53,6 +53,9 @@ Decision confirmed: T-A and T-B are in scope. Migration 0011 must not be deploye
 - T-008 ✓ DONE
 - T-009 ✓ DONE
 
-**Producer-side tasks (deferred to follow-up SPEC):**
-- T-A ⏸ Deferred — live-poller re-base and NOTIFY emission will activate WebSocket broadcast in follow-up
-- T-B ⏸ Deferred — orphaned model cleanup deferred pending T-A completion
+**Producer-side tasks (complete):**
+- T-A ✓ DONE — live_poller rebased to tracked_coins; collection_queue coin dispatch arms added; upsert_coin_quote/upsert_coin_candle with pg_notify wired
+- T-B ✓ DONE — TrackedMarket/LiveQuote/Candle removed from models/quote.rs; derivatives.rs deleted; upsert_live_quote/upsert_derivatives_quote removed; model_serde.rs orphaned tests removed
+
+**Remaining tech debt (not in T-A/T-B scope):**
+- backfill.rs still references upsert_candles (market-keyed candles table) — needs its own rebase once migration 0011 is deployed to production
