@@ -404,16 +404,16 @@ impl CoinGeckoClient {
 
         let tickers = body["tickers"].as_array().cloned().unwrap_or_default();
 
-        // Parse, filter (stale/anomaly), sort by USD volume desc, truncate.
+        // Parse, filter (stale/anomaly/contract-address), sort by USD volume desc, truncate.
         let mut results: Vec<(f64, MarketSearchResult)> = tickers
             .into_iter()
             .filter_map(|t| {
-                // Require base and target; skip stale or anomaly tickers.
+                // Require base and target; skip stale, anomaly, or contract-address tickers.
                 let base = t["base"].as_str()?.to_string();
                 let target = t["target"].as_str()?.to_string();
                 let is_stale = t["is_stale"].as_bool().unwrap_or(false);
                 let is_anomaly = t["is_anomaly"].as_bool().unwrap_or(false);
-                if is_stale || is_anomaly {
+                if is_stale || is_anomaly || is_contract_address(&base) || is_contract_address(&target) {
                     return None;
                 }
                 let venue = t["market"]["identifier"].as_str().map(|s| s.to_string());
@@ -562,6 +562,19 @@ pub fn normalise_ohlc_item(
         vs_currency: vs_currency.to_string(),
         source: "coingecko".to_string(),
     })
+}
+
+/// Returns true if `s` looks like an EVM contract address (`0x` + 40 hex chars).
+///
+/// CoinGecko tickers from DeFi venues use contract addresses as base/target instead
+/// of human-readable symbols. These are not tradable pairs and must be excluded from
+/// search results.
+fn is_contract_address(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 42
+        && b[0] == b'0'
+        && (b[1] == b'x' || b[1] == b'X')
+        && b[2..].iter().all(|c| c.is_ascii_hexdigit())
 }
 
 fn parse_ohlc_field(v: &Value, name: &str) -> Result<Decimal, ProviderError> {
@@ -1499,6 +1512,37 @@ mod tests {
         assert_eq!(results.len(), 2, "cap=2 must truncate to 2 results");
     }
 
+    // ── is_contract_address helper ────────────────────────────────────────────
+
+    #[test]
+    fn contract_address_detected() {
+        // Uppercase 0X prefix (as returned by CoinGecko DeFi tickers)
+        assert!(is_contract_address(
+            "0X6906CCDA405926FC3F04240187DD4FAD5DF6D555"
+        ));
+        // Lowercase 0x prefix
+        assert!(is_contract_address(
+            "0x6906ccda405926fc3f04240187dd4faf5df6d555"
+        ));
+    }
+
+    #[test]
+    fn non_contract_address_not_detected() {
+        assert!(!is_contract_address("BTC"));
+        assert!(!is_contract_address("USDT"));
+        assert!(!is_contract_address("ETH"));
+        // 41 hex chars (too short — missing one)
+        assert!(!is_contract_address("0x6906ccda405926fc3f04240187dd4faf5df6d55"));
+        // 43 hex chars (too long)
+        assert!(!is_contract_address(
+            "0x6906ccda405926fc3f04240187dd4faf5df6d5551"
+        ));
+        // Correct length but non-hex char
+        assert!(!is_contract_address(
+            "0x6906ccda405926fc3f04240187dd4faf5df6dXXX"
+        ));
+    }
+
     // ── Scenario 17 (REQ-PROV-005): fetch_coin_tickers sends demo key and parses tickers ──
 
     #[tokio::test]
@@ -1670,6 +1714,66 @@ mod tests {
         // After volume-desc sort: binance (90M) first, coinbase (5M) second.
         assert_eq!(results[0].venue.as_deref(), Some("binance"));
         assert_eq!(results[1].venue.as_deref(), Some("coinbase"));
+    }
+
+    #[tokio::test]
+    async fn fetch_coin_tickers_filters_contract_address_pairs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!({
+            "name": "Bitcoin",
+            "tickers": [
+                {
+                    "base": "BTC",
+                    "target": "USDT",
+                    "market": {"identifier": "binance"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 90000000.0}
+                },
+                {
+                    "base": "0X6906CCDA405926FC3F04240187DD4FAD5DF6D555",
+                    "target": "0X1C1B06405058ABE02E4748753AED1458BEFEE3B9",
+                    "market": {"identifier": "everdex"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 5000000.0}
+                },
+                {
+                    "base": "BTC",
+                    "target": "0X833589FCD6EDB6E08F4C7C32D4F71B54BDA02913",
+                    "market": {"identifier": "aerodrome-slipstream"},
+                    "is_stale": false,
+                    "is_anomaly": false,
+                    "converted_volume": {"usd": 3000000.0}
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let results = client
+            .fetch_coin_tickers("bitcoin", 10)
+            .await
+            .expect("fetch_coin_tickers");
+
+        assert_eq!(results.len(), 1, "contract address pairs must be excluded");
+        assert_eq!(results[0].base, "BTC");
+        assert_eq!(results[0].quote, "USDT");
+        assert_eq!(results[0].venue.as_deref(), Some("binance"));
     }
 
     #[tokio::test]

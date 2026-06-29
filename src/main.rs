@@ -165,10 +165,13 @@ async fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "coingecko".to_string());
     let coingecko_base_url = config::coingecko_base_url();
+    // Search acquires two pacer slots sequentially (coin resolve + tickers fetch).
+    // Each slot can sleep up to min_gap_ms (~2s for CoinGecko Demo) before proceeding.
+    // The timeout must cover both sleeps plus DB round-trip overhead.
     let search_timeout_ms: u64 = std::env::var("SEARCH_PACER_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2_000);
+        .unwrap_or(10_000);
 
     let api_state = crypto_collector::api::AppState {
         pool: pool.clone(),
