@@ -9,7 +9,7 @@ use std::path::Path;
 // ── Milestone 1: migration file presence and naming ──────────────────────────
 
 #[test]
-fn all_eleven_migration_files_exist() {
+fn all_twelve_migration_files_exist() {
     let expected = [
         "migrations/0001_registries.sql",
         "migrations/0002_live_quotes.sql",
@@ -22,6 +22,7 @@ fn all_eleven_migration_files_exist() {
         "migrations/0009_upstream_pacer.sql",
         "migrations/0010_coin_live_poll_interval.sql",
         "migrations/0011_remove_markets.sql",
+        "migrations/0012_coin_backfill.sql",
     ];
     for path in &expected {
         assert!(
@@ -214,6 +215,18 @@ fn backfill_migration_has_unique_job_constraint() {
         lower.contains("unique (market_id, dataset)")
             || lower.contains("unique(market_id, dataset)"),
         "0008_backfill.sql missing UNIQUE (market_id, dataset) on backfill_jobs (REQ-DB-033)"
+    );
+}
+
+/// REQ-DB-033: coin-keyed backfill_jobs UNIQUE (coin_id, dataset) for idempotent enqueue.
+#[test]
+fn coin_backfill_migration_has_unique_coin_dataset_constraint() {
+    let content = fs::read_to_string("migrations/0012_coin_backfill.sql")
+        .expect("0012_coin_backfill.sql must exist");
+    let lower = content.to_lowercase();
+    assert!(
+        lower.contains("unique (coin_id, dataset)") || lower.contains("unique(coin_id, dataset)"),
+        "0012_coin_backfill.sql missing UNIQUE (coin_id, dataset) on backfill_jobs (REQ-DB-033)"
     );
 }
 

@@ -164,7 +164,7 @@ fn collection_queue_item_status_fields() {
 fn backfill_job_fields() {
     let job = BackfillJob {
         id: 42,
-        market_id: 1,
+        coin_id: "bitcoin".to_string(),
         dataset: "candles:1h".to_string(),
         status: "pending".to_string(),
         requested_at: Utc::now(),
@@ -183,7 +183,7 @@ fn backfill_chunk_cursor_is_optional() {
     let chunk = BackfillChunk {
         id: 1,
         job_id: 42,
-        market_id: 1,
+        coin_id: "bitcoin".to_string(),
         dataset: "candles:1h".to_string(),
         interval: Some("1h".to_string()),
         range_start: None,

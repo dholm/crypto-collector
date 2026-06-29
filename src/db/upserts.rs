@@ -4,8 +4,6 @@
 //! overwrites identical rows rather than duplicating them (REQ-SCHED-040).
 //!
 //! # Natural keys
-//! - `live_quotes`:            `(market_id, ts)` — legacy; kept until T-B (live_poller rebase)
-//! - `candles`:                `(market_id, interval, ts)` — legacy
 //! - `coin_quotes`:            `(coin_id, vs_currency, ts)` — SPEC-API-002
 //! - `coin_candles`:           `(coin_id, vs_currency, interval, ts)` — SPEC-API-002
 //! - `coin_market_snapshots`:  `(coin_id, vs_currency, ts)`
@@ -17,78 +15,14 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use crate::models::quote::CoinCandle;
-use crate::providers::{CoinMarket, CoinMeta, OhlcCandle, SpotQuote};
+use crate::providers::{CoinMarket, CoinMeta, SpotQuote};
 
 // ── @MX annotation ────────────────────────────────────────────────────────────
 // @MX:NOTE: [AUTO] All upserts use ON CONFLICT DO UPDATE on natural keys (REQ-SCHED-040).
 //   Re-executing a crashed work unit overwrites the same rows — no duplicates.
-//   live_quotes/candles/coin_market_snapshots/derivatives_quotes are partitioned by ts;
+//   coin_market_snapshots/derivatives_quotes are partitioned by ts;
 //   ON CONFLICT requires the full PK including the partition key (ts).
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-040
-
-// ── candles (legacy — still used by backfill.rs; TODO: repurpose for coin_candles once backfill is rebased) ──
-
-/// Upsert a single OHLCV candle. Natural key: `(market_id, interval, ts)`.
-///
-// @MX:NOTE: [AUTO] upsert_candle — idempotent on (market_id, interval, ts); exact-once persistence
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-040
-pub const UPSERT_CANDLE_SQL: &str = "\
-    INSERT INTO candles \
-        (market_id, interval, ts, open, high, low, close, volume, vs_currency, source) \
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-    ON CONFLICT (market_id, interval, ts) DO UPDATE SET \
-        open       = EXCLUDED.open, \
-        high       = EXCLUDED.high, \
-        low        = EXCLUDED.low, \
-        close      = EXCLUDED.close, \
-        volume     = EXCLUDED.volume, \
-        source     = EXCLUDED.source";
-
-pub async fn upsert_candle(pool: &PgPool, c: &OhlcCandle) -> Result<(), sqlx::Error> {
-    sqlx::query(UPSERT_CANDLE_SQL)
-        .bind(c.market_id)
-        .bind(&c.interval)
-        .bind(c.ts)
-        .bind(c.open)
-        .bind(c.high)
-        .bind(c.low)
-        .bind(c.close)
-        .bind(c.volume)
-        .bind(&c.vs_currency)
-        .bind(&c.source)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-/// Upsert a batch of OHLCV candles in a single transaction.
-pub async fn upsert_candles(pool: &PgPool, candles: &[OhlcCandle]) -> Result<(), sqlx::Error> {
-    if candles.is_empty() {
-        return Ok(());
-    }
-    let start = std::time::Instant::now();
-    let mut tx = pool.begin().await?;
-    for c in candles {
-        sqlx::query(UPSERT_CANDLE_SQL)
-            .bind(c.market_id)
-            .bind(&c.interval)
-            .bind(c.ts)
-            .bind(c.open)
-            .bind(c.high)
-            .bind(c.low)
-            .bind(c.close)
-            .bind(c.volume)
-            .bind(&c.vs_currency)
-            .bind(&c.source)
-            .execute(&mut *tx)
-            .await?;
-    }
-    let result = tx.commit().await;
-    // REQ-OBS-015: record candle batch insert latency regardless of outcome.
-    metrics::histogram!("candle_insert_duration_seconds").record(start.elapsed().as_secs_f64());
-    result?;
-    Ok(())
-}
 
 // ── coin_quotes (SPEC-API-002 REQ-SCHED-040) ─────────────────────────────────
 

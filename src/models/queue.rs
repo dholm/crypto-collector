@@ -32,13 +32,13 @@ pub struct CollectionQueueItem {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Historical backfill job. One job per `(market_id, dataset)`.
-/// `UNIQUE (market_id, dataset)` makes enqueue idempotent (REQ-DB-033).
+/// Historical backfill job. One job per `(coin_id, dataset)`.
+/// `UNIQUE (coin_id, dataset)` makes enqueue idempotent (REQ-DB-033).
 /// A job fans out into `BackfillChunk`s which are the claimable work units.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct BackfillJob {
     pub id: i64,
-    pub market_id: i64,
+    pub coin_id: String,
     /// e.g. "candles:1h", "candles:1d"
     pub dataset: String,
     pub status: String,
@@ -54,7 +54,7 @@ pub struct BackfillJob {
 pub struct BackfillChunk {
     pub id: i64,
     pub job_id: i64,
-    pub market_id: i64,
+    pub coin_id: String,
     pub dataset: String,
     /// Candle interval (e.g. "1h"), NULL for non-candle datasets.
     pub interval: Option<String>,

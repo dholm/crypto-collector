@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
-use crate::db::upserts::upsert_candles;
+use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
 
@@ -90,7 +90,7 @@ pub const CLAIM_BACKFILL_SQL: &str = "\
         LIMIT 1 \
         FOR UPDATE SKIP LOCKED \
     ) \
-    RETURNING id, job_id, market_id, dataset, interval, \
+    RETURNING id, job_id, coin_id, dataset, interval, \
               range_start, range_end, cursor, status, \
               claimed_by, lease_expires_at, heartbeat_at, \
               attempts, last_error, created_at, updated_at";
@@ -142,15 +142,15 @@ pub const FAIL_OR_RETRY_BACKFILL_SQL: &str = "\
 /// `ON CONFLICT DO NOTHING` absorbs duplicate job registrations.
 pub const ENQUEUE_BACKFILL_JOB_SQL: &str = "\
     INSERT INTO backfill_jobs \
-        (market_id, dataset, status, requested_at, updated_at) \
+        (coin_id, dataset, status, requested_at, updated_at) \
     VALUES ($1, $2, 'pending', now(), now()) \
-    ON CONFLICT (market_id, dataset) DO NOTHING \
+    ON CONFLICT (coin_id, dataset) DO NOTHING \
     RETURNING id";
 
 /// Insert one chunk for a newly created job.
 pub const INSERT_BACKFILL_CHUNK_SQL: &str = "\
     INSERT INTO backfill_chunks \
-        (job_id, market_id, dataset, interval, range_start, range_end, \
+        (job_id, coin_id, dataset, interval, range_start, range_end, \
          status, created_at, updated_at) \
     VALUES ($1, $2, $3, $4, $5, $6, 'pending', now(), now())";
 
@@ -161,7 +161,7 @@ pub const INSERT_BACKFILL_CHUNK_SQL: &str = "\
 pub struct ClaimedChunk {
     pub id: i64,
     pub job_id: i64,
-    pub market_id: i64,
+    pub coin_id: String,
     pub dataset: String,
     pub interval: Option<String>,
     pub range_start: Option<DateTime<Utc>>,
@@ -264,14 +264,14 @@ pub async fn fail_or_retry_backfill_chunk(
 /// Returns `true` if a new job was created, `false` if it already exists.
 pub async fn enqueue_backfill_job(
     pool: &PgPool,
-    market_id: i64,
+    coin_id: &str,
     dataset: &str,
     interval: Option<&str>,
     range_start: Option<DateTime<Utc>>,
     range_end: Option<DateTime<Utc>>,
 ) -> Result<bool, sqlx::Error> {
     let job_id: Option<i64> = sqlx::query_scalar(ENQUEUE_BACKFILL_JOB_SQL)
-        .bind(market_id)
+        .bind(coin_id)
         .bind(dataset)
         .fetch_optional(pool)
         .await?;
@@ -282,7 +282,7 @@ pub async fn enqueue_backfill_job(
 
     sqlx::query(INSERT_BACKFILL_CHUNK_SQL)
         .bind(job_id)
-        .bind(market_id)
+        .bind(coin_id)
         .bind(dataset)
         .bind(interval)
         .bind(range_start)
@@ -321,25 +321,22 @@ async fn process_chunk(
     chain: &[Arc<dyn Provider>],
     chunk: &ClaimedChunk,
 ) -> Result<Option<DateTime<Utc>>, String> {
-    // Resolve market context.
-    type MarketRow = (i64, Option<String>, String, String, Option<String>);
-    let row: Option<MarketRow> =
-        sqlx::query_as("SELECT id, coin_id, base, quote, venue FROM tracked_markets WHERE id = $1")
-            .bind(chunk.market_id)
+    // Look up coin's trading symbol from tracked_coins.
+    let symbol: Option<String> =
+        sqlx::query_scalar("SELECT symbol FROM tracked_coins WHERE coin_id = $1")
+            .bind(&chunk.coin_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| e.to_string())?;
-
-    let (_, coin_id, base, quote, venue) =
-        row.ok_or_else(|| format!("market {} not found", chunk.market_id))?;
+    let symbol = symbol.ok_or_else(|| format!("coin {} not found", chunk.coin_id))?;
 
     let mq = MarketQuery {
-        market_id: chunk.market_id,
-        coin_id,
-        base,
-        quote: quote.clone(),
-        venue,
-        vs_currency: quote.to_lowercase(),
+        market_id: 0,
+        coin_id: Some(chunk.coin_id.clone()),
+        base: symbol,
+        quote: "USDT".to_string(),
+        venue: None,
+        vs_currency: "usd".to_string(),
     };
 
     // Acquire pacer slot OUTSIDE any transaction (REQ-SCHED-041).
@@ -373,10 +370,24 @@ async fn process_chunk(
         (None, None) => candles,
     };
 
-    // Idempotent upsert (REQ-SCHED-040).
-    upsert_candles(pool, &filtered)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Idempotent upsert into coin_candles (REQ-SCHED-040).
+    for c in &filtered {
+        let coin_candle = crate::models::quote::CoinCandle {
+            coin_id: chunk.coin_id.clone(),
+            vs_currency: c.vs_currency.clone(),
+            interval: c.interval.clone(),
+            ts: c.ts,
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            volume: c.volume,
+            source: c.source.clone(),
+        };
+        upsert_coin_candle(pool, &coin_candle)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     // Return the max timestamp for cursor advancement.
     let max_ts = filtered.iter().map(|c| c.ts).max();
@@ -676,7 +687,7 @@ mod tests {
     #[test]
     fn enqueue_job_sql_uses_on_conflict_do_nothing() {
         assert!(
-            ENQUEUE_BACKFILL_JOB_SQL.contains("ON CONFLICT (market_id, dataset) DO NOTHING"),
+            ENQUEUE_BACKFILL_JOB_SQL.contains("ON CONFLICT (coin_id, dataset) DO NOTHING"),
             "enqueue job SQL must be idempotent via ON CONFLICT (REQ-SCHED-028)"
         );
     }
@@ -690,22 +701,13 @@ mod tests {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
         let pool = crate::db::connect(&url).await.expect("connect");
 
-        // Need a market and a job first.
-        let market_id: i64 = sqlx::query_scalar(
-            "INSERT INTO tracked_markets (base, quote, status) VALUES ('BTC', 'USD', 'active') \
-             ON CONFLICT (base, quote) DO UPDATE SET status='active' RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("upsert market");
-
+        // bitcoin must exist in tracked_coins (seeded by migrations or prior test data).
         let job_id: i64 = sqlx::query_scalar(
-            "INSERT INTO backfill_jobs (market_id, dataset, status, requested_at, updated_at) \
-             VALUES ($1, 'ohlc_1d', 'pending', now(), now()) \
-             ON CONFLICT (market_id, dataset) DO UPDATE SET status='pending' \
+            "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
+             VALUES ('bitcoin', 'ohlc_1d', 'pending', now(), now()) \
+             ON CONFLICT (coin_id, dataset) DO UPDATE SET status='pending' \
              RETURNING id",
         )
-        .bind(market_id)
         .fetch_one(&pool)
         .await
         .expect("upsert job");
@@ -715,11 +717,10 @@ mod tests {
         let range_end = chrono::Utc::now();
         let chunk_id: i64 = sqlx::query_scalar(
             "INSERT INTO backfill_chunks \
-             (job_id, market_id, dataset, interval, range_start, range_end, status, created_at, updated_at) \
-             VALUES ($1, $2, 'ohlc_1d', '1d', $3, $4, 'pending', now(), now()) RETURNING id",
+             (job_id, coin_id, dataset, interval, range_start, range_end, status, created_at, updated_at) \
+             VALUES ($1, 'bitcoin', 'ohlc_1d', '1d', $2, $3, 'pending', now(), now()) RETURNING id",
         )
         .bind(job_id)
-        .bind(market_id)
         .bind(range_start)
         .bind(range_end)
         .fetch_one(&pool)
