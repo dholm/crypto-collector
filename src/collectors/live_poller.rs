@@ -114,17 +114,18 @@ pub const LIVE_COIN_CLAIM_SQL: &str = "\
     WHERE tracked_coins.coin_id = claimed.coin_id \
     RETURNING tracked_coins.coin_id, tracked_coins.symbol";
 
-/// Success UPDATE: advance `last_polled_at` and clear the marker (REQ-SCHED-005).
+/// Success UPDATE: advance `last_polled_at`, set `last_collected_at`, and clear the marker (REQ-SCHED-005).
 ///
 /// INVARIANT: runs OUTSIDE the claim transaction (cursor advances only on success).
 ///
-// @MX:WARN: [AUTO] LIVE_COIN_SUCCESS_SQL — sets last_polled_at; must run OUTSIDE claim tx
+// @MX:WARN: [AUTO] LIVE_COIN_SUCCESS_SQL — sets last_polled_at + last_collected_at; must run OUTSIDE claim tx
 // @MX:REASON: REQ-SCHED-005: last_polled_at advances ONLY after a reached success.
 //             REQ-SCHED-006: transient failure must NOT advance last_polled_at (see FAILURE_CLEAR_SQL).
+//             last_collected_at mirrors last_polled_at so the API can surface the last successful collection.
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-005
 pub const LIVE_COIN_SUCCESS_SQL: &str = "\
     UPDATE tracked_coins \
-    SET last_polled_at = now(), live_poll_claimed_until = NULL \
+    SET last_polled_at = now(), last_collected_at = now(), live_poll_claimed_until = NULL \
     WHERE coin_id = $1";
 
 /// Transient-failure UPDATE: clear the marker only, leave `last_polled_at` unchanged (REQ-SCHED-006).
@@ -530,6 +531,10 @@ mod tests {
         assert!(
             LIVE_COIN_SUCCESS_SQL.contains("last_polled_at = now()"),
             "success SQL must advance last_polled_at (REQ-SCHED-005)"
+        );
+        assert!(
+            LIVE_COIN_SUCCESS_SQL.contains("last_collected_at = now()"),
+            "success SQL must update last_collected_at so the API shows the last collection time"
         );
         assert!(
             LIVE_COIN_SUCCESS_SQL.contains("live_poll_claimed_until = NULL"),
