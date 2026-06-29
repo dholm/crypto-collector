@@ -27,6 +27,7 @@
 DROP TABLE IF EXISTS derivatives_quotes;
 DROP TABLE IF EXISTS candles;
 DROP TABLE IF EXISTS live_quotes;
+DROP TABLE IF EXISTS backfill_chunks;
 DROP TABLE IF EXISTS backfill_jobs;
 DROP TABLE IF EXISTS tracked_markets CASCADE;
 
