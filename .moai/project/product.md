@@ -16,23 +16,27 @@ Enable real-time and historical cryptocurrency market data consumption across th
 
 ## Core Capabilities
 
-### 1. Spot Quotes and OHLCV Candles
-- Real-time bid/ask snapshots and last-traded prices for cryptocurrency market pairs (e.g., BTC/USD, ETH/USDT).
-- Historical OHLCV (open, high, low, close, volume) candles at multiple time intervals (1m, 5m, 15m, 1h, 4h, 1d, 1w, 1M).
-- Markets modeled as base/quote currency pairs with optional venue/exchange dimension for higher-fidelity trading venues (Binance, Coinbase, Kraken).
-- Cursor-based pagination for efficient range queries across historical data.
+### 1. Coin Spot Quotes and OHLCV Candles
 
-### 2. Market Metadata and Tokenomics
+- Real-time spot quotes (price, vs_currency, source) for tracked coins via `GET /v1/coins/{coin_id}/quotes/latest` and paginated history via `GET /v1/coins/{coin_id}/quotes`.
+- Historical OHLCV (open, high, low, close, volume) candles at multiple intervals (1m, 5m, 15m, 1h, 4h, 1d, 1w) via `GET /v1/coins/{coin_id}/candles` (interval required).
+- Binance is the preferred upstream for spot quotes and OHLCV candles (lower latency, no monthly credit cap). CoinGecko retained for coin search and metadata.
+- Cursor-based keyset pagination for efficient range queries across historical data. All price/quantity fields serialized as JSON strings (DecimalString) to preserve full precision.
+- Per-coin polling cadence (`live_poll_interval`) configurable per coin in H/M/S notation (e.g. "5m", "1h30m"); null = global cadence. Set on registration, adjustable via PATCH, bounds-validated.
+
+### 2. Real-Time WebSocket Streams
+
+- `GET /v1/coins/stream/quotes` — live spot quote push per subscribed coin.
+- `GET /v1/coins/stream/candles` — live OHLCV candle push per subscribed (coin, interval) pair.
+- Per-connection subscription management via JSON control frames (subscribe/unsubscribe).
+- Cross-replica delivery via PostgreSQL LISTEN/NOTIFY — all service replicas push to subscribed clients regardless of which replica collected the data.
+- No authentication, no backfill on connect; malformed control frames return an error frame and the connection stays open.
+
+### 3. Market Metadata and Tokenomics
 - Coin-level aggregated metadata: official name, symbol, category, description, official links.
 - Supply metrics: circulating supply, total supply, maximum supply.
 - Market valuation: market capitalization, fully-diluted valuation (FDV), price-to-FDV ratio.
 - On-chain presence: contract addresses (if applicable), blockchain references.
-
-### 3. Derivatives Data
-- Perpetual and futures funding rates (borrowed cost of maintaining open positions).
-- Open interest (total notional value of open positions), stored as per-venue ticks (`derivatives_quotes` keyed by `(market_id, ts, venue)`); any cross-exchange aggregation is a deferred query-time concern, not a stored cross-venue total.
-- Mark and index price observations (exchange-reported mark price vs. broad index average).
-- Aggregated at venue level where applicable.
 
 ## Out of Scope (Explicit Non-Goals)
 
@@ -43,13 +47,12 @@ The following are explicitly **not** in scope and are reserved for future work o
 - **Sentiment analysis**: Social media sentiment, whale watching, or on-chain behavior tracking.
 - **Decentralized exchange (DEX) data**: Order books from DEXes; liquidity pool composition; governance token dynamics. DEX integration is a future phase.
 - **News and announcements**: Parsing press releases or news feeds. Orthogonal to market data aggregation.
-- **WebSocket streaming push**: Real-time push of quotes/candles/derivatives over WebSocket. The foundation is REST-polling only; streaming output is a future phase (all foundation SPECs — DB, PROV, SCHED, API, OBS — explicitly defer it).
 
 ## Data Sources and Provider Strategy
 
 ### Primary Aggregator
-- **CoinGecko API** is the primary (foundation) data source for prices, market metadata, supply, and derivatives data. **CoinMarketCap API** is future work — a second-provider integration with its own rate-limit/credit model, deliberately deferred out of the foundation scope (see SPEC-PROV-001 Exclusions).
-- Aggregators are preferred because they normalize data across venues, provide broad asset coverage, and handle stale/missing venue data gracefully.
+- **CoinGecko API** is the primary data source for coin search and metadata. Binance is the preferred upstream for live spot quotes and OHLCV candles (no monthly credit cap). **CoinMarketCap API** is future work — a second-provider integration with its own rate-limit/credit model, deliberately deferred out of the foundation scope (see SPEC-PROV-001 Exclusions).
+- Aggregators are preferred for metadata because they normalize data across venues and provide broad asset coverage. Binance is preferred for quotes/candles because it has no monthly credit cap and lower latency.
 
 ### Optional Fallback Chain
 - Centralized exchange APIs (**Binance**, **Coinbase**, **Kraken**) as optional secondary sources for higher-fidelity trading pair data (tighter bid-ask spreads, more granular timestamp precision).
