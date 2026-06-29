@@ -57,5 +57,9 @@ Decision confirmed: T-A and T-B are in scope. Migration 0011 must not be deploye
 - T-A ✓ DONE — live_poller rebased to tracked_coins; collection_queue coin dispatch arms added; upsert_coin_quote/upsert_coin_candle with pg_notify wired
 - T-B ✓ DONE — TrackedMarket/LiveQuote/Candle removed from models/quote.rs; derivatives.rs deleted; upsert_live_quote/upsert_derivatives_quote removed; model_serde.rs orphaned tests removed
 
-**Remaining tech debt (not in T-A/T-B scope):**
-- backfill.rs still references upsert_candles (market-keyed candles table) — needs its own rebase once migration 0011 is deployed to production
+**Backfill tech debt (resolved, commit `2824c7d`):**
+- Migration 0012 created coin-keyed backfill_jobs/backfill_chunks
+- backfill.rs rebased: process_chunk queries tracked_coins; writes coin_candles via upsert_coin_candle
+- upsert_candle/upsert_candles removed from db/upserts.rs and db/mod.rs
+- BackfillJob/BackfillChunk models updated: market_id → coin_id
+- tests/model_serde.rs and tests/migration_files.rs updated
