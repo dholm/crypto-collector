@@ -87,29 +87,31 @@ pub type SearchSlotFn = Arc<
         + Sync,
 >;
 
-/// Build the production `SearchSlotFn` that wraps `pacer::acquire_slot` with a timeout.
+/// Build the production `SearchSlotFn` using bounded slot acquisition.
 ///
-/// If the slot cannot be acquired within `timeout_ms`, returns `Unavailable`.
-pub fn make_db_search_slot_fn(pool: PgPool, timeout_ms: u64) -> SearchSlotFn {
-    use std::time::Duration;
+/// Uses `pacer::try_acquire_slot` with `max_wait_ms`: only takes a slot if the next
+/// available window opens within `max_wait_ms`. If collectors have queued slots further
+/// ahead than that, returns `Unavailable` immediately without sleeping and without
+/// consuming a credit. This prevents interactive search requests from sleeping for
+/// arbitrarily long durations while background collectors hold the queue.
+pub fn make_db_search_slot_fn(pool: PgPool, max_wait_ms: u64) -> SearchSlotFn {
     Arc::new(move |provider: String| {
         let pool = pool.clone();
         Box::pin(async move {
-            match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                crate::pacer::acquire_slot(&pool, &provider),
-            )
-            .await
-            {
-                Ok(Ok(())) => SearchSlotResult::Available,
-                Ok(Err(crate::pacer::AcquireSlotError::Cooldown(p, _))) => {
+            match crate::pacer::try_acquire_slot(&pool, &provider, max_wait_ms).await {
+                Ok(()) => SearchSlotResult::Available,
+                Err(crate::pacer::AcquireSlotError::Cooldown(p, _)) => {
                     SearchSlotResult::Unavailable(format!("provider '{p}' is in cooldown"))
                 }
-                Ok(Err(crate::pacer::AcquireSlotError::CreditExhausted(p))) => {
+                Err(crate::pacer::AcquireSlotError::CreditExhausted(p)) => {
                     SearchSlotResult::Unavailable(format!("provider '{p}' credit budget exhausted"))
                 }
-                Ok(Err(e)) => SearchSlotResult::Unavailable(format!("pacer error: {e}")),
-                Err(_elapsed) => SearchSlotResult::Unavailable("pacer slot timeout".to_string()),
+                Err(crate::pacer::AcquireSlotError::Busy(p)) => {
+                    SearchSlotResult::Unavailable(format!(
+                        "provider '{p}' rate limit queue is full"
+                    ))
+                }
+                Err(e) => SearchSlotResult::Unavailable(format!("pacer error: {e}")),
             }
         })
     })

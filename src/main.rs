@@ -165,20 +165,21 @@ async fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "coingecko".to_string());
     let coingecko_base_url = config::coingecko_base_url();
-    // Search acquires two pacer slots sequentially (coin resolve + tickers fetch).
-    // Each slot can sleep up to min_gap_ms (~2s for CoinGecko Demo) before proceeding.
-    // The timeout must cover both sleeps plus DB round-trip overhead.
-    let search_timeout_ms: u64 = std::env::var("SEARCH_PACER_TIMEOUT_MS")
+    // Maximum ms a search request will wait for a pacer slot to become available.
+    // If the collector queue is deeper than this, search returns 503 immediately
+    // without sleeping and without consuming a credit (try_acquire_slot).
+    // Must be >= min_gap_ms (~2000ms for CoinGecko Demo) to allow at least one slot.
+    let search_max_wait_ms: u64 = std::env::var("SEARCH_PACER_MAX_WAIT_MS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10_000);
+        .unwrap_or(3_000);
 
     let api_state = crypto_collector::api::AppState {
         pool: pool.clone(),
         chain: chain.clone(),
         search_slot_fn: crypto_collector::api::make_db_search_slot_fn(
             pool.clone(),
-            search_timeout_ms,
+            search_max_wait_ms,
         ),
         search_provider,
         coingecko_base_url,

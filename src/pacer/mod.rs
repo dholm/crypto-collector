@@ -127,6 +127,13 @@ pub enum AcquireSlotError {
     #[error("provider '{0}' not found in upstream_request_pacer")]
     NotFound(String),
 
+    /// Next available slot is more than `max_wait_ms` away; caller should 503.
+    ///
+    /// Unlike Cooldown/CreditExhausted, this means the provider is healthy but
+    /// the queue is too deep for an interactive request to wait.
+    #[error("provider '{0}' next slot is too far ahead (queue busy)")]
+    Busy(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -212,6 +219,95 @@ pub async fn acquire_slot(pool: &PgPool, provider: &str) -> Result<(), AcquireSl
                         return Err(AcquireSlotError::CreditExhausted(provider.to_string()));
                     }
                     // Fallback — pacer row exists but condition is unclear; treat as NotFound
+                    Err(AcquireSlotError::NotFound(provider.to_string()))
+                }
+            }
+        }
+    }
+}
+
+/// Try to acquire a pacer slot, but only if the next available slot is within `max_wait_ms`.
+///
+/// Unlike [`acquire_slot`], this function is safe for interactive request paths (e.g. search).
+/// If the queue is deeper than `max_wait_ms` — because background collectors have reserved
+/// many upcoming slots — it returns `Err(AcquireSlotError::Busy)` immediately without
+/// consuming a slot or sleeping. This prevents interactive requests from sleeping for
+/// arbitrarily long durations.
+///
+/// When the slot IS within range, it reserves it (same atomic UPDATE as `acquire_slot`),
+/// then sleeps at most `max_wait_ms + min_gap_ms` milliseconds before returning.
+///
+// @MX:NOTE: [AUTO] try_acquire_slot is the bounded slot acquisition for interactive (search) paths.
+// @MX:SPEC: SPEC-PROV-001 REQ-PROV-040/081
+pub async fn try_acquire_slot(
+    pool: &PgPool,
+    provider: &str,
+    max_wait_ms: u64,
+) -> Result<(), AcquireSlotError> {
+    reset_credit_window_if_needed(pool, provider).await?;
+
+    // Same UPDATE as acquire_slot, but adds a third WHERE gate:
+    //   GREATEST(now(), next_allowed_at) <= now() + max_wait_ms
+    // This means: only take the slot if it opens within max_wait_ms from now.
+    // If the slot is beyond that horizon, the UPDATE matches no rows → Busy.
+    let next_allowed_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "UPDATE upstream_request_pacer \
+         SET next_allowed_at = GREATEST(now(), next_allowed_at) \
+                               + (min_gap_ms * INTERVAL '1 ms'), \
+             credits_used = credits_used + 1, \
+             updated_at   = now() \
+         WHERE provider = $1 \
+           AND (cooldown_until IS NULL OR cooldown_until <= now()) \
+           AND (credit_limit IS NULL OR credits_used < credit_limit) \
+           AND GREATEST(now(), next_allowed_at) \
+                 <= now() + ($2 * INTERVAL '1 ms') \
+         RETURNING next_allowed_at",
+    )
+    .bind(provider)
+    .bind(max_wait_ms as i64)
+    .fetch_optional(pool)
+    .await?;
+
+    match next_allowed_at {
+        Some(next_at) => {
+            // Slot reserved. Sleep until it opens (bounded by max_wait_ms + min_gap_ms).
+            let now = Utc::now();
+            let wait = next_at.signed_duration_since(now);
+            if wait > Duration::zero() {
+                let ms = wait.num_milliseconds().clamp(0, 60_000) as u64;
+                tokio::time::sleep(StdDuration::from_millis(ms)).await;
+            }
+            Ok(())
+        }
+        None => {
+            // Distinguish: busy queue vs. cooldown/credit/notfound.
+            let row: Option<(Option<DateTime<Utc>>, Option<i64>, i64, DateTime<Utc>)> =
+                sqlx::query_as(
+                    "SELECT cooldown_until, credit_limit, credits_used, next_allowed_at \
+                     FROM upstream_request_pacer WHERE provider = $1",
+                )
+                .bind(provider)
+                .fetch_optional(pool)
+                .await?;
+
+            match row {
+                None => Err(AcquireSlotError::NotFound(provider.to_string())),
+                Some((cooldown_until, credit_limit, credits_used, next_allowed_at)) => {
+                    let now = Utc::now();
+                    if let Some(until) = cooldown_until {
+                        if until > now {
+                            return Err(AcquireSlotError::Cooldown(provider.to_string(), until));
+                        }
+                    }
+                    if credit_limit.is_some_and(|lim| credits_used >= lim) {
+                        return Err(AcquireSlotError::CreditExhausted(provider.to_string()));
+                    }
+                    // Queue busy: next slot is beyond max_wait_ms horizon.
+                    let horizon = now + Duration::milliseconds(max_wait_ms as i64);
+                    if next_allowed_at > horizon {
+                        return Err(AcquireSlotError::Busy(provider.to_string()));
+                    }
+                    // Row exists but reason unclear.
                     Err(AcquireSlotError::NotFound(provider.to_string()))
                 }
             }
@@ -394,6 +490,10 @@ mod tests {
             start.elapsed()
         );
     }
+
+    // ── pacer_decision covers try_acquire_slot's pure gates ─────────────────
+    // The Busy path is tested via the DB integration test below.
+    // The pure pacer_decision tests already cover Allow/Cooldown/CreditExhausted.
 
     // ── DB-gated integration tests (require live DATABASE_URL) ──────────────
 
@@ -587,6 +687,65 @@ mod tests {
         assert!(
             age < Duration::minutes(1),
             "credit_window_start must be reset to now, age={age:?}"
+        );
+    }
+
+    /// try_acquire_slot returns Busy when next_allowed_at is beyond max_wait_ms.
+    #[tokio::test]
+    #[ignore]
+    async fn db_try_acquire_slot_busy_when_queue_too_deep() {
+        let pool = setup_db().await;
+
+        // Push next_allowed_at far into the future (60s).
+        sqlx::query(
+            "UPDATE upstream_request_pacer \
+             SET next_allowed_at = now() + INTERVAL '60 seconds', \
+                 cooldown_until = NULL, credits_used = 0 \
+             WHERE provider = 'coingecko'",
+        )
+        .execute(&pool)
+        .await
+        .expect("setup");
+
+        // max_wait_ms = 3000 — slot is 60s away, so must return Busy.
+        let result = try_acquire_slot(&pool, "coingecko", 3_000).await;
+        assert!(
+            matches!(result, Err(AcquireSlotError::Busy(_))),
+            "try_acquire_slot must return Busy when queue is deeper than max_wait_ms, got: {result:?}"
+        );
+
+        // Reset for other tests.
+        sqlx::query(
+            "UPDATE upstream_request_pacer \
+             SET next_allowed_at = now() \
+             WHERE provider = 'coingecko'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset");
+    }
+
+    /// try_acquire_slot succeeds when next_allowed_at is within max_wait_ms.
+    #[tokio::test]
+    #[ignore]
+    async fn db_try_acquire_slot_succeeds_when_within_max_wait() {
+        let pool = setup_db().await;
+
+        // Set next_allowed_at to 1s from now — within our 3s max_wait.
+        sqlx::query(
+            "UPDATE upstream_request_pacer \
+             SET next_allowed_at = now() + INTERVAL '1 second', \
+                 cooldown_until = NULL, credits_used = 0 \
+             WHERE provider = 'coingecko'",
+        )
+        .execute(&pool)
+        .await
+        .expect("setup");
+
+        let result = try_acquire_slot(&pool, "coingecko", 3_000).await;
+        assert!(
+            result.is_ok(),
+            "try_acquire_slot must succeed when slot is within max_wait_ms, got: {result:?}"
         );
     }
 }
