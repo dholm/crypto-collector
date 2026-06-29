@@ -23,7 +23,7 @@ use super::{
     dto::{
         MarketDto, MarketSearchPage, Page, RegisterMarketRequest, UpdateMarketRequest,
     },
-    ApiError, ApiResult, AppState, SearchSlotResult,
+    ApiError, ApiResult, AppState,
 };
 
 // ── Query parameter types ─────────────────────────────────────────────────────
@@ -136,18 +136,16 @@ pub async fn register_market(
     Ok((StatusCode::CREATED, Json(MarketDto::from(market))).into_response())
 }
 
-/// `GET /v1/markets/search?q=` — search candidate market pairs via provider (REQ-API-023/080/081).
+/// `GET /v1/markets/search?q=` — search candidate market pairs via provider (REQ-API-023).
 ///
-/// # Flow (two upstream calls, two pacer slots)
+/// # Flow
 ///
 /// 1. Resolve `q` → `coin_id` via provider coin search (top match).
 ///    `q=BTC` resolves to `bitcoin`; a raw coin_id also resolves since CoinGecko search matches it.
 ///    Empty resolve → HTTP 200 `{"items":[]}`.
 /// 2. Fetch `coin_id`'s trading pairs from `/api/v3/coins/{id}/tickers`, ranked by
-///    `converted_volume.usd` descending; stale and anomaly tickers excluded; truncated to `limit`.
-///
-/// Each upstream provider call consumes one pacer slot (REQ-API-080/081).
-/// Returns 503 when either slot is unavailable.
+///    `converted_volume.usd` descending; stale, anomaly, and contract-address tickers excluded;
+///    truncated to `limit`.
 pub async fn search_markets(
     State(state): State<AppState>,
     Query(params): Query<SearchMarketsParams>,
@@ -156,14 +154,6 @@ pub async fn search_markets(
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let cap = limit.min(50) as usize;
 
-    // Acquire first pacer slot for coin resolution (REQ-API-080/081).
-    let slot_result = (state.search_slot_fn)(state.search_provider.clone()).await;
-    if let SearchSlotResult::Unavailable(reason) = slot_result {
-        return Err(ApiError::ServiceUnavailable(reason));
-    }
-
-    // Slot acquired: look up the named provider so auth, base URL, and tier
-    // are handled in one place (CoinGeckoClient::search_coins / fetch_coin_tickers).
     let provider = state
         .chain
         .iter()
@@ -189,12 +179,6 @@ pub async fn search_markets(
             return Ok(Json(MarketSearchPage { items: vec![] }));
         }
     };
-
-    // Acquire second pacer slot for tickers fetch (REQ-API-080/081).
-    let slot_result2 = (state.search_slot_fn)(state.search_provider.clone()).await;
-    if let SearchSlotResult::Unavailable(reason) = slot_result2 {
-        return Err(ApiError::ServiceUnavailable(reason));
-    }
 
     // Step 2: Fetch coin's trading pairs ranked by converted USD volume.
     let items = match provider.fetch_coin_tickers(&coin_id, cap).await {
@@ -495,7 +479,7 @@ mod tests {
         let state = crate::api::AppState {
             pool: pool.clone(),
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::deny_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
@@ -543,7 +527,7 @@ mod tests {
         let state = crate::api::AppState {
             pool,
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::deny_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),

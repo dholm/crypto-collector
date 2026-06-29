@@ -44,89 +44,12 @@ pub struct AppState {
     pub pool: PgPool,
     /// Ordered provider chain (same instance as the background workers).
     pub chain: Arc<Vec<Arc<dyn Provider>>>,
-    /// Function to try acquiring a search pacer slot for a given provider.
-    ///
-    /// Injected here so tests can supply a fake (deny or allow) without a live DB
-    /// (REQ-API-080/081, Scenario 15).
-    pub search_slot_fn: SearchSlotFn,
     /// Provider name to use for search calls (typically the first in the chain).
     pub search_provider: String,
     /// CoinGecko base URL for search API calls.
     pub coingecko_base_url: String,
     /// HTTP client for outbound search calls.
     pub http_client: reqwest::Client,
-}
-
-// ── Search pacer abstraction ──────────────────────────────────────────────────
-
-/// Result of a bounded search pacer slot acquisition attempt.
-#[derive(Debug, PartialEq, Eq)]
-pub enum SearchSlotResult {
-    /// Slot acquired; caller may proceed with the upstream call.
-    Available,
-    /// Slot unavailable (cooldown, credit exhaustion, or timeout); return 503.
-    ///
-    /// The message is included in the 503 JSON error body.
-    Unavailable(String),
-}
-
-/// Injected function type for pacer slot acquisition on the search request path.
-///
-/// Production: wraps `pacer::acquire_slot` with a bounded timeout.
-/// Tests: returns a fixed `SearchSlotResult` without touching the DB.
-///
-// @MX:WARN: [AUTO] SearchSlotFn is the request-path egress gate for search handlers
-// @MX:REASON: Search handlers MUST NOT issue upstream calls without first acquiring a slot through
-//             this function. Bypassing it would violate REQ-API-080/081 and SPEC-PROV-001 REQ-PROV-040.
-//             In production, the function wraps pacer::acquire_slot with a bounded timeout.
-//             In tests, a fake function allows pacing behavior to be tested without a live DB.
-// @MX:SPEC: SPEC-API-001 REQ-API-080 REQ-API-081
-pub type SearchSlotFn = Arc<
-    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = SearchSlotResult> + Send>>
-        + Send
-        + Sync,
->;
-
-/// Build the production `SearchSlotFn` using bounded slot acquisition.
-///
-/// Uses `pacer::try_acquire_slot` with `max_wait_ms`: only takes a slot if the next
-/// available window opens within `max_wait_ms`. If collectors have queued slots further
-/// ahead than that, returns `Unavailable` immediately without sleeping and without
-/// consuming a credit. This prevents interactive search requests from sleeping for
-/// arbitrarily long durations while background collectors hold the queue.
-pub fn make_db_search_slot_fn(pool: PgPool, max_wait_ms: u64) -> SearchSlotFn {
-    Arc::new(move |provider: String| {
-        let pool = pool.clone();
-        Box::pin(async move {
-            match crate::pacer::try_acquire_slot(&pool, &provider, max_wait_ms).await {
-                Ok(()) => SearchSlotResult::Available,
-                Err(crate::pacer::AcquireSlotError::Cooldown(p, _)) => {
-                    SearchSlotResult::Unavailable(format!("provider '{p}' is in cooldown"))
-                }
-                Err(crate::pacer::AcquireSlotError::CreditExhausted(p)) => {
-                    SearchSlotResult::Unavailable(format!("provider '{p}' credit budget exhausted"))
-                }
-                Err(crate::pacer::AcquireSlotError::Busy(p)) => {
-                    SearchSlotResult::Unavailable(format!(
-                        "provider '{p}' rate limit queue is full"
-                    ))
-                }
-                Err(e) => SearchSlotResult::Unavailable(format!("pacer error: {e}")),
-            }
-        })
-    })
-}
-
-/// Build a search slot function that always denies (for tests / no-provider scenarios).
-pub fn deny_search_slot_fn() -> SearchSlotFn {
-    Arc::new(|_provider: String| {
-        Box::pin(async { SearchSlotResult::Unavailable("test: deny".to_string()) })
-    })
-}
-
-/// Build a search slot function that always grants (for tests where search pacing is irrelevant).
-pub fn allow_search_slot_fn() -> SearchSlotFn {
-    Arc::new(|_provider: String| Box::pin(async { SearchSlotResult::Available }))
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -387,21 +310,6 @@ mod tests {
         let e = ApiError::Internal(anyhow::anyhow!("db error"));
         let resp = e.into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // search_slot_fn helpers work correctly
-    #[tokio::test]
-    async fn deny_search_slot_fn_returns_unavailable() {
-        let f = deny_search_slot_fn();
-        let result = f("coingecko".to_string()).await;
-        assert!(matches!(result, SearchSlotResult::Unavailable(_)));
-    }
-
-    #[tokio::test]
-    async fn allow_search_slot_fn_returns_available() {
-        let f = allow_search_slot_fn();
-        let result = f("coingecko".to_string()).await;
-        assert_eq!(result, SearchSlotResult::Available);
     }
 
     // Scenario 14 (REQ-API-002): OpenAPI YAML exists and has /v1 servers entry.

@@ -21,7 +21,7 @@ use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
     dto::{CoinDto, CoinSearchPage, Page, RegisterCoinRequest, UpdateCoinRequest},
-    ApiError, ApiResult, AppState, SearchSlotResult,
+    ApiError, ApiResult, AppState,
 };
 
 // ── Query parameter types ─────────────────────────────────────────────────────
@@ -133,29 +133,15 @@ pub async fn register_coin(
     Ok((StatusCode::CREATED, Json(CoinDto::from(coin))).into_response())
 }
 
-/// `GET /v1/coins/search?q=` — search candidate coins via provider (REQ-API-013/080/081).
-///
-/// # Pacing (REQ-API-080/081)
-///
-/// Acquires a pacer slot via `state.search_slot_fn` with a bounded wait.
-/// Returns 503 when the slot, cooldown, or credit budget is unavailable.
-/// The search call counts against the same per-provider credit budget as worker traffic.
+/// `GET /v1/coins/search?q=` — search candidate coins via provider (REQ-API-013).
 pub async fn search_coins(
     State(state): State<AppState>,
     Query(params): Query<SearchCoinsParams>,
 ) -> ApiResult<impl IntoResponse> {
     let q = params.q.as_deref().unwrap_or("").trim().to_string();
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let cap = limit.min(50) as usize; // cap search at 50 candidates
+    let cap = limit.min(50) as usize;
 
-    // Acquire pacer slot (REQ-API-080/081).
-    let slot_result = (state.search_slot_fn)(state.search_provider.clone()).await;
-    if let SearchSlotResult::Unavailable(reason) = slot_result {
-        return Err(ApiError::ServiceUnavailable(reason));
-    }
-
-    // Slot acquired: look up the named provider and delegate the upstream call so auth,
-    // base URL, and tier are handled in one place (CoinGeckoClient::search_coins).
     let provider = state
         .chain
         .iter()
@@ -307,9 +293,8 @@ mod tests {
     use super::*;
     use axum_test::TestServer;
 
-    // Helper: build a test router with deny search slot (for offline tests).
-    fn test_server_with_deny_pacer() -> TestServer {
-        use crate::api::{build_api_router, deny_search_slot_fn, AppState};
+    fn test_server() -> TestServer {
+        use crate::api::{build_api_router, AppState};
         use std::sync::Arc;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -319,7 +304,6 @@ mod tests {
         let state = AppState {
             pool,
             chain: Arc::new(vec![]),
-            search_slot_fn: deny_search_slot_fn(),
             search_provider: "coingecko".to_string(),
             coingecko_base_url: "https://api.coingecko.com".to_string(),
             http_client: reqwest::Client::new(),
@@ -328,41 +312,10 @@ mod tests {
         TestServer::new(build_api_router(state))
     }
 
-    // Scenario 15 (REQ-API-081): search returns 503 when pacer denies.
-    #[tokio::test]
-    async fn search_coins_returns_503_when_pacer_denies() {
-        let server = test_server_with_deny_pacer();
-        let resp = server
-            .get("/v1/coins/search")
-            .add_query_param("q", "bit")
-            .await;
-        assert_eq!(
-            resp.status_code(),
-            503,
-            "search must return 503 when pacer denies"
-        );
-        let body: serde_json::Value = resp.json();
-        assert_eq!(
-            body["code"], "SERVICE_UNAVAILABLE",
-            "error code must be SERVICE_UNAVAILABLE"
-        );
-    }
-
-    // Scenario 15: search returns 503 without an upstream HTTP call when pacer denies.
-    #[tokio::test]
-    async fn search_markets_returns_503_when_pacer_denies() {
-        let server = test_server_with_deny_pacer();
-        let resp = server
-            .get("/v1/markets/search")
-            .add_query_param("q", "btc")
-            .await;
-        assert_eq!(resp.status_code(), 503);
-    }
-
     // Scenario 11 (REQ-API-072): invalid limit returns 400.
     #[tokio::test]
     async fn list_coins_invalid_limit_returns_400() {
-        let server = test_server_with_deny_pacer();
+        let server = test_server();
         let resp = server
             .get("/v1/coins")
             .add_query_param("limit", "9999999")
@@ -373,7 +326,7 @@ mod tests {
     // Scenario 10 (REQ-API-071): invalid cursor returns 400.
     #[tokio::test]
     async fn list_coins_invalid_cursor_returns_400() {
-        let server = test_server_with_deny_pacer();
+        let server = test_server();
         let resp = server
             .get("/v1/coins")
             .add_query_param("cursor", "not!!valid!!base64@@")
@@ -477,7 +430,7 @@ mod tests {
         let state = crate::api::AppState {
             pool: pool.clone(),
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::allow_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
@@ -521,7 +474,7 @@ mod tests {
         let state = crate::api::AppState {
             pool,
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::deny_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),

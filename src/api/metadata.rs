@@ -144,7 +144,7 @@ mod tests {
         let state = crate::api::AppState {
             pool,
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::deny_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
@@ -195,7 +195,7 @@ mod tests {
         let state = crate::api::AppState {
             pool: pool.clone(),
             chain: std::sync::Arc::new(vec![]),
-            search_slot_fn: crate::api::deny_search_slot_fn(),
+
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
