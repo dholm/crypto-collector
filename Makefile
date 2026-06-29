@@ -4,6 +4,12 @@
 IMAGE         ?= registry.helles.farm/crypto-collector:latest
 IMAGE_AARCH64 ?= registry.helles.farm/crypto-collector:aarch64
 
+# Deploy target (override for other clusters/namespaces).
+KUBECTL    ?= kubectl
+NAMESPACE  ?= finance
+DEPLOYMENT ?= crypto-collector
+ROLLOUT_TIMEOUT ?= 180s
+
 # Container engine: prefer docker, fall back to podman (this project standardises
 # on podman). `cross` reads CROSS_CONTAINER_ENGINE to pick its build container,
 # defaulting to docker; exporting it keeps `build-aarch64` working on podman-only
@@ -62,6 +68,11 @@ image-aarch64: build-aarch64 ## Build aarch64 container image using pre-compiled
 
 push-aarch64: image-aarch64 ## Build and push aarch64 image
 	$(CONTAINER_ENGINE) push $(IMAGE_AARCH64)
+
+.PHONY: deploy
+deploy: push-aarch64 ## Gated build+push, then rollout restart and wait (fail-fast)
+	$(KUBECTL) -n $(NAMESPACE) rollout restart deploy/$(DEPLOYMENT)
+	$(KUBECTL) -n $(NAMESPACE) rollout status deploy/$(DEPLOYMENT) --timeout=$(ROLLOUT_TIMEOUT)
 
 # ── Clean ────────────────────────────────────────────────────────────────────
 
