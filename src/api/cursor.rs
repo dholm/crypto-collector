@@ -6,20 +6,18 @@
 //!
 //! Key types per endpoint group:
 //!
-//! | Endpoint                      | Key type          | Ordering          |
-//! |-------------------------------|-------------------|-------------------|
-//! | `GET /v1/coins`               | `CoinListKey`     | `coin_id ASC`     |
-//! | `GET /v1/markets`             | `MarketListKey`   | `id ASC`          |
-//! | `GET /v1/markets/{id}/quotes` | `TsKey`           | `ts DESC`         |
-//! | `GET /v1/markets/{id}/candles`| `TsKey`           | `ts DESC`         |
-//! | `GET /v1/coins/{id}/market`   | `TsKey`           | `ts DESC`         |
-//! | `GET /v1/markets/{id}/derivatives` | `TsKey`      | `ts DESC`         |
+//! | Endpoint                              | Key type      | Ordering      |
+//! |---------------------------------------|---------------|---------------|
+//! | `GET /v1/coins`                       | `CoinListKey` | `coin_id ASC` |
+//! | `GET /v1/coins/{coin_id}/quotes`      | `TsKey`       | `ts DESC`     |
+//! | `GET /v1/coins/{coin_id}/candles`     | `TsKey`       | `ts DESC`     |
+//! | `GET /v1/coins/{coin_id}/market`      | `TsKey`       | `ts DESC`     |
 //!
 // @MX:ANCHOR: [AUTO] encode_keyset_cursor / decode_keyset_cursor — every /v1 list endpoint depends on this contract
-// @MX:REASON: All six list endpoint families use these helpers. Changing the encoding (base64url no-pad JSON)
+// @MX:REASON: All list endpoint families use these helpers. Changing the encoding (base64url no-pad JSON)
 //             or the key type shapes breaks every existing cursor token held by callers. Keyset, not OFFSET,
 //             for stability over partitioned append-heavy tables (REQ-API-070/071).
-// @MX:SPEC: SPEC-API-001 REQ-API-070 REQ-API-071
+// @MX:SPEC: SPEC-API-001 REQ-API-070 REQ-API-071 SPEC-API-002
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,16 +30,10 @@ pub struct CoinListKey {
     pub coin_id: String,
 }
 
-/// Keyset position for `GET /v1/markets` — ordered `id ASC`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MarketListKey {
-    pub id: i64,
-}
-
 /// Generic timestamp key for all time-series list endpoints — ordered `ts DESC`.
 ///
-/// Used by quotes, candles, coin market snapshots, and derivatives histories.
-/// The resource-specific filter (market_id, coin_id, interval, etc.) is kept in the
+/// Used by coin quotes, coin candles, and coin market snapshots.
+/// The resource-specific filter (coin_id, vs_currency, interval, etc.) is kept in the
 /// WHERE clause, NOT in the cursor, so the cursor remains compact and stable across
 /// re-registrations (REQ-API-070).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,16 +106,7 @@ mod tests {
         assert_eq!(decoded, key);
     }
 
-    // Scenario 10: cursor round-trips — MarketListKey
-    #[test]
-    fn market_list_key_roundtrip() {
-        let key = MarketListKey { id: 42 };
-        let encoded = encode_keyset_cursor(&key);
-        let decoded: MarketListKey = decode_keyset_cursor(&encoded).unwrap();
-        assert_eq!(decoded, key);
-    }
-
-    // Scenario 10: cursor round-trips — TsKey (quotes / candles / derivatives)
+    // Scenario 10: cursor round-trips — TsKey (coin quotes / candles / coin market)
     #[test]
     fn ts_key_roundtrip() {
         let key = TsKey { ts: ts() };

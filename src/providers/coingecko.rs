@@ -413,7 +413,11 @@ impl CoinGeckoClient {
                 let target = t["target"].as_str()?.to_string();
                 let is_stale = t["is_stale"].as_bool().unwrap_or(false);
                 let is_anomaly = t["is_anomaly"].as_bool().unwrap_or(false);
-                if is_stale || is_anomaly || is_contract_address(&base) || is_contract_address(&target) {
+                if is_stale
+                    || is_anomaly
+                    || is_contract_address(&base)
+                    || is_contract_address(&target)
+                {
                     return None;
                 }
                 let venue = t["market"]["identifier"].as_str().map(|s| s.to_string());
@@ -1446,7 +1450,10 @@ mod tests {
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client.search_coins("", 10).await.expect("empty q");
-        assert!(results.is_empty(), "empty query must return empty vec without HTTP call");
+        assert!(
+            results.is_empty(),
+            "empty query must return empty vec without HTTP call"
+        );
     }
 
     #[tokio::test]
@@ -1532,7 +1539,9 @@ mod tests {
         assert!(!is_contract_address("USDT"));
         assert!(!is_contract_address("ETH"));
         // 41 hex chars (too short — missing one)
-        assert!(!is_contract_address("0x6906ccda405926fc3f04240187dd4faf5df6d55"));
+        assert!(!is_contract_address(
+            "0x6906ccda405926fc3f04240187dd4faf5df6d55"
+        ));
         // 43 hex chars (too long)
         assert!(!is_contract_address(
             "0x6906ccda405926fc3f04240187dd4faf5df6d5551"
@@ -1658,7 +1667,11 @@ mod tests {
             .await
             .expect("fetch_coin_tickers");
 
-        assert_eq!(results.len(), 1, "stale and anomaly tickers must be excluded");
+        assert_eq!(
+            results.len(),
+            1,
+            "stale and anomaly tickers must be excluded"
+        );
         assert_eq!(results[0].venue.as_deref(), Some("binance"));
     }
 

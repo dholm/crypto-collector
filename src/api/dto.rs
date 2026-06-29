@@ -1,4 +1,4 @@
-//! Request / response DTOs for the `/v1` REST API (SPEC-API-001).
+//! Request / response DTOs for the `/v1` REST API (SPEC-API-001, SPEC-API-002).
 //!
 //! Every monetary or quantity field is serialized as a JSON string using
 //! `rust_decimal::serde::str` (or `str_option`) to guarantee lossless round-trips
@@ -12,12 +12,11 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     coin::{CoinMarketSnapshot, CoinMetadata, TrackedCoin},
-    derivatives::DerivativesQuote,
-    quote::{Candle, LiveQuote, TrackedMarket},
+    quote::{CoinCandle, CoinQuote},
 };
 
 // ── Shared pagination wrapper ─────────────────────────────────────────────────
@@ -43,7 +42,7 @@ pub struct ApiErrorBody {
 
 // ── Coin management DTOs ──────────────────────────────────────────────────────
 
-/// Response DTO for a tracked coin.
+/// Response DTO for a tracked coin (SPEC-API-002 REQ-API-112).
 #[derive(Debug, Serialize)]
 pub struct CoinDto {
     pub coin_id: String,
@@ -53,10 +52,18 @@ pub struct CoinDto {
     pub registered_at: DateTime<Utc>,
     pub last_collected_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Per-coin live-poll cadence override (e.g. "5m", "1h30m").
+    /// `null` = use global `LIVE_QUOTE_POLL_INTERVAL_SECS`.
+    pub live_poll_interval: Option<String>,
 }
 
 impl From<TrackedCoin> for CoinDto {
     fn from(c: TrackedCoin) -> Self {
+        // Normalize raw PG interval text (e.g. "00:05:00") to human-readable (e.g. "5m").
+        let live_poll_interval = c
+            .live_poll_interval
+            .as_deref()
+            .and_then(super::poll_interval::normalize_pg_interval);
         Self {
             coin_id: c.coin_id,
             symbol: c.symbol,
@@ -65,23 +72,51 @@ impl From<TrackedCoin> for CoinDto {
             registered_at: c.registered_at,
             last_collected_at: c.last_collected_at,
             error: c.error,
+            live_poll_interval,
         }
     }
 }
 
-/// Request body for `POST /v1/coins`.
+/// Request body for `POST /v1/coins` (SPEC-API-002 REQ-API-112).
 #[derive(Debug, Deserialize)]
 pub struct RegisterCoinRequest {
     pub coin_id: String,
     pub symbol: String,
     pub name: String,
+    /// Optional per-coin live-poll interval (e.g. "5m"). Must satisfy bounds (REQ-API-114).
+    pub live_poll_interval: Option<String>,
 }
 
-/// Request body for `PATCH /v1/coins/{coin_id}`.
+/// Request body for `PATCH /v1/coins/{coin_id}` (SPEC-API-002 REQ-API-112).
+///
+/// # Tri-state semantics for `live_poll_interval`
+///
+/// - Absent in JSON (field not present): leave existing value unchanged.
+/// - `null` in JSON: reset to global default (set DB column to NULL).
+/// - String value: parse, validate bounds, set new per-coin interval.
+///
+/// This uses `Option<Option<String>>` where:
+/// - `None` (outer) = field was absent from request body.
+/// - `Some(None)` = field was explicitly set to `null`.
+/// - `Some(Some(s))` = field was set to a string value.
 #[derive(Debug, Deserialize)]
 pub struct UpdateCoinRequest {
     pub status: Option<String>,
     pub error: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub live_poll_interval: Option<Option<String>>,
+}
+
+/// Custom deserializer for tri-state `Option<Option<T>>` fields.
+///
+/// When the JSON key is absent, serde uses the `#[serde(default)]` → `None`.
+/// When the JSON key is present (even if `null`), this deserializer is invoked and returns `Some(...)`.
+fn deserialize_optional_field<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Some(Option::deserialize(deserializer)?))
 }
 
 // CoinSearchResult is defined in the providers layer so that `CoinGeckoClient::search_coins`
@@ -94,132 +129,43 @@ pub struct CoinSearchPage {
     pub items: Vec<CoinSearchResult>,
 }
 
-// ── Market management DTOs ────────────────────────────────────────────────────
+// ── Coin spot quote DTOs (SPEC-API-002 REQ-API-131/132) ───────────────────────
 
-/// Response DTO for a tracked market.
+/// Response DTO for a coin-keyed spot price quote.
 ///
-/// `TrackedMarket` uses `PgInterval` for `live_poll_interval` which does not implement
-/// `Serialize`; this DTO converts it to milliseconds (SPEC-API-001 plan.md DTO note).
+/// `price` serializes as a JSON string (REQ-API-073, OR-API-2).
 #[derive(Debug, Serialize)]
-pub struct MarketDto {
-    pub id: i64,
-    pub base: String,
-    pub quote: String,
-    pub venue: Option<String>,
-    pub coin_id: Option<String>,
-    pub kind: String,
-    pub status: String,
-    pub registered_at: DateTime<Utc>,
-    pub last_collected_at: Option<DateTime<Utc>>,
-    pub error: Option<String>,
-    /// Per-market live poll interval in milliseconds; `null` = use global default.
-    pub live_poll_interval_ms: Option<i64>,
-}
-
-impl From<TrackedMarket> for MarketDto {
-    fn from(m: TrackedMarket) -> Self {
-        let live_poll_interval_ms = m.live_poll_interval.map(|iv| {
-            // PgInterval: months + days + microseconds → milliseconds
-            let months_ms = i64::from(iv.months) * 30 * 24 * 3600 * 1000;
-            let days_ms = i64::from(iv.days) * 24 * 3600 * 1000;
-            let us_ms = iv.microseconds / 1000;
-            months_ms + days_ms + us_ms
-        });
-        Self {
-            id: m.id,
-            base: m.base,
-            quote: m.quote,
-            venue: m.venue,
-            coin_id: m.coin_id,
-            kind: m.kind,
-            status: m.status,
-            registered_at: m.registered_at,
-            last_collected_at: m.last_collected_at,
-            error: m.error,
-            live_poll_interval_ms,
-        }
-    }
-}
-
-/// Request body for `POST /v1/markets`.
-#[derive(Debug, Deserialize)]
-pub struct RegisterMarketRequest {
-    pub base: String,
-    pub quote: String,
-    pub venue: Option<String>,
-    pub coin_id: Option<String>,
-    pub kind: Option<String>,
-}
-
-/// Request body for `PATCH /v1/markets/{id}`.
-#[derive(Debug, Deserialize)]
-pub struct UpdateMarketRequest {
-    pub status: Option<String>,
-    pub error: Option<String>,
-    /// Per-market poll interval in milliseconds; `null` = revert to global default.
-    pub live_poll_interval_ms: Option<i64>,
-}
-
-// MarketSearchResult is defined in the providers layer so that `CoinGeckoClient::search_markets`
-// and the API handler share one type without a circular dependency.
-pub use crate::providers::MarketSearchResult;
-
-/// Response DTO for market search page.
-#[derive(Debug, Serialize)]
-pub struct MarketSearchPage {
-    pub items: Vec<MarketSearchResult>,
-}
-
-// ── Spot quote DTOs ───────────────────────────────────────────────────────────
-
-/// Response DTO for a spot quote.
-#[derive(Debug, Serialize)]
-pub struct QuoteDto {
-    pub market_id: i64,
+pub struct CoinQuoteDto {
+    pub coin_id: String,
+    pub vs_currency: String,
     pub ts: DateTime<Utc>,
-    pub as_of: Option<DateTime<Utc>>,
     #[serde(with = "rust_decimal::serde::str")]
     pub price: Decimal,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub bid: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub ask: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub bid_size: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub ask_size: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub volume_24h: Option<Decimal>,
-    pub vs_currency: String,
     pub source: String,
 }
 
-impl From<LiveQuote> for QuoteDto {
-    fn from(q: LiveQuote) -> Self {
+impl From<CoinQuote> for CoinQuoteDto {
+    fn from(q: CoinQuote) -> Self {
         Self {
-            market_id: q.market_id,
-            ts: q.ts,
-            as_of: q.as_of,
-            price: q.price,
-            bid: q.bid,
-            ask: q.ask,
-            bid_size: q.bid_size,
-            ask_size: q.ask_size,
-            volume_24h: q.volume_24h,
+            coin_id: q.coin_id,
             vs_currency: q.vs_currency,
+            ts: q.ts,
+            price: q.price,
             source: q.source,
         }
     }
 }
 
-// ── Candle DTOs ───────────────────────────────────────────────────────────────
+// ── Coin OHLCV candle DTOs (SPEC-API-002 REQ-API-141/142) ────────────────────
 
-/// Response DTO for an OHLCV candle.
+/// Response DTO for a coin-keyed OHLCV candle.
 ///
 /// `volume` is nullable (CoinGecko OHLC has no per-candle volume; REQ-API-042).
+/// All price fields serialize as JSON strings (REQ-API-073).
 #[derive(Debug, Serialize)]
-pub struct CandleDto {
-    pub market_id: i64,
+pub struct CoinCandleDto {
+    pub coin_id: String,
+    pub vs_currency: String,
     pub interval: String,
     pub ts: DateTime<Utc>,
     #[serde(with = "rust_decimal::serde::str")]
@@ -233,14 +179,14 @@ pub struct CandleDto {
     /// Nullable: `null` for CoinGecko-sourced candles (REQ-API-042).
     #[serde(with = "rust_decimal::serde::str_option")]
     pub volume: Option<Decimal>,
-    pub vs_currency: String,
     pub source: String,
 }
 
-impl From<Candle> for CandleDto {
-    fn from(c: Candle) -> Self {
+impl From<CoinCandle> for CoinCandleDto {
+    fn from(c: CoinCandle) -> Self {
         Self {
-            market_id: c.market_id,
+            coin_id: c.coin_id,
+            vs_currency: c.vs_currency,
             interval: c.interval,
             ts: c.ts,
             open: c.open,
@@ -248,7 +194,6 @@ impl From<Candle> for CandleDto {
             low: c.low,
             close: c.close,
             volume: c.volume,
-            vs_currency: c.vs_currency,
             source: c.source,
         }
     }
@@ -335,51 +280,6 @@ impl From<CoinMarketSnapshot> for CoinMarketSnapshotDto {
     }
 }
 
-// ── Derivatives DTOs ──────────────────────────────────────────────────────────
-
-/// Response DTO for a derivatives tick.
-#[derive(Debug, Serialize)]
-pub struct DerivativesQuoteDto {
-    pub market_id: i64,
-    pub ts: DateTime<Utc>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub funding_rate: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub open_interest: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub open_interest_usd: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub mark_price: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub index_price: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub basis: Option<Decimal>,
-    #[serde(with = "rust_decimal::serde::str_option")]
-    pub volume_24h: Option<Decimal>,
-    pub contract_type: Option<String>,
-    pub venue: Option<String>,
-    pub source: String,
-}
-
-impl From<DerivativesQuote> for DerivativesQuoteDto {
-    fn from(d: DerivativesQuote) -> Self {
-        Self {
-            market_id: d.market_id,
-            ts: d.ts,
-            funding_rate: d.funding_rate,
-            open_interest: d.open_interest,
-            open_interest_usd: d.open_interest_usd,
-            mark_price: d.mark_price,
-            index_price: d.index_price,
-            basis: d.basis,
-            volume_24h: d.volume_24h,
-            contract_type: d.contract_type,
-            venue: d.venue,
-            source: d.source,
-        }
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -387,40 +287,29 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    // Scenario 12 (REQ-API-073): Decimal fields serialize as strings, not numbers.
+    // Scenario 12 (REQ-API-073): CoinQuoteDto price serializes as string.
     #[test]
-    fn quote_dto_decimal_serializes_as_string() {
-        let dto = QuoteDto {
-            market_id: 1,
-            ts: chrono::Utc::now(),
-            as_of: None,
-            price: dec!(0.00000000001234),
-            bid: None,
-            ask: None,
-            bid_size: None,
-            ask_size: None,
-            volume_24h: Some(dec!(589000000000000)),
+    fn coin_quote_dto_price_serializes_as_string() {
+        let dto = CoinQuoteDto {
+            coin_id: "bitcoin".into(),
             vs_currency: "usd".into(),
+            ts: chrono::Utc::now(),
+            price: dec!(0.00000000001234),
             source: "test".into(),
         };
         let json = serde_json::to_string(&dto).unwrap();
-        // Price must appear as string, not a number
         assert!(
             json.contains(r#""price":"0.00000000001234""#),
             "price must serialize as JSON string; got: {json}"
         );
-        // Large supply must also be exact string
-        assert!(
-            json.contains(r#""volume_24h":"589000000000000""#),
-            "large decimal must serialize as JSON string; got: {json}"
-        );
     }
 
-    // Candle volume null → serializes as null, not "0"
+    // CoinCandleDto: null volume serializes as null.
     #[test]
-    fn candle_dto_null_volume_serializes_as_null() {
-        let dto = CandleDto {
-            market_id: 1,
+    fn coin_candle_dto_null_volume_serializes_as_null() {
+        let dto = CoinCandleDto {
+            coin_id: "bitcoin".into(),
+            vs_currency: "usd".into(),
             interval: "1h".into(),
             ts: chrono::Utc::now(),
             open: dec!(100),
@@ -428,7 +317,6 @@ mod tests {
             low: dec!(90),
             close: dec!(105),
             volume: None,
-            vs_currency: "usd".into(),
             source: "coingecko".into(),
         };
         let json = serde_json::to_string(&dto).unwrap();
@@ -438,57 +326,7 @@ mod tests {
         );
     }
 
-    // PgInterval → milliseconds conversion
-    #[test]
-    fn market_dto_converts_pg_interval_to_ms() {
-        use sqlx::postgres::types::PgInterval;
-        let market = TrackedMarket {
-            id: 1,
-            base: "BTC".into(),
-            quote: "USD".into(),
-            venue: None,
-            coin_id: None,
-            kind: "spot".into(),
-            status: "active".into(),
-            registered_at: chrono::Utc::now(),
-            last_collected_at: None,
-            error: None,
-            last_polled_at: None,
-            live_poll_claimed_until: None,
-            live_poll_interval: Some(PgInterval {
-                months: 0,
-                days: 0,
-                microseconds: 60_000_000, // 60s = 60000ms
-            }),
-        };
-        let dto = MarketDto::from(market);
-        assert_eq!(dto.live_poll_interval_ms, Some(60_000));
-    }
-
-    // PgInterval None → None
-    #[test]
-    fn market_dto_null_interval_stays_null() {
-        use sqlx::postgres::types::PgInterval;
-        let market = TrackedMarket {
-            id: 2,
-            base: "ETH".into(),
-            quote: "USD".into(),
-            venue: None,
-            coin_id: None,
-            kind: "spot".into(),
-            status: "active".into(),
-            registered_at: chrono::Utc::now(),
-            last_collected_at: None,
-            error: None,
-            last_polled_at: None,
-            live_poll_claimed_until: None,
-            live_poll_interval: None::<PgInterval>,
-        };
-        let dto = MarketDto::from(market);
-        assert_eq!(dto.live_poll_interval_ms, None);
-    }
-
-    // CoinMarketSnapshotDto Decimal fields serialize as strings
+    // CoinMarketSnapshotDto: Decimal fields serialize as strings.
     #[test]
     fn coin_market_snapshot_dto_price_is_string() {
         let dto = CoinMarketSnapshotDto {
@@ -508,5 +346,73 @@ mod tests {
             json.contains(r#""price":"67123.456789""#),
             "price must be a JSON string; got: {json}"
         );
+    }
+
+    // UpdateCoinRequest: tri-state deserialization.
+    #[test]
+    fn update_coin_request_absent_field_is_none_outer() {
+        let json = r#"{"status": "active"}"#;
+        let req: UpdateCoinRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.live_poll_interval.is_none(),
+            "absent field must be None (outer)"
+        );
+    }
+
+    #[test]
+    fn update_coin_request_null_field_is_some_none() {
+        let json = r#"{"live_poll_interval": null}"#;
+        let req: UpdateCoinRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.live_poll_interval,
+            Some(None),
+            "null field must be Some(None)"
+        );
+    }
+
+    #[test]
+    fn update_coin_request_string_field_is_some_some() {
+        let json = r#"{"live_poll_interval": "5m"}"#;
+        let req: UpdateCoinRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.live_poll_interval,
+            Some(Some("5m".to_string())),
+            "string field must be Some(Some(s))"
+        );
+    }
+
+    // CoinDto: normalize_pg_interval applied in From<TrackedCoin>.
+    #[test]
+    fn coin_dto_from_tracked_coin_normalizes_interval() {
+        use crate::models::coin::TrackedCoin;
+        let coin = TrackedCoin {
+            coin_id: "bitcoin".into(),
+            symbol: "BTC".into(),
+            name: "Bitcoin".into(),
+            status: "active".into(),
+            registered_at: chrono::Utc::now(),
+            last_collected_at: None,
+            error: None,
+            live_poll_interval: Some("00:05:00".to_string()),
+        };
+        let dto = CoinDto::from(coin);
+        assert_eq!(dto.live_poll_interval, Some("5m".to_string()));
+    }
+
+    #[test]
+    fn coin_dto_from_tracked_coin_null_interval_stays_null() {
+        use crate::models::coin::TrackedCoin;
+        let coin = TrackedCoin {
+            coin_id: "bitcoin".into(),
+            symbol: "BTC".into(),
+            name: "Bitcoin".into(),
+            status: "active".into(),
+            registered_at: chrono::Utc::now(),
+            last_collected_at: None,
+            error: None,
+            live_poll_interval: None,
+        };
+        let dto = CoinDto::from(coin);
+        assert_eq!(dto.live_poll_interval, None);
     }
 }

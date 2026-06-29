@@ -136,6 +136,8 @@ mod tests {
         use axum_test::TestServer;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
+        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
+        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
         let state = crate::api::AppState {
             pool,
             chain: std::sync::Arc::new(vec![]),
@@ -143,6 +145,8 @@ mod tests {
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
+            coin_quote_tx,
+            coin_candle_tx,
         };
         let server = TestServer::new(crate::api::build_api_router(state));
         let resp = server.get("/v1/coins/no-such-coin-xyz/market/latest").await;

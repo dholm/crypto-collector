@@ -4,10 +4,11 @@
 //! overwrites identical rows rather than duplicating them (REQ-SCHED-040).
 //!
 //! # Natural keys
-//! - `live_quotes`:            `(market_id, ts)`
-//! - `candles`:                `(market_id, interval, ts)`
+//! - `live_quotes`:            `(market_id, ts)` — legacy; kept until T-B (live_poller rebase)
+//! - `candles`:                `(market_id, interval, ts)` — legacy
+//! - `coin_quotes`:            `(coin_id, vs_currency, ts)` — SPEC-API-002
+//! - `coin_candles`:           `(coin_id, vs_currency, interval, ts)` — SPEC-API-002
 //! - `coin_market_snapshots`:  `(coin_id, vs_currency, ts)`
-//! - `derivatives_quotes`:     `(market_id, ts)`
 //! - `coin_metadata`:          `(coin_id, revision)` — revision logic is application-controlled
 
 use anyhow::Result;
@@ -15,6 +16,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
+use crate::models::quote::CoinCandle;
 use crate::providers::{CoinMarket, CoinMeta, DerivTick, OhlcCandle, SpotQuote};
 
 // ── @MX annotation ────────────────────────────────────────────────────────────
@@ -123,6 +125,128 @@ pub async fn upsert_candles(pool: &PgPool, candles: &[OhlcCandle]) -> Result<(),
     let result = tx.commit().await;
     // REQ-OBS-015: record candle batch insert latency regardless of outcome.
     metrics::histogram!("candle_insert_duration_seconds").record(start.elapsed().as_secs_f64());
+    result?;
+    Ok(())
+}
+
+// ── coin_quotes (SPEC-API-002 REQ-SCHED-040) ─────────────────────────────────
+
+/// Upsert a coin spot quote and notify WebSocket listeners. Natural key: `(coin_id, vs_currency, ts)`.
+///
+/// Runs in a short transaction so the upsert and `pg_notify` are atomic.
+/// Downstream: `src/listener.rs` relays the NOTIFY payload to `AppState.coin_quote_tx`.
+///
+// @MX:NOTE: [AUTO] upsert_coin_quote — idempotent on (coin_id, vs_currency, ts); emits pg_notify
+// @MX:SPEC: SPEC-API-002 SPEC-SCHED-001 REQ-SCHED-040 REQ-API-148
+pub const UPSERT_COIN_QUOTE_SQL: &str = "\
+    INSERT INTO coin_quotes \
+        (coin_id, vs_currency, ts, price, source) \
+    VALUES ($1, $2, $3, $4, $5) \
+    ON CONFLICT (coin_id, vs_currency, ts) DO UPDATE SET \
+        price  = EXCLUDED.price, \
+        source = EXCLUDED.source";
+
+pub async fn upsert_coin_quote(
+    pool: &PgPool,
+    coin_id: &str,
+    q: &SpotQuote,
+) -> Result<(), sqlx::Error> {
+    let start = std::time::Instant::now();
+
+    let payload = serde_json::json!({
+        "coin_id": coin_id,
+        "vs_currency": q.vs_currency,
+        "ts": q.ts.to_rfc3339(),
+        "price": q.price.to_string(),
+        "source": q.source,
+    })
+    .to_string();
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(UPSERT_COIN_QUOTE_SQL)
+        .bind(coin_id)
+        .bind(&q.vs_currency)
+        .bind(q.ts)
+        .bind(q.price)
+        .bind(&q.source)
+        .execute(&mut *tx)
+        .await?;
+
+    // Emit notify within the same tx (atomic upsert + notify, REQ-API-148).
+    sqlx::query("SELECT pg_notify('coin_quote_updated', $1)")
+        .bind(&payload)
+        .execute(&mut *tx)
+        .await?;
+
+    let result = tx.commit().await;
+    metrics::histogram!("coin_quote_insert_duration_seconds").record(start.elapsed().as_secs_f64());
+    result?;
+    Ok(())
+}
+
+// ── coin_candles (SPEC-API-002 REQ-SCHED-040) ────────────────────────────────
+
+/// Upsert a coin OHLCV candle and notify WebSocket listeners.
+/// Natural key: `(coin_id, vs_currency, interval, ts)`.
+///
+/// Runs in a short transaction so the upsert and `pg_notify` are atomic.
+///
+// @MX:NOTE: [AUTO] upsert_coin_candle — idempotent on (coin_id, vs_currency, interval, ts); emits pg_notify
+// @MX:SPEC: SPEC-API-002 SPEC-SCHED-001 REQ-SCHED-040 REQ-API-148
+pub const UPSERT_COIN_CANDLE_SQL: &str = "\
+    INSERT INTO coin_candles \
+        (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source) \
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+    ON CONFLICT (coin_id, vs_currency, interval, ts) DO UPDATE SET \
+        open   = EXCLUDED.open, \
+        high   = EXCLUDED.high, \
+        low    = EXCLUDED.low, \
+        close  = EXCLUDED.close, \
+        volume = EXCLUDED.volume, \
+        source = EXCLUDED.source";
+
+pub async fn upsert_coin_candle(pool: &PgPool, candle: &CoinCandle) -> Result<(), sqlx::Error> {
+    let start = std::time::Instant::now();
+
+    let payload = serde_json::json!({
+        "coin_id": candle.coin_id,
+        "vs_currency": candle.vs_currency,
+        "interval": candle.interval,
+        "ts": candle.ts.to_rfc3339(),
+        "open": candle.open.to_string(),
+        "high": candle.high.to_string(),
+        "low": candle.low.to_string(),
+        "close": candle.close.to_string(),
+        "volume": candle.volume.map(|v| v.to_string()),
+        "source": candle.source,
+    })
+    .to_string();
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(UPSERT_COIN_CANDLE_SQL)
+        .bind(&candle.coin_id)
+        .bind(&candle.vs_currency)
+        .bind(&candle.interval)
+        .bind(candle.ts)
+        .bind(candle.open)
+        .bind(candle.high)
+        .bind(candle.low)
+        .bind(candle.close)
+        .bind(candle.volume)
+        .bind(&candle.source)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("SELECT pg_notify('coin_candle_updated', $1)")
+        .bind(&payload)
+        .execute(&mut *tx)
+        .await?;
+
+    let result = tx.commit().await;
+    metrics::histogram!("coin_candle_insert_duration_seconds")
+        .record(start.elapsed().as_secs_f64());
     result?;
     Ok(())
 }
@@ -446,6 +570,57 @@ mod tests {
         assert!(
             UPSERT_DERIVATIVES_SQL.contains("ON CONFLICT (market_id, ts) DO UPDATE"),
             "derivatives upsert must use natural key (market_id, ts)"
+        );
+    }
+
+    // coin_quotes
+    #[test]
+    fn coin_quote_upsert_sql_has_correct_conflict_target() {
+        assert!(
+            UPSERT_COIN_QUOTE_SQL.contains("ON CONFLICT (coin_id, vs_currency, ts) DO UPDATE"),
+            "coin_quote upsert must use natural key (coin_id, vs_currency, ts)"
+        );
+    }
+
+    #[test]
+    fn coin_quote_upsert_sql_targets_correct_table() {
+        assert!(
+            UPSERT_COIN_QUOTE_SQL.contains("INSERT INTO coin_quotes"),
+            "upsert must target coin_quotes table"
+        );
+    }
+
+    #[test]
+    fn coin_quote_upsert_sql_no_market_id() {
+        assert!(
+            !UPSERT_COIN_QUOTE_SQL.contains("market_id"),
+            "coin_quotes upsert must not reference market_id (coin-keyed)"
+        );
+    }
+
+    // coin_candles
+    #[test]
+    fn coin_candle_upsert_sql_has_correct_conflict_target() {
+        assert!(
+            UPSERT_COIN_CANDLE_SQL
+                .contains("ON CONFLICT (coin_id, vs_currency, interval, ts) DO UPDATE"),
+            "coin_candle upsert must use natural key (coin_id, vs_currency, interval, ts)"
+        );
+    }
+
+    #[test]
+    fn coin_candle_upsert_sql_targets_correct_table() {
+        assert!(
+            UPSERT_COIN_CANDLE_SQL.contains("INSERT INTO coin_candles"),
+            "upsert must target coin_candles table"
+        );
+    }
+
+    #[test]
+    fn coin_candle_upsert_sql_no_market_id() {
+        assert!(
+            !UPSERT_COIN_CANDLE_SQL.contains("market_id"),
+            "coin_candles upsert must not reference market_id (coin-keyed)"
         );
     }
 }

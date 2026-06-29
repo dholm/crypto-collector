@@ -64,7 +64,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 
 # HTTP server: axum 0.8 + tower ecosystem (SPEC-API-001).
-axum = { version = "0.8", features = ["macros"] }
+# ws: WebSocket upgrade support for /v1/coins/stream/* (SPEC-API-002 T-006).
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace"] }
 # Base64url encoding for opaque keyset cursors (REQ-API-070).

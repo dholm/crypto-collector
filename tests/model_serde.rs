@@ -86,6 +86,7 @@ fn tracked_coin_serializes_with_correct_fields() {
         registered_at: Utc::now(),
         last_collected_at: None,
         error: None,
+        live_poll_interval: None,
     };
     let json = serde_json::to_string(&coin).expect("should serialize");
     assert!(json.contains("\"coin_id\":\"bitcoin\""), "coin_id in JSON");

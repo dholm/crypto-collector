@@ -8,6 +8,17 @@ use sqlx::FromRow;
 ///
 /// Keyed by `coin_id` (e.g. CoinGecko `"bitcoin"`). This is the unit of metadata and
 /// tokenomics collection — not tied to a specific quote currency or trading venue (research §1.3).
+///
+/// # Live-poller contract columns (REQ-API-112)
+///
+/// `live_poll_interval` is returned as `TEXT` from DB (cast via `::TEXT` in SELECT) and holds
+/// the normalized human-readable interval string (e.g. `"5m"`, `"1h30m"`). `None` = use global.
+/// The full poller contract is: `last_polled_at`, `live_poll_claimed_until`, `live_poll_interval`
+/// (all added via migration 0010).
+///
+/// @MX:ANCHOR: [AUTO] TrackedCoin live-poller contract — live_poll_interval (TEXT), last_polled_at, live_poll_claimed_until
+/// @MX:REASON: SPEC-API-002 REQ-API-112 SPEC-SCHED-001 REQ-SCHED-003. All SELECT queries must cast
+///             live_poll_interval::TEXT to map to Option<String>. Any schema rename breaks the coin poller.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct TrackedCoin {
     pub coin_id: String,
@@ -18,6 +29,11 @@ pub struct TrackedCoin {
     pub registered_at: DateTime<Utc>,
     pub last_collected_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
+    /// Per-coin live-poll cadence override in human-readable form (e.g. "5m", "1h30m").
+    /// `None` = use global `LIVE_QUOTE_POLL_INTERVAL_SECS`.
+    /// Stored as PG INTERVAL; returned as TEXT via `::TEXT` cast; normalized by `poll_interval::normalize_pg_interval`.
+    #[serde(default)]
+    pub live_poll_interval: Option<String>,
 }
 
 /// Slowly-changing descriptive coin metadata. Keyed by `(coin_id, revision)`.

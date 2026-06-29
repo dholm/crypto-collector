@@ -16,7 +16,10 @@
 use anyhow::{Context, Result};
 use opentelemetry::propagation::Extractor;
 use std::{sync::Arc, time::Duration};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{broadcast, watch},
+};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -165,12 +168,39 @@ async fn main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "coingecko".to_string());
     let coingecko_base_url = config::coingecko_base_url();
+
+    // Broadcast channels for WebSocket fan-out (SPEC-API-002 REQ-API-148).
+    // Capacity 256 per channel — lagged receivers log a warning and skip to newest.
+    let (coin_quote_tx, _) = broadcast::channel::<String>(256);
+    let (coin_candle_tx, _) = broadcast::channel::<String>(256);
+
+    // Spawn PG LISTEN/NOTIFY relays for cross-replica WebSocket delivery.
+    {
+        let pool_ql = pool.clone();
+        let tx_ql = coin_quote_tx.clone();
+        let rx_ql = shutdown_rx.clone();
+        tokio::spawn(async move {
+            crypto_collector::listener::run_coin_quote_listener(pool_ql, tx_ql, rx_ql).await;
+        });
+    }
+    {
+        let pool_cl = pool.clone();
+        let tx_cl = coin_candle_tx.clone();
+        let rx_cl = shutdown_rx.clone();
+        tokio::spawn(async move {
+            crypto_collector::listener::run_coin_candle_listener(pool_cl, tx_cl, rx_cl).await;
+        });
+    }
+    info!("crypto-collector: PG LISTEN/NOTIFY relays started");
+
     let api_state = crypto_collector::api::AppState {
         pool: pool.clone(),
         chain: chain.clone(),
         search_provider,
         coingecko_base_url,
         http_client: reqwest::Client::new(),
+        coin_quote_tx,
+        coin_candle_tx,
     };
 
     // API router: build_api_router + request-metrics middleware + OTel trace layer (REQ-OBS-011/023).
@@ -302,9 +332,10 @@ async fn wait_for_shutdown_signal() {
 
 // ── Tracked-asset gauge refresh (REQ-OBS-013) ─────────────────────────────────
 
-/// Refresh `tracked_coins` and `tracked_markets` gauges from the DB.
+/// Refresh `tracked_coins` gauge from the DB.
 ///
 /// On error, logs a warning and preserves the last gauge value (no reset to 0).
+/// `tracked_markets` gauge removed: table dropped by migration 0011 (SPEC-API-002).
 ///
 // @MX:NOTE: [AUTO] DB-backed gauge — each replica queries its own pool; gauge is per-replica.
 //           Aggregate with max()/avg() across replicas in Prometheus, NOT sum().
@@ -316,14 +347,6 @@ async fn refresh_tracked_gauges(pool: &sqlx::PgPool) {
     {
         Ok(count) => metrics::gauge!("tracked_coins").set(count as f64),
         Err(e) => tracing::warn!(error = %e, "tracked_coins gauge refresh failed"),
-    }
-
-    match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tracked_markets")
-        .fetch_one(pool)
-        .await
-    {
-        Ok(count) => metrics::gauge!("tracked_markets").set(count as f64),
-        Err(e) => tracing::warn!(error = %e, "tracked_markets gauge refresh failed"),
     }
 }
 
@@ -341,16 +364,6 @@ mod tests {
         assert!(
             sql.contains("tracked_coins"),
             "SQL must target tracked_coins table"
-        );
-        assert!(sql.contains("COUNT(*)"), "SQL must use COUNT(*)");
-    }
-
-    #[test]
-    fn tracked_markets_gauge_uses_correct_table() {
-        let sql = "SELECT COUNT(*) FROM tracked_markets";
-        assert!(
-            sql.contains("tracked_markets"),
-            "SQL must target tracked_markets table"
         );
         assert!(sql.contains("COUNT(*)"), "SQL must use COUNT(*)");
     }

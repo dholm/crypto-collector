@@ -9,7 +9,7 @@ use std::path::Path;
 // ── Milestone 1: migration file presence and naming ──────────────────────────
 
 #[test]
-fn all_nine_migration_files_exist() {
+fn all_eleven_migration_files_exist() {
     let expected = [
         "migrations/0001_registries.sql",
         "migrations/0002_live_quotes.sql",
@@ -20,6 +20,8 @@ fn all_nine_migration_files_exist() {
         "migrations/0007_collection_queue.sql",
         "migrations/0008_backfill.sql",
         "migrations/0009_upstream_pacer.sql",
+        "migrations/0010_coin_live_poll_interval.sql",
+        "migrations/0011_remove_markets.sql",
     ];
     for path in &expected {
         assert!(
@@ -229,6 +231,8 @@ fn time_series_migrations_have_btree_and_brin_indexes() {
             "migrations/0005_derivatives_quotes.sql",
             "derivatives_quotes",
         ),
+        ("migrations/0011_remove_markets.sql", "coin_quotes"),
+        ("migrations/0011_remove_markets.sql", "coin_candles"),
     ];
     for (path, table) in &partitioned_migrations {
         let content = fs::read_to_string(path)

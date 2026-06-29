@@ -1,8 +1,8 @@
-//! Spot quote read handlers (SPEC-API-001 REQ-API-030/031).
+//! Coin-keyed spot quote read handlers (SPEC-API-002 REQ-API-131/132).
 //!
 //! Routes:
-//! - `GET /v1/markets/{id}/quotes/latest` → get_latest_quote
-//! - `GET /v1/markets/{id}/quotes`        → list_quotes (keyset-paginated, time-range)
+//! - `GET /v1/coins/{coin_id}/quotes/latest` → get_latest_quote
+//! - `GET /v1/coins/{coin_id}/quotes`        → list_quotes (keyset-paginated, time-range)
 
 use axum::{
     extract::{Path, Query, State},
@@ -14,7 +14,7 @@ use serde::Deserialize;
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
-    dto::{Page, QuoteDto},
+    dto::{CoinQuoteDto, Page},
     ApiError, ApiResult, AppState,
 };
 
@@ -30,38 +30,36 @@ pub struct ListQuotesParams {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-/// `GET /v1/markets/{id}/quotes/latest` — newest live quote for a market (REQ-API-030).
+/// `GET /v1/coins/{coin_id}/quotes/latest` — newest spot quote for a coin (REQ-API-131).
 pub async fn get_latest_quote(
     State(state): State<AppState>,
-    Path(market_id): Path<i64>,
+    Path(coin_id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    // Verify market exists first (REQ-API-074: 404 for unknown market).
-    ensure_market_exists(&state.pool, market_id).await?;
+    ensure_coin_exists(&state.pool, &coin_id).await?;
 
-    let quote: Option<crate::models::quote::LiveQuote> = sqlx::query_as(
-        "SELECT market_id, ts, as_of, price, bid, ask, bid_size, ask_size, \
-                volume_24h, vs_currency, source \
-         FROM live_quotes \
-         WHERE market_id = $1 \
+    let quote: Option<crate::models::quote::CoinQuote> = sqlx::query_as(
+        "SELECT coin_id, vs_currency, ts, price, source \
+         FROM coin_quotes \
+         WHERE coin_id = $1 \
          ORDER BY ts DESC \
          LIMIT 1",
     )
-    .bind(market_id)
+    .bind(&coin_id)
     .fetch_optional(&state.pool)
     .await?;
 
     match quote {
-        Some(q) => Ok(Json(QuoteDto::from(q)).into_response()),
+        Some(q) => Ok(Json(CoinQuoteDto::from(q)).into_response()),
         None => Err(ApiError::NotFound(format!(
-            "no quotes found for market id {market_id}"
+            "no quotes found for coin '{coin_id}'"
         ))),
     }
 }
 
-/// `GET /v1/markets/{id}/quotes` — keyset-paginated quote history (REQ-API-031).
+/// `GET /v1/coins/{coin_id}/quotes` — keyset-paginated quote history (REQ-API-132).
 pub async fn list_quotes(
     State(state): State<AppState>,
-    Path(market_id): Path<i64>,
+    Path(coin_id): Path<String>,
     Query(params): Query<ListQuotesParams>,
 ) -> ApiResult<impl IntoResponse> {
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -73,21 +71,19 @@ pub async fn list_quotes(
         .transpose()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    ensure_market_exists(&state.pool, market_id).await?;
+    ensure_coin_exists(&state.pool, &coin_id).await?;
 
-    // The keyset WHERE clause: ts < cursor_ts (for DESC ordering stability).
-    let items: Vec<crate::models::quote::LiveQuote> = sqlx::query_as(
-        "SELECT market_id, ts, as_of, price, bid, ask, bid_size, ask_size, \
-                volume_24h, vs_currency, source \
-         FROM live_quotes \
-         WHERE market_id = $1 \
+    let items: Vec<crate::models::quote::CoinQuote> = sqlx::query_as(
+        "SELECT coin_id, vs_currency, ts, price, source \
+         FROM coin_quotes \
+         WHERE coin_id = $1 \
            AND ($2::TIMESTAMPTZ IS NULL OR ts <= $2) \
            AND ($3::TIMESTAMPTZ IS NULL OR ts >= $3) \
            AND ($4::TIMESTAMPTZ IS NULL OR ts < $4) \
          ORDER BY ts DESC \
          LIMIT $5",
     )
-    .bind(market_id)
+    .bind(&coin_id)
     .bind(params.end)
     .bind(params.start)
     .bind(cursor_ts)
@@ -97,23 +93,22 @@ pub async fn list_quotes(
 
     let (items, next_cursor) = paginate_ts(items, limit, |q| q.ts);
     Ok(Json(Page {
-        items: items.into_iter().map(QuoteDto::from).collect(),
+        items: items.into_iter().map(CoinQuoteDto::from).collect(),
         next_cursor,
     }))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Check that a market_id exists; return 404 if not.
-pub async fn ensure_market_exists(pool: &sqlx::PgPool, market_id: i64) -> ApiResult<()> {
-    let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM tracked_markets WHERE id = $1")
-        .bind(market_id)
-        .fetch_optional(pool)
-        .await?;
+/// Check that a coin_id exists; return 404 if not.
+pub async fn ensure_coin_exists(pool: &sqlx::PgPool, coin_id: &str) -> ApiResult<()> {
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT coin_id FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .fetch_optional(pool)
+            .await?;
     if exists.is_none() {
-        return Err(ApiError::NotFound(format!(
-            "market id {market_id} not found"
-        )));
+        return Err(ApiError::NotFound(format!("coin '{coin_id}' not found")));
     }
     Ok(())
 }
@@ -145,51 +140,25 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 6, 1, h, 0, 0).unwrap()
     }
 
+    fn make_coin_quote(h: u32, price_str: &str) -> crate::models::quote::CoinQuote {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+        crate::models::quote::CoinQuote {
+            coin_id: "bitcoin".into(),
+            vs_currency: "usd".into(),
+            ts: ts(h),
+            price: Decimal::from_str(price_str).unwrap(),
+            source: "test".into(),
+        }
+    }
+
     // paginate_ts: has_more → next_cursor encodes last item ts
     #[test]
     fn paginate_ts_has_more_returns_cursor() {
-        use rust_decimal_macros::dec;
-
         let items = vec![
-            crate::models::quote::LiveQuote {
-                market_id: 1,
-                ts: ts(12),
-                as_of: None,
-                price: dec!(100),
-                bid: None,
-                ask: None,
-                bid_size: None,
-                ask_size: None,
-                volume_24h: None,
-                vs_currency: "usd".into(),
-                source: "test".into(),
-            },
-            crate::models::quote::LiveQuote {
-                market_id: 1,
-                ts: ts(11),
-                as_of: None,
-                price: dec!(99),
-                bid: None,
-                ask: None,
-                bid_size: None,
-                ask_size: None,
-                volume_24h: None,
-                vs_currency: "usd".into(),
-                source: "test".into(),
-            },
-            crate::models::quote::LiveQuote {
-                market_id: 1,
-                ts: ts(10),
-                as_of: None,
-                price: dec!(98),
-                bid: None,
-                ask: None,
-                bid_size: None,
-                ask_size: None,
-                volume_24h: None,
-                vs_currency: "usd".into(),
-                source: "test".into(),
-            },
+            make_coin_quote(12, "100"),
+            make_coin_quote(11, "99"),
+            make_coin_quote(10, "98"),
         ];
 
         let (trimmed, next_cursor) = paginate_ts(items, 2, |q| q.ts);
@@ -201,20 +170,7 @@ mod tests {
 
     #[test]
     fn paginate_ts_no_more_returns_null_cursor() {
-        use rust_decimal_macros::dec;
-        let items = vec![crate::models::quote::LiveQuote {
-            market_id: 1,
-            ts: ts(12),
-            as_of: None,
-            price: dec!(100),
-            bid: None,
-            ask: None,
-            bid_size: None,
-            ask_size: None,
-            volume_24h: None,
-            vs_currency: "usd".into(),
-            source: "test".into(),
-        }];
+        let items = vec![make_coin_quote(12, "100")];
         let (_, next_cursor) = paginate_ts(items, 100, |q| q.ts);
         assert!(next_cursor.is_none());
     }
@@ -222,20 +178,21 @@ mod tests {
     // DB-gated integration tests
     #[tokio::test]
     #[ignore]
-    async fn db_latest_quote_unknown_market_returns_404() {
+    async fn db_latest_quote_unknown_coin_returns_404() {
         use axum_test::TestServer;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
         let state = crate::api::AppState {
             pool,
             chain: std::sync::Arc::new(vec![]),
-
             search_provider: "coingecko".into(),
             coingecko_base_url: "https://api.coingecko.com".into(),
             http_client: reqwest::Client::new(),
+            coin_quote_tx: tokio::sync::broadcast::channel(16).0,
+            coin_candle_tx: tokio::sync::broadcast::channel(16).0,
         };
         let server = TestServer::new(crate::api::build_api_router(state));
-        let resp = server.get("/v1/markets/99999999/quotes/latest").await;
+        let resp = server.get("/v1/coins/no-such-coin-xyz/quotes/latest").await;
         assert_eq!(resp.status_code(), 404);
     }
 }

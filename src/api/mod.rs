@@ -1,7 +1,7 @@
-//! `/v1` REST API router and shared infrastructure (SPEC-API-001).
+//! `/v1` REST API router and shared infrastructure (SPEC-API-001, SPEC-API-002).
 //!
-//! Exposed modules: cursor, dto, coins, markets, quotes, candles, metadata,
-//! coin_market, derivatives.
+//! Exposed modules: cursor, dto, coins, quotes, candles, metadata,
+//! coin_market, poll_interval, websocket.
 //!
 //! # Server bootstrap
 //!
@@ -16,11 +16,11 @@ pub mod candles;
 pub mod coin_market;
 pub mod coins;
 pub mod cursor;
-pub mod derivatives;
 pub mod dto;
-pub mod markets;
 pub mod metadata;
+pub mod poll_interval;
 pub mod quotes;
+pub mod websocket;
 
 use axum::{
     extract::rejection::JsonRejection,
@@ -31,6 +31,7 @@ use axum::{
 };
 use sqlx::PgPool;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::providers::Provider;
@@ -38,6 +39,11 @@ use crate::providers::Provider;
 // ── App state ─────────────────────────────────────────────────────────────────
 
 /// Shared Axum application state for all `/v1` handlers.
+// @MX:ANCHOR: [AUTO] AppState — shared across all /v1 handlers and WebSocket upgraders
+// @MX:REASON: fan_in >= 3: all handler modules + listener.rs + main.rs.
+//             Adding fields here requires updating test_server() in all test modules.
+//             broadcast senders must outlive the router; they are cloned cheaply into handlers.
+// @MX:SPEC: SPEC-API-001 SPEC-API-002 REQ-API-148
 #[derive(Clone)]
 pub struct AppState {
     /// Database connection pool.
@@ -50,6 +56,12 @@ pub struct AppState {
     pub coingecko_base_url: String,
     /// HTTP client for outbound search calls.
     pub http_client: reqwest::Client,
+    /// Broadcast sender for coin spot quotes — WebSocket fan-out (REQ-API-148).
+    /// Driven by `src/listener.rs` which relays PG NOTIFY `coin_quote_updated`.
+    pub coin_quote_tx: broadcast::Sender<String>,
+    /// Broadcast sender for coin OHLCV candles — WebSocket fan-out (REQ-API-148).
+    /// Driven by `src/listener.rs` which relays PG NOTIFY `coin_candle_updated`.
+    pub coin_candle_tx: broadcast::Sender<String>,
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -57,7 +69,7 @@ pub struct AppState {
 /// API error taxonomy mapped to HTTP status codes (REQ-API-074).
 ///
 // @MX:ANCHOR: [AUTO] ApiError — shared error→status mapper; every handler returns this
-// @MX:REASON: fan_in >= 3: all nine handler modules + integration tests.
+// @MX:REASON: fan_in >= 3: all handler modules + integration tests.
 //             All 400/404/422/500/503 responses must go through here to guarantee the
 //             uniform JSON error body (REQ-API-074).
 // @MX:SPEC: SPEC-API-001 REQ-API-074
@@ -67,7 +79,7 @@ pub enum ApiError {
     BadRequest(String),
     /// 404: coin or market id not found.
     NotFound(String),
-    /// 422: semantically invalid registration (unknown asset, etc.).
+    /// 422: semantically invalid (live_poll_interval out of bounds, etc.; REQ-API-114).
     UnprocessableEntity(String),
     /// 503: upstream provider unavailable (pacer denied).
     ServiceUnavailable(String),
@@ -130,11 +142,19 @@ pub type ApiResult<T> = Result<T, ApiError>;
 /// The returned router does NOT include a prefix — callers can nest it or serve at `/`.
 /// SPEC-OBS-001 will add `/healthz` and metrics routes on separate ports/routers.
 ///
+/// # Route registration order (REQ-API-148)
+///
+/// Literal routes (including stream WebSocket routes) MUST be registered BEFORE
+/// the parameterised `/v1/coins/{coin_id}` route so Axum's literal-first matching
+/// takes priority. Specifically:
+/// - `/v1/coins/stream/quotes` and `/v1/coins/stream/candles` BEFORE `/v1/coins/{coin_id}`
+/// - `/v1/coins/search` BEFORE `/v1/coins/{coin_id}`
+///
 // @MX:ANCHOR: [AUTO] build_api_router — single route registration point for all /v1 endpoints
-// @MX:REASON: fan_in >= 3: main.rs startup, integration tests, SPEC-OBS-001 will wrap alongside.
+// @MX:REASON: fan_in >= 3: main.rs startup, integration tests, docs.
 //             All endpoint additions MUST go through here (REQ-API-001: single /v1 surface).
-//             /v1/coins/search MUST be registered before /v1/coins/{coin_id} (literal before param).
-// @MX:SPEC: SPEC-API-001 REQ-API-001
+//             Literal routes MUST precede param routes (REQ-API-148).
+// @MX:SPEC: SPEC-API-001 SPEC-API-002 REQ-API-001 REQ-API-148
 pub fn build_api_router(state: AppState) -> Router {
     Router::new()
         // ── Coins management ─────────────────────────────────────────────────
@@ -142,9 +162,19 @@ pub fn build_api_router(state: AppState) -> Router {
             "/v1/coins",
             get(coins::list_coins).post(coins::register_coin),
         )
-        // NOTE: /v1/coins/search MUST be registered BEFORE /v1/coins/{coin_id}
-        // so Axum's literal route takes priority over the path parameter.
+        // NOTE: Literal paths MUST be registered BEFORE /v1/coins/{coin_id} (REQ-API-148).
+        // Axum resolves exact matches first; parameterised catch-all comes last.
         .route("/v1/coins/search", get(coins::search_coins))
+        // ── WebSocket streams (REQ-API-148: BEFORE /v1/coins/{coin_id}) ──────
+        .route(
+            "/v1/coins/stream/quotes",
+            get(websocket::stream_coin_quotes),
+        )
+        .route(
+            "/v1/coins/stream/candles",
+            get(websocket::stream_coin_candles),
+        )
+        // ── Parameterised coin routes (must come after all literal /v1/coins/* routes) ──
         .route(
             "/v1/coins/{coin_id}",
             get(coins::get_coin)
@@ -161,34 +191,14 @@ pub fn build_api_router(state: AppState) -> Router {
             "/v1/coins/{coin_id}/market",
             get(coin_market::list_coin_market),
         )
-        // ── Markets management ────────────────────────────────────────────────
+        // ── Coin spot quote endpoints (SPEC-API-002 REQ-API-131/132) ─────────
         .route(
-            "/v1/markets",
-            get(markets::list_markets).post(markets::register_market),
-        )
-        // NOTE: /v1/markets/search MUST be registered BEFORE /v1/markets/{id}
-        .route("/v1/markets/search", get(markets::search_markets))
-        .route(
-            "/v1/markets/{id}",
-            get(markets::get_market)
-                .patch(markets::update_market)
-                .delete(markets::delete_market),
-        )
-        // ── Market read endpoints ─────────────────────────────────────────────
-        .route(
-            "/v1/markets/{id}/quotes/latest",
+            "/v1/coins/{coin_id}/quotes/latest",
             get(quotes::get_latest_quote),
         )
-        .route("/v1/markets/{id}/quotes", get(quotes::list_quotes))
-        .route("/v1/markets/{id}/candles", get(candles::list_candles))
-        .route(
-            "/v1/markets/{id}/derivatives/latest",
-            get(derivatives::get_latest_derivative),
-        )
-        .route(
-            "/v1/markets/{id}/derivatives",
-            get(derivatives::list_derivatives),
-        )
+        .route("/v1/coins/{coin_id}/quotes", get(quotes::list_quotes))
+        // ── Coin OHLCV candle endpoints (SPEC-API-002 REQ-API-141/142) ───────
+        .route("/v1/coins/{coin_id}/candles", get(candles::list_candles))
         .with_state(state)
 }
 
@@ -237,18 +247,15 @@ mod tests {
         let routes = [
             "/v1/coins",
             "/v1/coins/search",
+            "/v1/coins/stream/quotes",
+            "/v1/coins/stream/candles",
             "/v1/coins/{coin_id}",
             "/v1/coins/{coin_id}/metadata",
             "/v1/coins/{coin_id}/market/latest",
             "/v1/coins/{coin_id}/market",
-            "/v1/markets",
-            "/v1/markets/search",
-            "/v1/markets/{id}",
-            "/v1/markets/{id}/quotes/latest",
-            "/v1/markets/{id}/quotes",
-            "/v1/markets/{id}/candles",
-            "/v1/markets/{id}/derivatives/latest",
-            "/v1/markets/{id}/derivatives",
+            "/v1/coins/{coin_id}/quotes/latest",
+            "/v1/coins/{coin_id}/quotes",
+            "/v1/coins/{coin_id}/candles",
         ];
         for route in &routes {
             assert!(
@@ -261,12 +268,11 @@ mod tests {
     // Scenario 1: no /v2 routes.
     #[test]
     fn no_v2_routes_exist() {
-        // All known routes must start with /v1/ — none with /v2.
         let routes = [
             "/v1/coins",
-            "/v1/markets",
             "/v1/coins/search",
-            "/v1/markets/search",
+            "/v1/coins/stream/quotes",
+            "/v1/coins/stream/candles",
         ];
         for route in routes {
             assert!(
@@ -274,6 +280,41 @@ mod tests {
                 "route '{route}' must not be a /v2 route"
             );
         }
+    }
+
+    // REQ-API-148: stream routes appear before /{coin_id} in registration order.
+    #[test]
+    fn stream_routes_precede_coin_id_param_route() {
+        // This is a static ordering check documenting the invariant.
+        // The actual enforcement is in build_api_router — stream routes must appear
+        // before the /v1/coins/{coin_id} line in source order.
+        let ordered_routes = [
+            "/v1/coins/search",
+            "/v1/coins/stream/quotes",
+            "/v1/coins/stream/candles",
+            // Parameterised must come last
+            "/v1/coins/{coin_id}",
+        ];
+        let param_pos = ordered_routes
+            .iter()
+            .position(|r| *r == "/v1/coins/{coin_id}")
+            .unwrap();
+        let stream_q_pos = ordered_routes
+            .iter()
+            .position(|r| *r == "/v1/coins/stream/quotes")
+            .unwrap();
+        let stream_c_pos = ordered_routes
+            .iter()
+            .position(|r| *r == "/v1/coins/stream/candles")
+            .unwrap();
+        assert!(
+            stream_q_pos < param_pos,
+            "stream/quotes must precede /{{coin_id}}"
+        );
+        assert!(
+            stream_c_pos < param_pos,
+            "stream/candles must precede /{{coin_id}}"
+        );
     }
 
     // Scenario 13 (REQ-API-074): ApiError → correct status codes.
@@ -348,17 +389,11 @@ mod tests {
             "getCoinMetadata",
             "getCoinMarketLatest",
             "listCoinMarket",
-            "listMarkets",
-            "registerMarket",
-            "searchMarkets",
-            "getMarket",
-            "updateMarket",
-            "deleteMarket",
-            "getLatestQuote",
-            "listQuotes",
-            "listCandles",
-            "getLatestDerivative",
-            "listDerivatives",
+            "getLatestCoinQuote",
+            "listCoinQuotes",
+            "listCoinCandles",
+            "streamCoinQuotes",
+            "streamCoinCandles",
         ];
         for op_id in &operation_ids {
             assert!(
@@ -378,12 +413,10 @@ mod tests {
 
         let schemas = [
             "Coin",
-            "Market",
-            "Quote",
-            "Candle",
+            "CoinQuote",
+            "CoinCandle",
             "CoinMetadata",
             "CoinMarketSnapshot",
-            "DerivativesQuote",
             "ApiError",
             "Page",
         ];

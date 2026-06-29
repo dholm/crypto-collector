@@ -23,13 +23,11 @@ use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
 use crate::db::upserts::{
-    upsert_candles, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_derivatives_quote,
-    upsert_live_quote,
+    upsert_candles, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_live_quote,
 };
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{
-    Capability, CoinMarket, CoinMeta, DerivTick, MarketQuery, OhlcCandle, Provider, ProviderError,
-    SpotQuote,
+    Capability, CoinMarket, CoinMeta, MarketQuery, OhlcCandle, Provider, ProviderError, SpotQuote,
 };
 
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
@@ -316,23 +314,6 @@ async fn chain_fetch_coin_market(
     Err(last_err)
 }
 
-async fn chain_fetch_derivatives(
-    chain: &[Arc<dyn Provider>],
-    market: &MarketQuery,
-) -> Result<DerivTick, ProviderError> {
-    let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
-    for p in chain {
-        if !p.supports(Capability::Derivatives) {
-            continue;
-        }
-        match p.fetch_derivatives(market).await {
-            Ok(d) => return Ok(d),
-            Err(e) => last_err = e,
-        }
-    }
-    Err(last_err)
-}
-
 /// Find the first provider supporting `cap`; return its name for pacer pacing.
 fn first_provider_for_cap(chain: &[Arc<dyn Provider>], cap: Capability) -> Option<String> {
     chain
@@ -479,72 +460,6 @@ async fn dispatch_item(
             let quote = quote_result.map_err(|e| e.to_string())?;
 
             upsert_live_quote(pool, &quote)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            Ok(true)
-        }
-
-        ("market", "derivatives") => {
-            let market_id: i64 = item
-                .target_id
-                .parse()
-                .map_err(|_| format!("invalid market_id: {}", item.target_id))?;
-
-            let info = fetch_market_info(pool, market_id)
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("market {market_id} not found"))?;
-
-            let cap = Capability::Derivatives;
-            let provider_name = match first_provider_for_cap(chain, cap) {
-                Some(n) => n,
-                None => return Err("no provider supports Derivatives".to_string()),
-            };
-
-            match acquire_slot(pool, &provider_name).await {
-                Err(ref e) if pacer_should_skip_queue(e) => {
-                    warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(false);
-                }
-                Err(e) => return Err(format!("pacer: {e}")),
-                Ok(()) => {}
-            }
-
-            let mq = MarketQuery {
-                market_id: info.id,
-                coin_id: info.coin_id,
-                base: info.base.clone(),
-                quote: info.quote.clone(),
-                venue: info.venue,
-                vs_currency: info.quote.to_lowercase(),
-            };
-
-            // REQ-OBS-012/015: instrument provider call.
-            let fetch_start = std::time::Instant::now();
-            let tick_result = chain_fetch_derivatives(chain, &mq).await;
-            let fetch_dur = fetch_start.elapsed().as_secs_f64();
-            let outcome = if tick_result.is_ok() {
-                "success"
-            } else {
-                "error"
-            };
-            metrics::counter!(
-                "collection_requests_total",
-                "provider" => provider_name.clone(),
-                "capability" => "derivatives",
-                "outcome" => outcome,
-            )
-            .increment(1);
-            metrics::histogram!(
-                "collection_request_duration_seconds",
-                "provider" => provider_name,
-                "capability" => "derivatives",
-            )
-            .record(fetch_dur);
-            let tick = tick_result.map_err(|e| e.to_string())?;
-
-            upsert_derivatives_quote(pool, &tick)
                 .await
                 .map_err(|e| e.to_string())?;
 

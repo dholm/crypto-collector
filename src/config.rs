@@ -213,12 +213,27 @@ pub fn replica_id() -> &'static str {
     })
 }
 
-/// Live-quote poll cadence in seconds (global default, per-market may override).
+/// Live-quote poll cadence in seconds (global default, per-coin may override).
 ///
 /// Env var: `LIVE_QUOTE_POLL_INTERVAL_SECS`. Default: 60 s.
-/// Respects CoinGecko Demo tier budget (30 calls/min = 2 s/call; 60 s handles ~30 active markets).
+/// Respects CoinGecko Demo tier budget (30 calls/min = 2 s/call; 60 s handles ~30 active coins).
 pub fn live_quote_poll_interval_secs() -> i64 {
     parse_env_i64("LIVE_QUOTE_POLL_INTERVAL_SECS", 60)
+}
+
+/// Minimum allowed per-coin live_poll_interval (REQ-API-113/114 lower bound).
+///
+/// Env var: `LIVE_POLL_MIN_INTERVAL_SECS`. Default: 5 s.
+/// The effective floor is `max(live_poll_min_interval_secs, live_quote_poll_interval_secs)`.
+pub fn live_poll_min_interval_secs() -> u64 {
+    parse_env_u64("LIVE_POLL_MIN_INTERVAL_SECS", 5)
+}
+
+/// Maximum allowed per-coin live_poll_interval (REQ-API-113/114 upper bound).
+///
+/// Env var: `LIVE_POLL_MAX_INTERVAL_SECS`. Default: 3600 s (1 hour).
+pub fn live_poll_max_interval_secs() -> u64 {
+    parse_env_u64("LIVE_POLL_MAX_INTERVAL_SECS", 3600)
 }
 
 /// TTL for the live-poll in-flight claim marker in seconds.
@@ -395,6 +410,20 @@ mod tests {
     fn live_quote_poll_interval_secs_default() {
         if std::env::var("LIVE_QUOTE_POLL_INTERVAL_SECS").is_err() {
             assert_eq!(live_quote_poll_interval_secs(), 60);
+        }
+    }
+
+    #[test]
+    fn live_poll_min_interval_secs_default() {
+        if std::env::var("LIVE_POLL_MIN_INTERVAL_SECS").is_err() {
+            assert_eq!(live_poll_min_interval_secs(), 5);
+        }
+    }
+
+    #[test]
+    fn live_poll_max_interval_secs_default() {
+        if std::env::var("LIVE_POLL_MAX_INTERVAL_SECS").is_err() {
+            assert_eq!(live_poll_max_interval_secs(), 3600);
         }
     }
 

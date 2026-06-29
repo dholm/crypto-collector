@@ -395,7 +395,6 @@ mod tests {
         );
     }
 
-
     // ── DB-gated integration tests (require live DATABASE_URL) ──────────────
 
     async fn setup_db() -> PgPool {
@@ -590,5 +589,4 @@ mod tests {
             "credit_window_start must be reset to now, age={age:?}"
         );
     }
-
 }
