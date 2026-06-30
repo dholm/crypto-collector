@@ -97,10 +97,12 @@ coingecko:
 providers: "binance,coingecko"
 
 # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
-# Fleet-wide cooldown in milliseconds after the provider returns HTTP 429.
+# Inter-request cooldown in milliseconds between consecutive calls to each provider.
+# Default (code): 500 ms. Override here for stricter APIs.
 # Maps to PACER_<PROVIDER>_COOLDOWN_MS.
 pacer:
-  coingeckoCooldownMs: "60000"   # PACER_COINGECKO_COOLDOWN_MS — default 60 s
+  coingeckoCooldownMs: "60000"   # PACER_COINGECKO_COOLDOWN_MS — 60 s (demo tier limit)
+  binanceCooldownMs: "500"       # PACER_BINANCE_COOLDOWN_MS — 500 ms (generous rate limit)
 
 # ── Scheduling knobs (SPEC-SCHED-001) ─────────────────────────────────────────
 schedule:

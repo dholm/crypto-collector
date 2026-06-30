@@ -188,16 +188,16 @@ pub fn coingecko_api_key() -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
-/// Fleet-wide cooldown duration in milliseconds after a provider returns HTTP 429.
+/// Fleet-wide cooldown duration in milliseconds between consecutive requests to a provider.
 ///
-/// Env var: `PACER_{PROVIDER}_COOLDOWN_MS` (e.g. `PACER_COINGECKO_COOLDOWN_MS`).
-/// Default: 60 000 ms (1 minute).
+/// Env var: `PACER_{PROVIDER}_COOLDOWN_MS` (e.g. `PACER_BINANCE_COOLDOWN_MS`).
+/// Default: 500 ms. Override per-provider for stricter APIs (e.g. CoinGecko demo = 60 000 ms).
 pub fn pacer_cooldown_ms(provider: &str) -> u64 {
     let key = format!("PACER_{}_COOLDOWN_MS", provider.to_uppercase());
     std::env::var(&key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60_000)
+        .unwrap_or(500)
 }
 
 // ── SPEC-SCHED-001 scheduling knobs (OR-SCHED-1 resolved) ────────────────────
@@ -397,10 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn pacer_cooldown_ms_default_is_60s() {
+    fn pacer_cooldown_ms_default_is_500ms() {
         let key = "PACER_TESTPROVIDER_COOLDOWN_MS";
         if std::env::var(key).is_err() {
-            assert_eq!(pacer_cooldown_ms("testprovider"), 60_000);
+            assert_eq!(pacer_cooldown_ms("testprovider"), 500);
         }
     }
 

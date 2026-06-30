@@ -34,6 +34,7 @@ data:
 
   # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
   PACER_COINGECKO_COOLDOWN_MS: {{ .Values.pacer.coingeckoCooldownMs | quote }}
+  PACER_BINANCE_COOLDOWN_MS: {{ .Values.pacer.binanceCooldownMs | quote }}
 
   # ── Scheduling knobs (SPEC-SCHED-001) ─────────────────────────────────────────
   LIVE_QUOTE_POLL_INTERVAL_SECS: {{ .Values.schedule.liveQuotePollIntervalSecs | quote }}
