@@ -136,7 +136,7 @@ pub async fn register_coin(
     .await?;
 
     // Enqueue initial collection (REQ-API-010: SPEC-SCHED-001).
-    for kind in &["metadata", "market"] {
+    for kind in &["metadata", "market", "candles"] {
         sqlx::query(ENQUEUE_QUEUE_SQL)
             .bind("coin")
             .bind(&req.coin_id)

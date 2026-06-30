@@ -206,6 +206,7 @@ impl CoinGeckoClient {
                 ("vs_currency", vs_currency),
                 ("ids", &ids),
                 ("price_change_percentage", ""),
+                ("precision", "full"),
             ])
             .send()
             .await?;
