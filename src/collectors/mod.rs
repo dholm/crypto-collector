@@ -70,8 +70,11 @@ impl WorkerConfig {
             replica_id: config::replica_id().to_string(),
             live_quote_poll_interval_secs: config::live_quote_poll_interval_secs(),
             live_poll_claim_ttl_secs: config::live_poll_claim_ttl_secs(),
+            // Tick at 1/6th of the poll interval (min 5s) so a coin whose due
+            // time slips past a tick boundary is picked up within one extra tick,
+            // not an entire poll-interval later.
             live_poller_tick: Duration::from_secs(
-                config::live_quote_poll_interval_secs().max(1) as u64
+                (config::live_quote_poll_interval_secs() / 6).max(5) as u64
             ),
             collection_lease_secs: config::collection_lease_secs(),
             collection_heartbeat_interval_secs: config::collection_heartbeat_interval_secs(),
