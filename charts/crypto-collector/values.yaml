@@ -94,7 +94,7 @@ coingecko:
 # ── Provider chain (SPEC-PROV-001) ────────────────────────────────────────────
 # PROVIDERS env var: comma-separated fallback order (first name tried first).
 # Valid names: coingecko, binance, coinbase, kraken.
-providers: "coingecko"
+providers: "binance,coingecko"
 
 # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
 # Fleet-wide cooldown in milliseconds after the provider returns HTTP 429.
