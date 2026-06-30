@@ -262,8 +262,9 @@ impl CoinGeckoClient {
             .await
             .map_err(|e| ProviderError::Parse(format!("ohlc parse error: {e}")))?;
 
+        let interval = coingecko_days_to_interval(days);
         raw.iter()
-            .map(|v| normalise_ohlc_item(v, market_id, vs_currency))
+            .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
             .collect()
     }
 
@@ -526,10 +527,25 @@ fn normalise_market_item(
 ///
 // @MX:NOTE: [AUTO] volume intentionally None — CoinGecko /coins/{id}/ohlc returns [ts,O,H,L,C] with no volume field.
 // @MX:SPEC: SPEC-PROV-001 REQ-PROV-013/031 research §2.2
+/// Map a CoinGecko OHLC `days` parameter to the actual candle interval string.
+///
+/// CoinGecko's `/coins/{id}/ohlc` endpoint auto-selects granularity based on `days`:
+/// - 1 day  → 30-minute candles
+/// - 2–30 days → 4-hour candles
+/// - 31+ days  → 4-day candles
+pub fn coingecko_days_to_interval(days: u32) -> &'static str {
+    match days {
+        1 => "30m",
+        2..=30 => "4h",
+        _ => "4d",
+    }
+}
+
 pub fn normalise_ohlc_item(
     v: &Value,
     market_id: i64,
     vs_currency: &str,
+    interval: &str,
 ) -> Result<OhlcCandle, ProviderError> {
     let arr = v
         .as_array()
@@ -554,9 +570,7 @@ pub fn normalise_ohlc_item(
 
     Ok(OhlcCandle {
         market_id,
-        // CoinGecko auto granularity: 30m (1-2d), 4h (3-30d), 4d (31d+).
-        // We use "auto" as the interval label to indicate CoinGecko's auto-bucket.
-        interval: "auto".to_string(),
+        interval: interval.to_string(),
         ts,
         open,
         high,
@@ -1056,7 +1070,7 @@ mod tests {
         let arr = fixture.as_array().unwrap();
         let candles: Vec<OhlcCandle> = arr
             .iter()
-            .map(|v| normalise_ohlc_item(v, 42, "usd"))
+            .map(|v| normalise_ohlc_item(v, 42, "usd", "4h"))
             .collect::<Result<_, _>>()
             .expect("normalise");
 
@@ -1073,13 +1087,26 @@ mod tests {
             assert_eq!(c.source, "coingecko", "source must be 'coingecko'");
             // OHLC values must be Decimal
             assert_eq!(c.market_id, 42);
+            // interval must never be "auto"
+            assert_ne!(c.interval, "auto", "interval must not be 'auto'");
         }
+    }
+
+    #[test]
+    fn coingecko_days_to_interval_maps_correctly() {
+        assert_eq!(coingecko_days_to_interval(1), "30m");
+        assert_eq!(coingecko_days_to_interval(2), "4h");
+        assert_eq!(coingecko_days_to_interval(7), "4h");
+        assert_eq!(coingecko_days_to_interval(30), "4h");
+        assert_eq!(coingecko_days_to_interval(31), "4d");
+        assert_eq!(coingecko_days_to_interval(90), "4d");
+        assert_eq!(coingecko_days_to_interval(365), "4d");
     }
 
     #[test]
     fn ohlc_normalise_open_high_low_close_as_decimal() {
         let item = json!([1719820000000i64, 94000.5, 96000.25, 93000.75, 95000.1]);
-        let candle = normalise_ohlc_item(&item, 1, "usd").expect("normalise");
+        let candle = normalise_ohlc_item(&item, 1, "usd", "4h").expect("normalise");
 
         assert_eq!(candle.open, Decimal::from_str("94000.5").unwrap());
         assert_eq!(candle.high, Decimal::from_str("96000.25").unwrap());
@@ -1138,7 +1165,7 @@ mod tests {
     #[test]
     fn ohlc_item_timestamp_parsed_to_utc() {
         let item = json!([1719820000000i64, 100.0, 110.0, 90.0, 105.0]);
-        let candle = normalise_ohlc_item(&item, 1, "usd").unwrap();
+        let candle = normalise_ohlc_item(&item, 1, "usd", "4h").unwrap();
         assert_eq!(candle.ts.timestamp(), 1_719_820_000);
     }
 
