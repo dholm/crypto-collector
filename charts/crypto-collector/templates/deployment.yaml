@@ -26,6 +26,7 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9000"
         prometheus.io/path: "/metrics"
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       # terminationGracePeriodSeconds = graceSeconds + drainSeconds + 5 s buffer
       # graceSeconds: readiness → 503; kube-proxy endpoint removal propagates
