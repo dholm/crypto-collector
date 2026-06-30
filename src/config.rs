@@ -300,11 +300,11 @@ pub fn backfill_idle_sleep_ms() -> u64 {
     parse_env_u64("BACKFILL_IDLE_SLEEP_MS", 1_000)
 }
 
-/// Metadata periodic-refresh cadence in seconds (OR-SCHED-3 resolved).
+/// Market + metadata periodic-refresh cadence in seconds (OR-SCHED-3 resolved).
 ///
-/// Env var: `METADATA_REFRESH_INTERVAL_SECS`. Default: 86 400 s (24 h).
+/// Env var: `METADATA_REFRESH_INTERVAL_SECS`. Default: 3 600 s (1 h).
 pub fn metadata_refresh_interval_secs() -> u64 {
-    parse_env_u64("METADATA_REFRESH_INTERVAL_SECS", 86_400)
+    parse_env_u64("METADATA_REFRESH_INTERVAL_SECS", 3_600)
 }
 
 // ── Internal env-var helpers ──────────────────────────────────────────────────
@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn metadata_refresh_interval_default() {
         if std::env::var("METADATA_REFRESH_INTERVAL_SECS").is_err() {
-            assert_eq!(metadata_refresh_interval_secs(), 86_400);
+            assert_eq!(metadata_refresh_interval_secs(), 3_600);
         }
     }
 

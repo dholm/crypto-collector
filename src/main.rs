@@ -158,6 +158,26 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Market+metadata refresh task: re-enqueues market and metadata collection for
+    // all active coins on a fixed cadence (METADATA_REFRESH_INTERVAL_SECS, default 1 h).
+    // Runs immediately at startup so data is never stale after a rollout.
+    {
+        let pool_refresh = pool.clone();
+        let mut shutdown_refresh = shutdown_rx.clone();
+        let refresh_secs = crypto_collector::config::metadata_refresh_interval_secs();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(refresh_secs));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        enqueue_market_metadata_refresh(&pool_refresh).await;
+                    }
+                    _ = shutdown_refresh.changed() => break,
+                }
+            }
+        });
+    }
+
     // ── Step 8: Flip readiness (all prerequisites satisfied) (REQ-OBS-040) ────
     health_state.set_ready();
     info!("crypto-collector: service is ready");
@@ -347,6 +367,49 @@ async fn refresh_tracked_gauges(pool: &sqlx::PgPool) {
     {
         Ok(count) => metrics::gauge!("tracked_coins").set(count as f64),
         Err(e) => tracing::warn!(error = %e, "tracked_coins gauge refresh failed"),
+    }
+}
+
+// ── Market + metadata periodic refresh ────────────────────────────────────────
+
+/// Enqueue `market` and `metadata` tasks for every active coin.
+///
+/// Uses `ON CONFLICT DO NOTHING` so concurrent or duplicate calls are safe.
+async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
+    let coin_ids: Vec<String> =
+        match sqlx::query_scalar("SELECT coin_id FROM tracked_coins WHERE status = 'active'")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "market/metadata refresh: failed to fetch active coins");
+                return;
+            }
+        };
+
+    for coin_id in &coin_ids {
+        for kind in &["market", "metadata"] {
+            if let Err(e) = sqlx::query(
+                crypto_collector::collectors::collection_queue::ENQUEUE_QUEUE_SQL,
+            )
+            .bind("coin")
+            .bind(coin_id)
+            .bind(kind)
+            .execute(pool)
+            .await
+            {
+                tracing::warn!(error = %e, coin_id, kind, "market/metadata refresh: enqueue failed");
+            }
+        }
+    }
+
+    if !coin_ids.is_empty() {
+        tracing::info!(
+            coins = coin_ids.len(),
+            "market/metadata refresh: enqueued for {} coin(s)",
+            coin_ids.len()
+        );
     }
 }
 

@@ -137,8 +137,8 @@ schedule:
   # Sleep in ms when the backfill chunk queue is empty (BACKFILL_IDLE_SLEEP_MS). Default: 1000 ms.
   backfillIdleSleepMs: "1000"
 
-  # Metadata periodic-refresh cadence (METADATA_REFRESH_INTERVAL_SECS). Default: 86400 s (24 h).
-  metadataRefreshIntervalSecs: "86400"
+  # Market + metadata periodic-refresh cadence (METADATA_REFRESH_INTERVAL_SECS). Default: 3600 s (1 h).
+  metadataRefreshIntervalSecs: "3600"
 
 # ── Liveness and readiness probes (REQ-DEPLOY-024) ───────────────────────────
 # Both probes target the health port (HEALTH_PORT / containerPort: 8081).
