@@ -13,6 +13,7 @@
 //! `TcpListener`s alongside this one — structured to minimise overlap.
 
 pub mod candles;
+pub mod candles_agg;
 pub mod coin_market;
 pub mod coins;
 pub mod cursor;

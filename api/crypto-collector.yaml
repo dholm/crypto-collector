@@ -378,6 +378,19 @@ paths:
       operationId: listCoinCandles
       tags: [candles]
       summary: List OHLCV candle history for a coin (keyset-paginated)
+      description: >
+        Returns OHLCV candles for the coin at the requested `interval`.
+
+
+        When no candles are stored natively at the requested `interval`, the
+        service aggregates them on the fly from the largest finer-grained stored
+        interval that divides the target evenly (e.g. a 4h candle from four 1h
+        candles). Aggregated candles carry `source` = `aggregated:<source_interval>`
+        (e.g. `aggregated:1h`); natively-collected candles keep their provider
+        source. Closed buckets missing any source candle are omitted (never
+        interpolated); the single bucket whose window contains the current time
+        is emitted as a live, still-forming candle. When no stored interval can
+        compose the target, an empty page (HTTP 200) is returned.
       parameters:
         - name: interval
           in: query
@@ -391,6 +404,10 @@ paths:
           schema:
             type: string
             default: usd
+          description: >
+            Quote currency to read/aggregate within (default `usd`). Native and
+            aggregated results are both scoped to this currency; an unrecognised
+            value is not a 400 and simply yields an empty page.
         - $ref: '#/components/parameters/cursor'
         - $ref: '#/components/parameters/limit'
         - $ref: '#/components/parameters/start'
@@ -675,10 +692,17 @@ components:
         volume:
           $ref: '#/components/schemas/DecimalString'
           nullable: true
-          description: "Nullable: some providers do not include per-candle volume"
+          description: >
+            Nullable: some providers do not include per-candle volume. For
+            aggregated candles the value is the sum of component volumes, or
+            null if any component's volume is null.
         source:
           type: string
           example: binance
+          description: >
+            Provider name for natively-collected candles (e.g. `binance`), or
+            `aggregated:<source_interval>` (e.g. `aggregated:1h`) when the candle
+            was derived by aggregating a finer stored interval.
 
     CoinCandlePage:
       allOf:
