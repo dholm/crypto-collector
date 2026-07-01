@@ -74,7 +74,7 @@ impl WorkerConfig {
             // time slips past a tick boundary is picked up within one extra tick,
             // not an entire poll-interval later.
             live_poller_tick: Duration::from_secs(
-                (config::live_quote_poll_interval_secs() / 6).max(5) as u64
+                (config::live_quote_poll_interval_secs() / 6).max(5) as u64,
             ),
             collection_lease_secs: config::collection_lease_secs(),
             collection_heartbeat_interval_secs: config::collection_heartbeat_interval_secs(),

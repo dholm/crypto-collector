@@ -1,17 +1,21 @@
 /// Crypto Collector entry point — SPEC-OBS-001 three-port topology.
 ///
-/// Startup order (REQ-OBS-040):
+/// Startup order (REQ-OBS-040, REQ-OBS-041):
 ///   1. Parse config from env vars.
 ///   2. Init structured JSON logging + optional OTLP tracing (REQ-OBS-020/021).
 ///   3. Install Prometheus recorder + bind metrics listener on METRICS_PORT (REQ-OBS-010).
-///   4. Build PgPool + run migrations (SPEC-DB-001).
-///   5. Build provider chain (SPEC-PROV-001).
-///   6. Create HealthState (not ready yet).
-///   7. Spawn workers (SPEC-SCHED-001) + gauge-refresh task (REQ-OBS-013).
-///   8. Flip readiness to ready (all prerequisites satisfied) (REQ-OBS-040).
-///   9. Bind health listener (HEALTH_PORT 8081) and API listener (API_PORT 8080).
-///  10. Await SIGTERM/SIGINT.
-///  11. Graceful shutdown (REQ-OBS-030..033): set_shutting_down → sleep grace →
+///   4. Build a lazy PgPool (no I/O yet) (SPEC-DB-001).
+///   5. Create HealthState (not ready) + shutdown channel.
+///   6. Bind health listener (HEALTH_PORT 8081) + spawn health server + shutdown
+///      orchestrator — BEFORE the DB is confirmed reachable, so /healthz/live stays
+///      answerable during a DB outage and Kubernetes does not crash-loop the pod.
+///   7. Apply migrations, retrying with backoff until the DB is reachable (REQ-OBS-041).
+///   8. Build provider chain (SPEC-PROV-001).
+///   9. Spawn workers (SPEC-SCHED-001) + gauge-refresh task (REQ-OBS-013).
+///  10. Flip readiness to ready (all prerequisites satisfied) (REQ-OBS-040).
+///  11. Bind API listener (API_PORT 8080) + spawn API server.
+///  12. Await SIGTERM/SIGINT.
+///  13. Graceful shutdown (REQ-OBS-030..033): set_shutting_down → sleep grace →
 ///      broadcast shutdown → drain → pool.close → telemetry::shutdown.
 use anyhow::{Context, Result};
 use opentelemetry::propagation::Extractor;
@@ -107,15 +111,96 @@ async fn main() -> Result<()> {
     crypto_collector::metrics::init(metrics_port)
         .context("failed to install Prometheus recorder")?;
 
-    // ── Step 4: Database pool + migrations (SPEC-DB-001, REQ-OBS-041) ─────────
+    // ── Step 4: Lazy database pool (SPEC-DB-001, REQ-OBS-041) ─────────────────
+    // `connect_lazy` performs no I/O — the pool is ready to hand to the health
+    // server immediately. Migrations run in Step 8 with retry, so the health
+    // listener can bind (and answer liveness) even while the DB is unreachable.
     let database_url =
         config::database_url().context("failed to resolve database connection settings")?;
-    let pool = crypto_collector::db::connect(&database_url)
+    let pool = crypto_collector::db::connect_lazy(&database_url)
+        .context("failed to build database connection pool")?;
+
+    // ── Step 5: Health state + shutdown channel ───────────────────────────────
+    // Health state starts not-ready; readiness stays 503 until set_ready() (Step 10).
+    let health_state = crypto_collector::health::HealthState::new(pool.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // ── Step 6: Bind health listener + shutdown orchestrator BEFORE the DB retry ─
+    // Binding health first keeps `/healthz/live` answerable during a database
+    // outage, so Kubernetes does not kill the pod (no CrashLoopBackoff). Readiness
+    // reports 503 throughout the retry window (REQ-OBS-041).
+    let health_router = crypto_collector::health::router(health_state.clone());
+    let health_listener = TcpListener::bind(format!("0.0.0.0:{health_port}"))
         .await
-        .context("failed to connect to database and apply migrations")?;
+        .with_context(|| format!("failed to bind health port {health_port}"))?;
+    info!("crypto-collector: health server listening on port {health_port}");
+
+    // Shutdown orchestrator — spawned early so SIGTERM during a DB outage aborts
+    // the retry loop cleanly (REQ-OBS-030..033). Ordering is load-bearing.
+    //
+    // @MX:ANCHOR: [AUTO] shutdown orchestrator — ordering is load-bearing for zero-drop rollouts
+    // @MX:REASON: fan_in >= 3: SIGTERM path, SIGINT path, integration tests.
+    //             Order: set_shutting_down → grace sleep → shutdown_tx → drain → pool.close.
+    //             Changing the order drops in-flight requests mid-rollout (REQ-OBS-030..033).
+    // @MX:WARN: [AUTO] tokio::spawn for signal + sleep + channel: three concurrent tasks involved
+    // @MX:REASON: Each step (grace, drain) involves sleeping inside an async task;
+    //             be careful not to block the runtime — use tokio::time::sleep, not std::thread::sleep.
+    // @MX:SPEC: SPEC-OBS-001 REQ-OBS-030 REQ-OBS-031 REQ-OBS-032 REQ-OBS-033 REQ-OBS-041
+    let shutdown_orchestrator = {
+        let health_state_shutdown = health_state.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            info!("crypto-collector: shutdown signal received; flipping readiness to 503");
+
+            // a. Flip readiness to 503 — kube-proxy begins removing the pod (REQ-OBS-030/004).
+            health_state_shutdown.set_shutting_down();
+
+            // b. Grace window: kube-proxy removes pod from endpoints list (REQ-OBS-030/031).
+            info!(grace_secs, "crypto-collector: shutdown grace period");
+            tokio::time::sleep(Duration::from_secs(grace_secs)).await;
+
+            // c. Signal workers + startup retry to stop (REQ-OBS-032/041).
+            info!("crypto-collector: broadcasting shutdown to workers");
+            shutdown_tx.send(true).ok();
+        })
+    };
+
+    // Spawn the health server now (concurrent with the DB retry below).
+    let health_handle = {
+        let mut health_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            axum::serve(health_listener, health_router)
+                .with_graceful_shutdown(async move {
+                    loop {
+                        if *health_shutdown_rx.borrow() {
+                            break;
+                        }
+                        if health_shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+        })
+    };
+
+    // ── Step 7: Apply migrations, retrying until the DB is reachable (REQ-OBS-041) ─
+    let mut migrate_shutdown_rx = shutdown_rx.clone();
+    let migrated = crypto_collector::db::migrate_with_retry(&pool, &mut migrate_shutdown_rx)
+        .await
+        .context("migration retry loop failed")?;
+    if !migrated {
+        // Shutdown was requested before the database became available.
+        info!("crypto-collector: shutdown requested before database was ready; exiting");
+        health_handle.await.ok();
+        shutdown_orchestrator.await.ok();
+        pool.close().await;
+        crypto_collector::telemetry::shutdown();
+        return Ok(());
+    }
     info!("crypto-collector: database connected and migrations applied");
 
-    // ── Step 5: Provider chain (SPEC-PROV-001) ─────────────────────────────────
+    // ── Step 8: Provider chain (SPEC-PROV-001) ─────────────────────────────────
     let provider_names = config::provider_names();
     let coingecko_cfg = crypto_collector::providers::CoinGeckoConfig::from_env();
     let chain = Arc::new(
@@ -124,13 +209,7 @@ async fn main() -> Result<()> {
     );
     info!("crypto-collector: provider chain = {:?}", provider_names);
 
-    // ── Step 6: Health state (starts not-ready) ────────────────────────────────
-    let health_state = crypto_collector::health::HealthState::new(pool.clone());
-
-    // ── Shutdown channel — broadcast true to stop workers + servers ────────────
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    // ── Step 7: Spawn workers (SPEC-SCHED-001) + gauge-refresh task ───────────
+    // ── Step 9: Spawn workers (SPEC-SCHED-001) + gauge-refresh task ───────────
     let worker_cfg = crypto_collector::collectors::WorkerConfig::from_env();
     let supervisor = crypto_collector::collectors::spawn_workers(
         pool.clone(),
@@ -178,11 +257,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Step 8: Flip readiness (all prerequisites satisfied) (REQ-OBS-040) ────
+    // ── Step 10: Flip readiness (all prerequisites satisfied) (REQ-OBS-040) ───
     health_state.set_ready();
     info!("crypto-collector: service is ready");
 
-    // ── Step 9: Bind API and health listeners (REQ-OBS-001) ───────────────────
+    // ── Step 11: Bind API listener (REQ-OBS-001) ──────────────────────────────
     let search_provider = provider_names
         .first()
         .cloned()
@@ -236,45 +315,11 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to bind API port {api_port}"))?;
     info!("crypto-collector: API server listening on port {api_port}");
 
-    let health_router = crypto_collector::health::router(health_state.clone());
-    let health_listener = TcpListener::bind(format!("0.0.0.0:{health_port}"))
-        .await
-        .with_context(|| format!("failed to bind health port {health_port}"))?;
-    info!("crypto-collector: health server listening on port {health_port}");
     info!("crypto-collector: metrics server listening on port {metrics_port}");
 
-    // ── Step 10: Await SIGTERM/SIGINT (REQ-OBS-030) ────────────────────────────
-    let health_state_shutdown = health_state.clone();
+    // ── Step 12: Serve API concurrently; await SIGTERM/SIGINT (REQ-OBS-030) ────
+    // The health server and shutdown orchestrator were already spawned in Step 6.
     let mut api_shutdown_rx = shutdown_rx.clone();
-    let mut health_shutdown_rx = shutdown_rx.clone();
-
-    // Spawn shutdown orchestrator (runs concurrently with servers).
-    //
-    // @MX:ANCHOR: [AUTO] shutdown orchestrator — ordering is load-bearing for zero-drop rollouts
-    // @MX:REASON: fan_in >= 3: SIGTERM path, SIGINT path, integration tests.
-    //             Order: set_shutting_down → grace sleep → shutdown_tx → drain → pool.close.
-    //             Changing the order drops in-flight requests mid-rollout (REQ-OBS-030..033).
-    // @MX:WARN: [AUTO] tokio::spawn for signal + sleep + channel: three concurrent tasks involved
-    // @MX:REASON: Each step (grace, drain) involves sleeping inside an async task;
-    //             be careful not to block the runtime — use tokio::time::sleep, not std::thread::sleep.
-    // @MX:SPEC: SPEC-OBS-001 REQ-OBS-030 REQ-OBS-031 REQ-OBS-032 REQ-OBS-033
-    let shutdown_orchestrator = tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        info!("crypto-collector: shutdown signal received; flipping readiness to 503");
-
-        // a. Flip readiness to 503 — kube-proxy begins removing the pod (REQ-OBS-030/004).
-        health_state_shutdown.set_shutting_down();
-
-        // b. Grace window: kube-proxy removes pod from endpoints list (REQ-OBS-030/031).
-        info!(grace_secs, "crypto-collector: shutdown grace period");
-        tokio::time::sleep(Duration::from_secs(grace_secs)).await;
-
-        // c. Signal workers to stop claiming new work (REQ-OBS-032).
-        info!("crypto-collector: broadcasting shutdown to workers");
-        shutdown_tx.send(true).ok();
-    });
-
-    // Serve API and health concurrently.
     let api_handle = tokio::spawn(async move {
         axum::serve(api_listener, api_router)
             .with_graceful_shutdown(async move {
@@ -283,21 +328,6 @@ async fn main() -> Result<()> {
                         break;
                     }
                     if api_shutdown_rx.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
-            .await
-    });
-
-    let health_handle = tokio::spawn(async move {
-        axum::serve(health_listener, health_router)
-            .with_graceful_shutdown(async move {
-                loop {
-                    if *health_shutdown_rx.borrow() {
-                        break;
-                    }
-                    if health_shutdown_rx.changed().await.is_err() {
                         break;
                     }
                 }
@@ -390,14 +420,13 @@ async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
 
     for coin_id in &coin_ids {
         for kind in &["market", "metadata"] {
-            if let Err(e) = sqlx::query(
-                crypto_collector::collectors::collection_queue::ENQUEUE_QUEUE_SQL,
-            )
-            .bind("coin")
-            .bind(coin_id)
-            .bind(kind)
-            .execute(pool)
-            .await
+            if let Err(e) =
+                sqlx::query(crypto_collector::collectors::collection_queue::ENQUEUE_QUEUE_SQL)
+                    .bind("coin")
+                    .bind(coin_id)
+                    .bind(kind)
+                    .execute(pool)
+                    .await
             {
                 tracing::warn!(error = %e, coin_id, kind, "market/metadata refresh: enqueue failed");
             }
