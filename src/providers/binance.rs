@@ -156,15 +156,36 @@ fn parse_string_decimal(v: &Value, name: &str) -> Result<Decimal, ProviderError>
     }
 }
 
-/// Convert a `days` count to the appropriate Binance kline interval.
+/// Snap an interval in seconds to the nearest Binance kline interval string.
 ///
-/// Heuristic: mirrors CoinGecko's auto-bucket approach — use 1d candles for periods ≥ 1 day.
-fn days_to_kline_interval(days: u32) -> &'static str {
-    match days {
-        0..=1 => "1h",
-        2..=7 => "4h",
-        _ => "1d",
-    }
+/// Binance natively supports these kline intervals (in seconds):
+/// 1m=60, 3m=180, 5m=300, 15m=900, 30m=1800, 1h=3600, 2h=7200, 4h=14400,
+/// 6h=21600, 8h=28800, 12h=43200, 1d=86400, 3d=259200, 1w=604800, 1M=2592000.
+///
+/// Snapping uses nearest-neighbour by absolute distance (linear, not log-scale).
+pub(crate) fn secs_to_kline_interval(interval_secs: i64) -> &'static str {
+    const INTERVALS: &[(i64, &str)] = &[
+        (60, "1m"),
+        (180, "3m"),
+        (300, "5m"),
+        (900, "15m"),
+        (1_800, "30m"),
+        (3_600, "1h"),
+        (7_200, "2h"),
+        (14_400, "4h"),
+        (21_600, "6h"),
+        (28_800, "8h"),
+        (43_200, "12h"),
+        (86_400, "1d"),
+        (259_200, "3d"),
+        (604_800, "1w"),
+        (2_592_000, "1M"),
+    ];
+    INTERVALS
+        .iter()
+        .min_by_key(|(s, _)| (interval_secs - s).abs())
+        .map(|(_, name)| *name)
+        .unwrap_or("1h")
 }
 
 // ── BinanceProvider ───────────────────────────────────────────────────────────
@@ -251,10 +272,13 @@ impl Provider for BinanceProvider {
         &self,
         market: &MarketQuery,
         days: u32,
+        interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         let symbol = Self::ticker_symbol(market);
-        let interval = days_to_kline_interval(days);
-        let limit = (days * 24).clamp(1, 1000); // Binance kline limit: min 1, max 1000
+        let interval = secs_to_kline_interval(interval_secs);
+        // Number of candles that fit in the requested lookback window (clamped to API max).
+        let snapped_secs = interval_secs.max(1);
+        let limit = ((days as i64 * 86_400) / snapped_secs).clamp(1, 1000) as u32;
 
         self.local_throttle.acquire().await;
         pacer::acquire_slot(&self.pool, "binance")
@@ -459,6 +483,41 @@ mod tests {
         assert!(candles[0].ts < candles[1].ts);
         // volumes always Some
         assert!(candles.iter().all(|c| c.volume.is_some()));
+    }
+
+    // ── secs_to_kline_interval: snap to nearest Binance interval ─────────────
+
+    #[test]
+    fn snap_exact_intervals_unchanged() {
+        assert_eq!(secs_to_kline_interval(60), "1m");
+        assert_eq!(secs_to_kline_interval(3_600), "1h");
+        assert_eq!(secs_to_kline_interval(14_400), "4h");
+        assert_eq!(secs_to_kline_interval(86_400), "1d");
+    }
+
+    #[test]
+    fn snap_default_poll_interval_60s_to_1m() {
+        // Default global interval (60 s) → nearest Binance interval is 1m
+        assert_eq!(secs_to_kline_interval(60), "1m");
+    }
+
+    #[test]
+    fn snap_midpoint_between_1m_and_3m_to_lower() {
+        // midpoint (60+180)/2 = 120 → distance to 1m is 60, distance to 3m is 60 → ties to 1m
+        assert_eq!(secs_to_kline_interval(120), "1m");
+    }
+
+    #[test]
+    fn snap_above_midpoint_advances_to_next_interval() {
+        // 121 s → closer to 3m (180) than 1m (60) → 3m
+        assert_eq!(secs_to_kline_interval(121), "3m");
+    }
+
+    #[test]
+    fn snap_large_value_gives_monthly() {
+        // 1M = 2592000 s
+        assert_eq!(secs_to_kline_interval(2_592_000), "1M");
+        assert_eq!(secs_to_kline_interval(10_000_000), "1M");
     }
 
     // ── Provider trait: supports() ────────────────────────────────────────────

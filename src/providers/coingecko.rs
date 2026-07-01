@@ -233,6 +233,11 @@ impl CoinGeckoClient {
 
     /// `GET /coins/{id}/ohlc?vs_currency={vs}&days={days}` — day-bucketed OHLC.
     ///
+    /// `interval_secs` drives granularity selection: it is snapped to the nearest
+    /// CoinGecko-supported band (30m / 4h / 4d).  Because CoinGecko's free-tier API
+    /// couples granularity with the `days` param, the snapped interval overrides the
+    /// band even when this changes `days` (granularity takes priority per design).
+    ///
     /// Returns candles with `volume = None` and `source = "coingecko"` (REQ-PROV-013/031).
     pub async fn fetch_ohlc(
         &self,
@@ -240,8 +245,11 @@ impl CoinGeckoClient {
         vs_currency: &str,
         days: u32,
         market_id: i64,
+        interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
-        let days_str = days.to_string();
+        let interval = coingecko_snap_interval(interval_secs);
+        let effective_days = coingecko_days_for_interval(interval, days);
+        let days_str = effective_days.to_string();
         let resp = self
             .get(&format!("/api/v3/coins/{coin_id}/ohlc"))
             .query(&[("vs_currency", vs_currency), ("days", &days_str)])
@@ -262,7 +270,6 @@ impl CoinGeckoClient {
             .await
             .map_err(|e| ProviderError::Parse(format!("ohlc parse error: {e}")))?;
 
-        let interval = coingecko_days_to_interval(days);
         raw.iter()
             .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
             .collect()
@@ -527,12 +534,48 @@ fn normalise_market_item(
 ///
 // @MX:NOTE: [AUTO] volume intentionally None — CoinGecko /coins/{id}/ohlc returns [ts,O,H,L,C] with no volume field.
 // @MX:SPEC: SPEC-PROV-001 REQ-PROV-013/031 research §2.2
-/// Map a CoinGecko OHLC `days` parameter to the actual candle interval string.
+/// Snap an interval in seconds to the nearest CoinGecko-supported granularity string.
 ///
-/// CoinGecko's `/coins/{id}/ohlc` endpoint auto-selects granularity based on `days`:
-/// - 1 day  → 30-minute candles
-/// - 2–30 days → 4-hour candles
-/// - 31+ days  → 4-day candles
+/// CoinGecko's `/coins/{id}/ohlc` endpoint (free/demo tier) auto-selects granularity
+/// from exactly three bands:
+/// - 30 m  (1 800 s) — only when `days = 1`
+/// - 4 h  (14 400 s) — when `days` is 2..=30
+/// - 4 d (345 600 s) — when `days >= 31`
+///
+/// We snap `interval_secs` to the nearest band by absolute distance.
+pub fn coingecko_snap_interval(interval_secs: i64) -> &'static str {
+    const BANDS: &[(i64, &str)] = &[(1_800, "30m"), (14_400, "4h"), (345_600, "4d")];
+    BANDS
+        .iter()
+        .min_by_key(|(s, _)| (interval_secs - s).abs())
+        .map(|(_, name)| *name)
+        .unwrap_or("4h")
+}
+
+/// Derive the `days` parameter required by the CoinGecko API for the given snapped interval.
+///
+/// CoinGecko couples granularity and lookback: the `days` value determines which
+/// granularity band the API returns.  Granularity takes priority — we clamp
+/// `requested_days` into the band that matches the interval, preserving as much
+/// of the requested lookback as the band allows.
+///
+/// | interval | valid days range | clamping behaviour               |
+/// |----------|-----------------|----------------------------------|
+/// | "30m"    | 1               | always 1                         |
+/// | "4h"     | 2..=30          | clamp(2, 30)                     |
+/// | "4d"     | 31+             | max(31, requested_days)          |
+pub fn coingecko_days_for_interval(interval: &str, requested_days: u32) -> u32 {
+    match interval {
+        "30m" => 1,
+        "4h" => requested_days.clamp(2, 30),
+        _ => requested_days.max(31), // "4d" and any future band
+    }
+}
+
+/// Legacy helper kept for backward compatibility with existing tests.
+///
+/// Maps a `days` count to the CoinGecko auto-selected interval string.
+/// Prefer `coingecko_snap_interval` for new call-sites.
 pub fn coingecko_days_to_interval(days: u32) -> &'static str {
     match days {
         1 => "30m",
@@ -787,6 +830,7 @@ impl Provider for CoinGeckoProvider {
         &self,
         market: &MarketQuery,
         days: u32,
+        interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         let coin_id = market.coin_id.as_deref().ok_or_else(|| {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC"))
@@ -804,7 +848,13 @@ impl Provider for CoinGeckoProvider {
 
         match self
             .client
-            .fetch_ohlc(coin_id, &market.vs_currency, days, market.market_id)
+            .fetch_ohlc(
+                coin_id,
+                &market.vs_currency,
+                days,
+                market.market_id,
+                interval_secs,
+            )
             .await
         {
             Ok(c) => Ok(c),
@@ -1103,6 +1153,64 @@ mod tests {
         assert_eq!(coingecko_days_to_interval(365), "4d");
     }
 
+    // ── coingecko_snap_interval: snaps interval_secs to nearest CG band ───────
+
+    #[test]
+    fn snap_interval_below_midpoint_gives_30m() {
+        // 60 s (default poll) → closest to 30m (1800 s) over 4h (14400 s)
+        assert_eq!(coingecko_snap_interval(60), "30m");
+        // 1800 s exactly → 30m
+        assert_eq!(coingecko_snap_interval(1_800), "30m");
+        // Just below the midpoint between 30m and 4h: (1800+14400)/2 = 8100
+        assert_eq!(coingecko_snap_interval(8_099), "30m");
+    }
+
+    #[test]
+    fn snap_interval_at_midpoint_gives_lower_band() {
+        // Exact midpoint 8100 → ties resolved toward lower band (30m)
+        assert_eq!(coingecko_snap_interval(8_100), "30m");
+    }
+
+    #[test]
+    fn snap_interval_above_midpoint_gives_4h() {
+        assert_eq!(coingecko_snap_interval(8_101), "4h");
+        assert_eq!(coingecko_snap_interval(14_400), "4h"); // exact 4h
+        assert_eq!(coingecko_snap_interval(86_400), "4h"); // 1d, still closer to 4h
+                                                           // Midpoint between 4h (14400) and 4d (345600): (14400+345600)/2 = 180000
+        assert_eq!(coingecko_snap_interval(179_999), "4h");
+    }
+
+    #[test]
+    fn snap_interval_at_or_above_4d_midpoint_gives_4d() {
+        assert_eq!(coingecko_snap_interval(180_001), "4d");
+        assert_eq!(coingecko_snap_interval(345_600), "4d"); // exact 4d
+        assert_eq!(coingecko_snap_interval(1_000_000), "4d");
+    }
+
+    // ── coingecko_days_for_interval: preserves lookback within band limits ─────
+
+    #[test]
+    fn days_for_30m_always_one() {
+        assert_eq!(coingecko_days_for_interval("30m", 1), 1);
+        assert_eq!(coingecko_days_for_interval("30m", 7), 1);
+        assert_eq!(coingecko_days_for_interval("30m", 0), 1);
+    }
+
+    #[test]
+    fn days_for_4h_clamped_to_2_through_30() {
+        assert_eq!(coingecko_days_for_interval("4h", 1), 2); // below band floor → floor
+        assert_eq!(coingecko_days_for_interval("4h", 7), 7);
+        assert_eq!(coingecko_days_for_interval("4h", 30), 30);
+        assert_eq!(coingecko_days_for_interval("4h", 31), 30); // above band ceil → ceil
+    }
+
+    #[test]
+    fn days_for_4d_at_least_31() {
+        assert_eq!(coingecko_days_for_interval("4d", 7), 31); // below band floor → 31
+        assert_eq!(coingecko_days_for_interval("4d", 31), 31);
+        assert_eq!(coingecko_days_for_interval("4d", 90), 90);
+    }
+
     #[test]
     fn ohlc_normalise_open_high_low_close_as_decimal() {
         let item = json!([1719820000000i64, 94000.5, 96000.25, 93000.75, 95000.1]);
@@ -1293,14 +1401,16 @@ mod tests {
             tier: "demo".to_string(),
         };
         let client = CoinGeckoClient::new(cfg);
+        // Use a 4h interval (14400 s) → snaps to "4h" band → days clamped to 7 (within 2..=30)
         let candles = client
-            .fetch_ohlc("bitcoin", "usd", 7, 1)
+            .fetch_ohlc("bitcoin", "usd", 7, 1, 14_400)
             .await
             .expect("fetch");
 
         assert_eq!(candles.len(), 2);
         assert!(candles.iter().all(|c| c.volume.is_none()));
         assert!(candles.iter().all(|c| c.source == "coingecko"));
+        assert!(candles.iter().all(|c| c.interval == "4h"));
     }
 
     #[tokio::test]

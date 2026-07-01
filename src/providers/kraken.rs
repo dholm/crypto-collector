@@ -39,6 +39,7 @@ impl Provider for KrakenProvider {
         &self,
         _market: &MarketQuery,
         _days: u32,
+        _interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         Err(ProviderError::NotSupported(Capability::Ohlc))
     }

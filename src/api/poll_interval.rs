@@ -134,6 +134,22 @@ pub fn duration_to_pg_interval(d: std::time::Duration) -> String {
     format!("{} seconds", d.as_secs())
 }
 
+/// Convert a PostgreSQL INTERVAL text (or a human-readable duration string) to seconds.
+///
+/// Accepts both PG wire format `"HH:MM:SS"` and the normalized human-readable form
+/// (`"5m"`, `"1h30m"`, `"30s"`).  Returns `None` when the input cannot be parsed.
+///
+/// Used by collectors to convert `TrackedCoin.live_poll_interval` (returned as TEXT
+/// via `::TEXT` cast) into a seconds count for snapping to provider granularities.
+pub(crate) fn pg_interval_to_secs(s: &str) -> Option<i64> {
+    // Try the HH:MM:SS path first (PG wire format).
+    if let Some(normalized) = normalize_pg_interval(s) {
+        return parse_hms(&normalized).ok().map(|v| v as i64);
+    }
+    // Fallback: already a human-readable string ("5m", "1h30m", etc.).
+    parse_hms(s).ok().map(|v| v as i64)
+}
+
 /// Normalize a PostgreSQL INTERVAL text representation to a human-readable string.
 ///
 /// PostgreSQL returns intervals as `"HH:MM:SS"` in the default `postgres` interval style
@@ -314,5 +330,36 @@ mod tests {
             duration_to_pg_interval(std::time::Duration::from_secs(300)),
             "300 seconds"
         );
+    }
+
+    // ── pg_interval_to_secs ───────────────────────────────────────────────────
+
+    #[test]
+    fn pg_interval_hh_mm_ss_parsed_to_secs() {
+        // PG INTERVAL wire format "00:05:00" = 5 minutes = 300 s
+        assert_eq!(pg_interval_to_secs("00:05:00"), Some(300));
+        // "01:30:00" = 90 minutes = 5400 s
+        assert_eq!(pg_interval_to_secs("01:30:00"), Some(5_400));
+        // "00:01:00" = 60 s
+        assert_eq!(pg_interval_to_secs("00:01:00"), Some(60));
+    }
+
+    #[test]
+    fn pg_interval_human_readable_parsed_to_secs() {
+        // Already-normalized strings also accepted
+        assert_eq!(pg_interval_to_secs("5m"), Some(300));
+        assert_eq!(pg_interval_to_secs("1h"), Some(3_600));
+        assert_eq!(pg_interval_to_secs("1h30m"), Some(5_400));
+    }
+
+    #[test]
+    fn pg_interval_fractional_seconds_ignored() {
+        assert_eq!(pg_interval_to_secs("00:05:00.000000"), Some(300));
+    }
+
+    #[test]
+    fn pg_interval_invalid_returns_none() {
+        assert_eq!(pg_interval_to_secs("not-a-duration"), None);
+        assert_eq!(pg_interval_to_secs(""), None);
     }
 }

@@ -299,8 +299,9 @@ async fn chain_fetch_ohlc_for_chunk(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     days: u32,
+    interval_secs: i64,
 ) -> Result<Vec<OhlcCandle>, ProviderError> {
-    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days).await;
+    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs).await;
     result
 }
 
@@ -321,14 +322,16 @@ async fn process_chunk(
     chain: &[Arc<dyn Provider>],
     chunk: &ClaimedChunk,
 ) -> Result<Option<DateTime<Utc>>, String> {
-    // Look up coin's trading symbol from tracked_coins.
-    let symbol: Option<String> =
-        sqlx::query_scalar("SELECT symbol FROM tracked_coins WHERE coin_id = $1")
-            .bind(&chunk.coin_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| e.to_string())?;
-    let symbol = symbol.ok_or_else(|| format!("coin {} not found", chunk.coin_id))?;
+    // Look up coin's trading symbol and per-coin poll interval from tracked_coins.
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT symbol, live_poll_interval::TEXT FROM tracked_coins WHERE coin_id = $1",
+    )
+    .bind(&chunk.coin_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    let (symbol, live_poll_interval) =
+        row.ok_or_else(|| format!("coin {} not found", chunk.coin_id))?;
 
     let mq = MarketQuery {
         market_id: 0,
@@ -351,7 +354,14 @@ async fn process_chunk(
     let start = resume_start(chunk.cursor, chunk.range_start);
     let days = range_to_days(start, chunk.range_end, 90); // 90-day cap per CoinGecko API
 
-    let candles = chain_fetch_ohlc_for_chunk(chain, &mq, days)
+    // Candle granularity = per-coin poll interval (or global default).
+    let global_interval = crate::config::live_quote_poll_interval_secs();
+    let interval_secs = crate::config::effective_candle_interval_secs(
+        live_poll_interval.as_deref(),
+        global_interval,
+    );
+
+    let candles = chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs)
         .await
         .map_err(|e| e.to_string())?;
 

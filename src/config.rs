@@ -221,6 +221,20 @@ pub fn live_quote_poll_interval_secs() -> i64 {
     parse_env_i64("LIVE_QUOTE_POLL_INTERVAL_SECS", 60)
 }
 
+/// Resolve the effective candle collection interval in seconds for a single coin.
+///
+/// Priority: per-coin `live_poll_interval` (PG INTERVAL as TEXT) → global default.
+///
+/// `live_poll_interval` is returned from the DB as `live_poll_interval::TEXT`, which
+/// PostgreSQL formats as `"HH:MM:SS"` for sub-day intervals. This function parses that
+/// back to seconds and falls back to `global_secs` when the field is absent or unparseable.
+pub fn effective_candle_interval_secs(live_poll_interval: Option<&str>, global_secs: i64) -> i64 {
+    live_poll_interval
+        .and_then(crate::api::poll_interval::pg_interval_to_secs)
+        .filter(|&v| v > 0)
+        .unwrap_or(global_secs)
+}
+
 /// Minimum allowed per-coin live_poll_interval (REQ-API-113/114 lower bound).
 ///
 /// Env var: `LIVE_POLL_MIN_INTERVAL_SECS`. Default: 5 s.
@@ -541,5 +555,27 @@ mod tests {
         if std::env::var("TRACKED_GAUGE_INTERVAL_SECS").is_err() {
             assert_eq!(tracked_gauge_interval_secs(), 30);
         }
+    }
+
+    // ── effective_candle_interval_secs ────────────────────────────────────────
+
+    #[test]
+    fn effective_interval_falls_back_to_global_when_none() {
+        assert_eq!(effective_candle_interval_secs(None, 60), 60);
+        assert_eq!(effective_candle_interval_secs(None, 300), 300);
+    }
+
+    #[test]
+    fn effective_interval_uses_per_coin_when_set() {
+        // PG INTERVAL wire format "00:05:00" = 300 s
+        assert_eq!(effective_candle_interval_secs(Some("00:05:00"), 60), 300);
+        // Human-readable also accepted
+        assert_eq!(effective_candle_interval_secs(Some("1h"), 60), 3_600);
+    }
+
+    #[test]
+    fn effective_interval_falls_back_on_parse_error() {
+        // Unparseable value → fall back to global
+        assert_eq!(effective_candle_interval_secs(Some("garbage"), 60), 60);
     }
 }

@@ -225,13 +225,21 @@ pub async fn enqueue_queue_item(
 
 // ── Coin context lookup ───────────────────────────────────────────────────────
 
-async fn fetch_coin_symbol(pool: &PgPool, coin_id: &str) -> Result<Option<String>> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT symbol FROM tracked_coins WHERE coin_id = $1")
-            .bind(coin_id)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(|(s,)| s))
+/// Fetch the trading symbol and optional per-coin poll interval for a tracked coin.
+///
+/// `live_poll_interval` is returned as a PG INTERVAL cast to TEXT (e.g. `"00:05:00"`).
+/// Returns `None` when the coin is not found.
+async fn fetch_coin_context(
+    pool: &PgPool,
+    coin_id: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT symbol, live_poll_interval::TEXT FROM tracked_coins WHERE coin_id = $1",
+    )
+    .bind(coin_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
 }
 
 // ── Chain dispatch helpers ────────────────────────────────────────────────────
@@ -241,8 +249,9 @@ async fn chain_fetch_ohlc_local(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     days: u32,
+    interval_secs: i64,
 ) -> Result<Vec<OhlcCandle>, ProviderError> {
-    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days).await;
+    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs).await;
     result
 }
 
@@ -321,7 +330,7 @@ async fn dispatch_item(
         ("coin", "candles") => {
             let coin_id = &item.target_id;
 
-            let symbol = fetch_coin_symbol(pool, coin_id)
+            let (symbol, live_poll_interval) = fetch_coin_context(pool, coin_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("coin {coin_id} not found"))?;
@@ -350,9 +359,16 @@ async fn dispatch_item(
                 vs_currency: "usd".to_string(),
             };
 
+            // Candle granularity = per-coin poll interval (or global default).
+            let global_interval = crate::config::live_quote_poll_interval_secs();
+            let interval_secs = crate::config::effective_candle_interval_secs(
+                live_poll_interval.as_deref(),
+                global_interval,
+            );
+
             // REQ-OBS-012/015: instrument provider call with counter + duration histogram.
             let fetch_start = std::time::Instant::now();
-            let candles_result = chain_fetch_ohlc_local(chain, &mq, 7).await;
+            let candles_result = chain_fetch_ohlc_local(chain, &mq, 7, interval_secs).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if candles_result.is_ok() {
                 "success"
@@ -398,7 +414,7 @@ async fn dispatch_item(
         ("coin", "spot") => {
             let coin_id = &item.target_id;
 
-            let symbol = fetch_coin_symbol(pool, coin_id)
+            let (symbol, _) = fetch_coin_context(pool, coin_id)
                 .await
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("coin {coin_id} not found"))?;

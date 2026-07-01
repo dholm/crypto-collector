@@ -242,13 +242,21 @@ pub trait Provider: Send + Sync {
     /// Fetch a live spot quote for the given market.
     async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError>;
 
-    /// Fetch OHLC candles. `days` selects the lookback window.
+    /// Fetch OHLC candles. `days` selects the lookback window; `interval_secs` is the
+    /// desired candle granularity.
+    ///
+    /// Each provider snaps `interval_secs` to the nearest granularity it natively supports
+    /// and stores that string on every returned `OhlcCandle.interval`.
+    ///
+    /// CoinGecko note: granularity and lookback are coupled on the free tier — the snapped
+    /// granularity overrides the `days` band when they conflict.
     ///
     /// REQ-PROV-013: CoinGecko candles have `volume = None`.
     async fn fetch_ohlc(
         &self,
         market: &MarketQuery,
         days: u32,
+        interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError>;
 
     /// Fetch slowly-changing coin metadata (descriptions, links, supply cap).
@@ -344,10 +352,14 @@ pub fn build_chain(
 ///
 /// Records an `AttemptRecord` for each provider tried (REQ-PROV-006).
 /// Returns `Err` only when ALL providers fail (caller falls back to last-persisted data).
+///
+/// `interval_secs` is the desired candle granularity; each provider snaps it to the
+/// nearest supported interval (see `Provider::fetch_ohlc`).
 pub async fn chain_fetch_ohlc(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     days: u32,
+    interval_secs: i64,
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
     let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
@@ -362,7 +374,7 @@ pub async fn chain_fetch_ohlc(
             continue;
         }
 
-        match provider.fetch_ohlc(market, days).await {
+        match provider.fetch_ohlc(market, days, interval_secs).await {
             Ok(candles) => {
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
@@ -490,6 +502,7 @@ mod tests {
             &self,
             _m: &MarketQuery,
             _days: u32,
+            _interval_secs: i64,
         ) -> Result<Vec<OhlcCandle>, ProviderError> {
             Err(ProviderError::Http {
                 status: 500,
@@ -558,6 +571,7 @@ mod tests {
             &self,
             _m: &MarketQuery,
             _days: u32,
+            _interval_secs: i64,
         ) -> Result<Vec<OhlcCandle>, ProviderError> {
             Ok(self.candles.clone())
         }
@@ -624,7 +638,8 @@ mod tests {
         ];
 
         let market = stub_market();
-        let (result, records) = chain_fetch_ohlc(&chain, &market, 7).await;
+        // Use the global default interval (60 s) for stub tests.
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
 
         // Result: secondary's candles
         let candles = result.expect("should return secondary's candles");
@@ -645,7 +660,7 @@ mod tests {
         let chain: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysFailProvider), Arc::new(AlwaysFailProvider)];
         let market = stub_market();
-        let (result, records) = chain_fetch_ohlc(&chain, &market, 7).await;
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
 
         assert!(result.is_err(), "must return error when all providers fail");
         assert_eq!(records.len(), 2);
@@ -674,6 +689,7 @@ mod tests {
                 &self,
                 _m: &MarketQuery,
                 _d: u32,
+                _interval_secs: i64,
             ) -> Result<Vec<OhlcCandle>, ProviderError> {
                 Err(ProviderError::NotSupported(Capability::Ohlc))
             }
@@ -711,7 +727,7 @@ mod tests {
 
         let chain: Vec<Arc<dyn Provider>> = vec![Arc::new(UnsupportedProvider)];
         let market = stub_market();
-        let (_result, records) = chain_fetch_ohlc(&chain, &market, 7).await;
+        let (_result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
