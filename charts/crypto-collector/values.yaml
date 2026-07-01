@@ -92,9 +92,11 @@ coingecko:
     secretKey: "COINGECKO_API_KEY"
 
 # ── Provider chain (SPEC-PROV-001) ────────────────────────────────────────────
-# PROVIDERS env var: comma-separated fallback order (first name tried first).
+# Fallback order (first name tried first); joined into the PROVIDERS env var.
 # Valid names: coingecko, binance, coinbase, kraken.
-providers: "binance,coingecko"
+providers:
+  - binance
+  - coingecko
 
 # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
 # Inter-request cooldown in milliseconds between consecutive calls to each provider.

@@ -23,7 +23,7 @@ data:
   DB_NAME: {{ .Values.database.name | quote }}
 
   # ── Provider chain (SPEC-PROV-001) ───────────────────────────────────────────
-  PROVIDERS: {{ .Values.providers | quote }}
+  PROVIDERS: {{ join "," .Values.providers | quote }}
 
   # ── CoinGecko provider (SPEC-PROV-001) ────────────────────────────────────────
   COINGECKO_TIER: {{ .Values.coingecko.tier | quote }}
