@@ -237,7 +237,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Market+metadata refresh task: re-enqueues market and metadata collection for
+    // Periodic refresh task: re-enqueues market, metadata, and candle collection for
     // all active coins on a fixed cadence (METADATA_REFRESH_INTERVAL_SECS, default 1 h).
     // Runs immediately at startup so data is never stale after a rollout.
     {
@@ -249,7 +249,7 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        enqueue_market_metadata_refresh(&pool_refresh).await;
+                        enqueue_periodic_refresh(&pool_refresh).await;
                     }
                     _ = shutdown_refresh.changed() => break,
                 }
@@ -400,12 +400,18 @@ async fn refresh_tracked_gauges(pool: &sqlx::PgPool) {
     }
 }
 
-// ── Market + metadata periodic refresh ────────────────────────────────────────
+// ── Periodic refresh (market + metadata + candles) ────────────────────────────
 
-/// Enqueue `market` and `metadata` tasks for every active coin.
+/// Collection kinds re-enqueued for every active coin on each periodic refresh tick.
+///
+/// `candles` is included so OHLCV history keeps advancing: without it, candle jobs
+/// are only ever enqueued once at coin registration (`api::coins`) and never refresh.
+const REFRESH_KINDS: &[&str] = &["market", "metadata", "candles"];
+
+/// Enqueue periodic collection tasks (see [`REFRESH_KINDS`]) for every active coin.
 ///
 /// Uses `ON CONFLICT DO NOTHING` so concurrent or duplicate calls are safe.
-async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
+async fn enqueue_periodic_refresh(pool: &sqlx::PgPool) {
     let coin_ids: Vec<String> =
         match sqlx::query_scalar("SELECT coin_id FROM tracked_coins WHERE status = 'active'")
             .fetch_all(pool)
@@ -413,13 +419,13 @@ async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
         {
             Ok(ids) => ids,
             Err(e) => {
-                tracing::warn!(error = %e, "market/metadata refresh: failed to fetch active coins");
+                tracing::warn!(error = %e, "periodic refresh: failed to fetch active coins");
                 return;
             }
         };
 
     for coin_id in &coin_ids {
-        for kind in &["market", "metadata"] {
+        for kind in REFRESH_KINDS {
             if let Err(e) =
                 sqlx::query(crypto_collector::collectors::collection_queue::ENQUEUE_QUEUE_SQL)
                     .bind("coin")
@@ -428,7 +434,7 @@ async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
                     .execute(pool)
                     .await
             {
-                tracing::warn!(error = %e, coin_id, kind, "market/metadata refresh: enqueue failed");
+                tracing::warn!(error = %e, coin_id, kind, "periodic refresh: enqueue failed");
             }
         }
     }
@@ -436,7 +442,7 @@ async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
     if !coin_ids.is_empty() {
         tracing::info!(
             coins = coin_ids.len(),
-            "market/metadata refresh: enqueued for {} coin(s)",
+            "periodic refresh: enqueued for {} coin(s)",
             coin_ids.len()
         );
     }
@@ -447,6 +453,22 @@ async fn enqueue_market_metadata_refresh(pool: &sqlx::PgPool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Periodic refresh enqueues candles (regression: candles never refreshed) ─
+
+    #[test]
+    fn periodic_refresh_includes_candles() {
+        // Regression guard: the periodic refresh must re-enqueue candle collection.
+        // Before this, REFRESH_KINDS was ["market", "metadata"], so candle jobs were
+        // only ever created once at coin registration and OHLCV history went stale.
+        assert!(
+            REFRESH_KINDS.contains(&"candles"),
+            "periodic refresh must re-enqueue candles or OHLCV history never advances"
+        );
+        // The pre-existing kinds must remain covered.
+        assert!(REFRESH_KINDS.contains(&"market"));
+        assert!(REFRESH_KINDS.contains(&"metadata"));
+    }
 
     // ── Scenario 11: startup sequence SQL targets (REQ-OBS-013) ───────────────
 
