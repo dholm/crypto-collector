@@ -32,6 +32,24 @@ recomputation is [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (collection-queue w
 
 ## HISTORY
 
+- 2026-07-04 (v0.3.0): Replaced the v0.2.0 "repeat the reference cycle's shape onto the current
+  cycle's own anchor price" projection with Bitbo's "cycle-repeat" replay methodology
+  (REQ-CYCLE-060/061/062/063, superseding the v0.2.0 wording of REQ-CYCLE-060/061/062 below).
+  The old model anchored the projection on the reference cycle's halving-day price, which
+  produced a large discontinuity at the join (the projection did not start from today's real
+  price) and an unbounded overshoot (it replayed the reference cycle's full multiple with no
+  reference to the current cycle's actual trajectory). The new model instead replays the
+  ACTUAL trailing 1458-day (one halving-cycle, `CYCLE_DAYS`) daily-return series forward from
+  today, scaled by today's real price: `projected_price[today + k] = current_price *
+  (P[today - 1458 + k] / P[today - 1458])`. This is continuous at the join by construction (k=1
+  is one reference-day return away from `current_price`) and its magnitude reflects the current
+  cycle's own actual gains (diminishing returns are baked in, not modelled). Projected points
+  span up to 1458 days forward and may cross the (unknown) next halving; they are assigned
+  `cycle_number`/`days_since_halving` using a NEW projection-only extended halving list — the
+  four real halvings plus one ESTIMATED 2028-04-20 halving (block-height projection, not a
+  confirmed date) — that exists solely to place projected points on the correct side of that
+  future boundary. This extended list is entirely separate from `halving_dates()`/`assign_cycle`,
+  which are unchanged: real-data cycle 4 remains open-ended (REQ-CYCLE-012 preserved verbatim).
 - 2026-07-04 (v0.2.0): Added a forward-projected extension of the current (in-progress) cycle
   (REQ-CYCLE-060/061/062): repeats the last COMPLETED cycle's shape onto the current cycle out
   to the next halving, flagged `projected = true`. New `projected` column/field
@@ -288,27 +306,39 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   (SPEC-API-001 REQ-API-002/003), the system shall add this endpoint, its response schema (both
   baselines), and its operationId to that document and keep it in parity via the doc-parity test.
 
-### Forward-projected current cycle (v0.2.0)
+### Forward-projected current cycle — Bitbo cycle-repeat replay (v0.3.0, supersedes v0.2.0)
 
-- **REQ-CYCLE-060** (Ubiquitous): The system shall extend the current (highest-numbered,
-  in-progress) cycle with forward-projected points that repeat the last COMPLETED cycle's
-  shape — the highest cycle_number below the current cycle that has a successor halving date
-  and at least one real point — for each of that reference cycle's points whose
-  `days_since_halving` exceeds the current cycle's real maximum, up to the reference cycle's own
-  maximum `days_since_halving` (i.e. out to the next halving).
-- **REQ-CYCLE-061** (Ubiquitous): Each projected point shall carry `cycle_number` equal to the
-  current cycle, a real future `ts` (`current cycle's halving_date + days_since_halving days`), a
-  `price` computed as `current_cycle_anchor_price * reference_point.norm_halving` (`Decimal`,
-  never `f64` — REQ-CYCLE-024/REQ-PROV-012), the reference point's `norm_halving` and
-  `norm_cycle_low` values re-applied unchanged, and `projected = true`; real historical points
-  shall carry `projected = false`. Projected points shall sort after real current-cycle points
-  under the existing `(cycle_number, days_since_halving)` order (REQ-CYCLE-050/051) with no
-  change to the cursor/keyset contract.
-- **REQ-CYCLE-062** (Unwanted): If there is no completed reference cycle with real points, or the
-  current cycle has no real points at all, then the system shall emit zero projected points — this
-  is not an error (mirrors REQ-CYCLE-030/031). Projected points are provisional: they are
-  recomputed on every recompute tick and their span shrinks as the current cycle's real data grows
-  (same idempotent-rebuild contract as REQ-CYCLE-034/041).
+- **REQ-CYCLE-060** (Ubiquitous): The system shall extend the daily price series forward by
+  replaying the ACTUAL trailing `CYCLE_DAYS` (= 1458, one halving cycle) daily-return window,
+  scaled by today's real price: for `k = 1..=CYCLE_DAYS`, `projected_price[today + k] =
+  current_price * (P[today - CYCLE_DAYS + k] / P[today - CYCLE_DAYS])`, where `today` is the
+  latest date with a real daily candle, `current_price = P[today]`, and `P` is the same daily
+  `(date, close)` series used by `compute_overlay` (last-observation-carried-forward across any
+  gaps in the reference window). This replaces the v0.2.0 model of repeating the last completed
+  cycle's shape anchored on that cycle's own halving-day price.
+- **REQ-CYCLE-061** (Ubiquitous): Each projected point shall carry a real future `ts` (`today +
+  k` days), the computed `price` (`Decimal`, never `f64` — REQ-CYCLE-024/REQ-PROV-012),
+  `halving_baseline_approximate = true` (a projection, and any cycle-5 halving date it is keyed
+  against is itself an estimate — REQ-CYCLE-063), and `projected = true`; real historical points
+  continue to carry `projected = false`. `norm_halving` and `norm_cycle_low` are computed against
+  each projected point's own assigned cycle: the anchor/low for a cycle that also has real points
+  reuses that cycle's real halving-day anchor and folds real prices into the cycle low; a fully
+  projected future cycle anchors and lows against its own projected points only. Projected points
+  shall sort after real points under the existing `(cycle_number, days_since_halving)` order
+  (REQ-CYCLE-050/051) with no change to the cursor/keyset contract.
+- **REQ-CYCLE-062** (Unwanted): If fewer than `CYCLE_DAYS` days of daily history are available
+  (i.e. `today - CYCLE_DAYS` predates the earliest stored daily candle), then the system shall
+  emit zero projected points — this is not an error (mirrors REQ-CYCLE-030/031). Projected points
+  are provisional: they are recomputed on every recompute tick and their reference window shifts
+  forward as new real data arrives (same idempotent-rebuild contract as REQ-CYCLE-034/041).
+- **REQ-CYCLE-063** (Ubiquitous): Because the `CYCLE_DAYS`-day projection horizon can cross the
+  next (unknown) halving, the system shall assign each projected point's `cycle_number` /
+  `days_since_halving` using a projection-only extended halving-date list: the four compiled-in
+  real halving dates (REQ-CYCLE-010) plus one ESTIMATED next halving (`2028-04-20`, a
+  block-height projection, clearly marked as an estimate in code) used solely to place projected
+  points on the correct side of that future boundary. This extended list is entirely separate
+  from `halving_dates()`/`assign_cycle`, which remain unchanged for real data — cycle 4 stays
+  open-ended for real points regardless of the projection (REQ-CYCLE-012 preserved verbatim).
 
 ## Exclusions (What NOT to Build)
 

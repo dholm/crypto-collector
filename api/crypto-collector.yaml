@@ -786,7 +786,12 @@ components:
         cycle_number:
           type: integer
           format: int32
-          description: 1 = 2012-11-28 halving, 2 = 2016-07-09, 3 = 2020-05-11, 4 = 2024-04-20 (open-ended)
+          description: >
+            1 = 2012-11-28 halving, 2 = 2016-07-09, 3 = 2020-05-11, 4 = 2024-04-20 (open-ended
+            for real data, REQ-CYCLE-012). Projected points (see `projected`) MAY carry
+            cycle_number 5, assigned against an ESTIMATED 2028-04-20 halving used only to
+            place projected points on the correct side of that future boundary
+            (REQ-CYCLE-063); this never affects real-data cycle 4.
         halving_date:
           type: string
           format: date
@@ -815,10 +820,14 @@ components:
         projected:
           type: boolean
           description: >
-            true when this point is a forward projection of the last completed cycle's shape
-            onto the current cycle, out to the next halving, rather than a real observed daily
-            candle (REQ-CYCLE-060). Projected points are provisional and recomputed on every
-            recompute tick.
+            true when this point is a forward "cycle-repeat" projection rather than a real
+            observed daily candle (REQ-CYCLE-060/063): the price replays the actual daily
+            returns of the trailing 1458-day (one halving-cycle) reference window forward from
+            today, scaled by today's real price, so the projection is continuous with the last
+            real point and reflects the current cycle's actual magnitude (no teleport to a
+            reference cycle's halving price). Projected points span up to 1458 days forward,
+            may cross into a projected cycle 5 (estimated 2028-04-20 halving), and are
+            provisional — recomputed and shrinking as real data grows on every recompute tick.
 
     CycleOverlayPointPage:
       allOf:
