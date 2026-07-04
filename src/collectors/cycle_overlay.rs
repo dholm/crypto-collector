@@ -8,7 +8,7 @@
 //!   (REQ-CYCLE-041/042).
 
 use anyhow::Result;
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
@@ -234,17 +234,57 @@ pub async fn recompute_cycle_overlay(
     Ok(())
 }
 
-/// Derive a `1d` `(date, close)` series from the largest stored divisor interval, reusing
-/// the SPEC-API-003 read-time aggregation (OR-CYCLE-4).
+/// Select the 1d-divisor interval with the widest historical coverage as the daily source.
+///
+/// Unlike SPEC-API-003's `select_source_interval` (which picks the *coarsest* divisor to
+/// minimise aggregation work), the overlay needs the *deepest* history: a coin may store a
+/// coarse interval (e.g. `4h`) that only covers recent live data alongside a finer interval
+/// (e.g. `5m`) backfilled across years. Picking the coarsest would silently truncate the
+/// overlay to the recent window. We therefore rank candidates by coverage span (widest
+/// first), breaking ties toward the coarser interval for aggregation efficiency.
+///
+/// `candidates` are `(interval, coverage_secs)` pairs where `coverage_secs = max(ts) - min(ts)`.
+///
+// @MX:NOTE: [AUTO] overlay daily source = widest-coverage 1d-divisor, NOT the coarsest.
+// @MX:REASON: heterogeneous per-interval coverage (finer=backfilled deep history, coarser=recent
+//             live only) means "coarsest divisor" can drop years of data. Widest span reaches
+//             back furthest; coarser breaks ties only among equally-covering intervals.
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-041 OR-CYCLE-4
+fn select_widest_source_interval<'a>(
+    candidates: &[(&'a str, i64)],
+    target_secs: i64,
+) -> Option<&'a str> {
+    use crate::api::candles_agg::interval_to_seconds;
+    candidates
+        .iter()
+        .filter_map(|&(name, coverage_secs)| {
+            let secs = interval_to_seconds(name)?;
+            // Must be a strictly-finer interval that tiles 1d evenly (same divisor rule).
+            if secs < target_secs && target_secs % secs == 0 {
+                Some((coverage_secs, secs, name))
+            } else {
+                None
+            }
+        })
+        // Widest coverage first; tie-break toward the coarser interval (larger secs).
+        .max_by_key(|&(coverage_secs, secs, _)| (coverage_secs, secs))
+        .map(|(_, _, name)| name)
+}
+
+/// Derive a `1d` `(date, close)` series from the widest-coverage stored divisor interval,
+/// reusing the SPEC-API-003 read-time aggregation (OR-CYCLE-4).
 async fn aggregate_daily_from_finer(
     pool: &PgPool,
     coin_id: &str,
     vs_currency: &str,
 ) -> Result<Vec<(NaiveDate, Decimal)>> {
-    use crate::api::candles_agg::{aggregate_candles, interval_to_seconds, select_source_interval};
+    use crate::api::candles_agg::{aggregate_candles, interval_to_seconds};
 
-    let stored_intervals: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT interval FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2",
+    // Per-interval coverage span, so we can prefer the interval that reaches furthest back
+    // rather than the coarsest one (which may only hold recent live data).
+    let stored: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT interval, min(ts), max(ts) FROM coin_candles \
+         WHERE coin_id = $1 AND vs_currency = $2 GROUP BY interval",
     )
     .bind(coin_id)
     .bind(vs_currency)
@@ -252,9 +292,12 @@ async fn aggregate_daily_from_finer(
     .await?;
 
     let target_secs = interval_to_seconds("1d").expect("1d always has a known second count");
-    let stored_refs: Vec<&str> = stored_intervals.iter().map(String::as_str).collect();
+    let candidates: Vec<(&str, i64)> = stored
+        .iter()
+        .map(|(interval, min_ts, max_ts)| (interval.as_str(), (*max_ts - *min_ts).num_seconds()))
+        .collect();
 
-    let Some(source_interval) = select_source_interval(&stored_refs, target_secs) else {
+    let Some(source_interval) = select_widest_source_interval(&candidates, target_secs) else {
         // OR-CYCLE-4 / REQ-CYCLE-030/031: no derivable 1d source → zero points, not an error.
         return Ok(vec![]);
     };
@@ -515,5 +558,49 @@ mod tests {
         let _price: Decimal = points[0].price;
         let _nh: Decimal = points[0].norm_halving;
         let _ncl: Decimal = points[0].norm_cycle_low;
+    }
+
+    // ── select_widest_source_interval: overlay daily-source selection ─────────────
+
+    const DAY: i64 = 86_400;
+
+    // Reproduction (OR-CYCLE-4 regression): a coarse interval (4h) holding only recent live
+    // data must NOT be preferred over a fine interval (5m) that spans years of backfill.
+    // The old SPEC-API-003 `select_source_interval` (coarsest divisor) would pick 4h and
+    // truncate the overlay to ~1 month; the overlay-specific selector must pick 5m.
+    #[test]
+    fn widest_source_prefers_deep_5m_over_recent_4h() {
+        let candidates = [
+            ("4h", 28 * DAY),   // ~1 month recent
+            ("5m", 3244 * DAY), // ~9 years backfilled
+            ("1m", 2 * DAY),    // 2 days recent
+        ];
+        assert_eq!(select_widest_source_interval(&candidates, DAY), Some("5m"));
+        // Document the bug being fixed: the coarsest-divisor selector picks 4h.
+        let names: Vec<&str> = candidates.iter().map(|&(n, _)| n).collect();
+        assert_eq!(
+            crate::api::candles_agg::select_source_interval(&names, DAY),
+            Some("4h"),
+            "old coarsest-divisor selector picks the recent-only 4h — the bug this fixes"
+        );
+    }
+
+    #[test]
+    fn widest_source_breaks_ties_toward_coarser_interval() {
+        // Equal coverage → prefer the coarser interval (fewer rows to aggregate).
+        let candidates = [("5m", 100 * DAY), ("1h", 100 * DAY)];
+        assert_eq!(select_widest_source_interval(&candidates, DAY), Some("1h"));
+    }
+
+    #[test]
+    fn widest_source_ignores_non_divisor_and_too_coarse_intervals() {
+        // `1d` is not strictly finer than target; a non-tiling interval is excluded.
+        let candidates = [("1d", 999 * DAY), ("4h", 10 * DAY)];
+        assert_eq!(select_widest_source_interval(&candidates, DAY), Some("4h"));
+        assert_eq!(
+            select_widest_source_interval(&[], DAY),
+            None,
+            "no candidates → no source"
+        );
     }
 }
