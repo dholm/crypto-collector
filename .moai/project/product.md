@@ -38,6 +38,10 @@ Enable real-time and historical cryptocurrency market data consumption across th
 - Market valuation: market capitalization, fully-diluted valuation (FDV), price-to-FDV ratio.
 - On-chain presence: contract addresses (if applicable), blockchain references.
 
+### 4. Derived Analytics
+- **Bitcoin halving-cycle overlay**: Materialised daily price points normalized against Bitcoin halving cycles. Each point stores the raw daily price and two normalization baselines — one anchored to the halving day (halving day = 1.0) and one anchored to the cycle low (cycle low = 1.0). Both series are plotted against `days_since_halving` to reproduce the shape of Bitbo's "Cycle Repeat" chart entirely from local persisted candles, with no external data source or scraping.
+- Recomputed on the periodic collector tick from the persisted `1d` (daily) OHLCV history in `coin_candles`. Keyset-paginated read route at `GET /v1/coins/{coin_id}/cycle-overlay` with optional `?cycle=N` and `?vs_currency` filters. Known halving dates treated as block-derived constants; future halvings extend the model via code updates.
+
 ## Out of Scope (Explicit Non-Goals)
 
 The following are explicitly **not** in scope and are reserved for future work or external systems:

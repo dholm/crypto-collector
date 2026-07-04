@@ -56,6 +56,7 @@ api (axum 0.8, /v1 REST routes) + health (8081) + metrics (9000)
 | SPEC-SCHED-001 | Collectors: live_poller, collection_queue, backfill |
 | SPEC-API-001 | REST API server, /v1 router, OpenAPI v3.1 |
 | SPEC-OBS-001 | Observability: health, Prometheus, OTel, graceful shutdown |
+| SPEC-CYCLE-001 | Derived analytics: Bitcoin halving-cycle overlay |
 
 ### Build & Test Commands
 
