@@ -31,6 +31,13 @@ use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderEr
 /// idempotency key on `backfill_jobs`.
 pub const STARTUP_BACKFILL_DATASET: &str = "candles";
 
+/// Empty-page forward-skip step size, expressed as a candle count and multiplied by
+/// the chunk's `interval_secs` to get the skip span (REQ-SCHED-024/025/026,
+/// see [`next_cursor_for_page`]). 1000 matches Binance's OHLC page cap — the largest
+/// page size among supported providers — so a single skip conservatively covers what
+/// one provider page could have returned.
+const EMPTY_PAGE_SKIP_CANDLES: i64 = 1000;
+
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
 
 /// Determine the resume start for a backfill chunk (REQ-SCHED-024/025).
@@ -76,6 +83,51 @@ pub fn should_use_range_path(
     range_end: Option<DateTime<Utc>>,
 ) -> bool {
     start.is_some() && range_end.is_some()
+}
+
+/// Compute the next durable cursor and completion decision for one processed
+/// backfill chunk page (REQ-SCHED-024/025/026).
+///
+/// - Non-empty page (`max_ts` is `Some`): advance the cursor to `max_ts`; the chunk
+///   is done iff `max_ts >= range_end` (or `range_end` is `None`, e.g. legacy
+///   whole-dataset chunks). Unchanged from prior behavior.
+/// - Empty page (`max_ts` is `None`) **on the range path** (`resume_start` and
+///   `range_end` both known — mirrors [`should_use_range_path`]): a single empty or
+///   fully-filtered page must NOT end a multi-year backfill (a data gap, provider
+///   hiccup, or an out-of-window page is not "no more data"). Instead advance the
+///   cursor forward by `page_span_secs`, capped at `range_end`, so the walk makes
+///   guaranteed forward progress and terminates once the advanced cursor reaches
+///   `range_end`.
+/// - Empty page off the range path (either bound unknown, e.g. legacy whole-dataset
+///   chunks): unchanged — complete with no cursor advance.
+///
+// @MX:NOTE: [AUTO] next_cursor_for_page — empty-page-forward-skip invariant
+//   A single empty RANGE-path page must advance the cursor by page_span_secs
+//   (capped at range_end) and stay pending, never silently completing the chunk.
+//   This guarantees termination (cursor is strictly monotonic and bounded by
+//   range_end) while preventing gaps/hiccups from truncating a historical backfill.
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-024 REQ-SCHED-025 REQ-SCHED-026
+pub fn next_cursor_for_page(
+    resume_start: Option<DateTime<Utc>>,
+    range_end: Option<DateTime<Utc>>,
+    max_ts: Option<DateTime<Utc>>,
+    page_span_secs: i64,
+) -> (Option<DateTime<Utc>>, bool) {
+    match max_ts {
+        Some(ts) => {
+            let done = range_end.is_none_or(|end| ts >= end);
+            (Some(ts), done)
+        }
+        None => match (resume_start, range_end) {
+            (Some(start), Some(end)) => {
+                let advanced = (start + chrono::Duration::seconds(page_span_secs.max(1))).min(end);
+                let done = advanced >= end;
+                (Some(advanced), done)
+            }
+            // Legacy / whole-dataset path: unchanged — complete, no cursor advance.
+            _ => (None, true),
+        },
+    }
 }
 
 // ── SQL constants ─────────────────────────────────────────────────────────────
@@ -410,12 +462,15 @@ fn first_range_provider(chain: &[Arc<dyn Provider>]) -> Option<String> {
 
 /// Process one claimed backfill chunk to completion (or failure).
 ///
-/// Returns the max candle timestamp on success (for cursor advance), or an error string.
+/// Returns `(max_ts, interval_secs)` on success: `max_ts` is the max candle timestamp
+/// persisted this page (`None` when the page was empty); `interval_secs` is the
+/// candle granularity used, which the caller needs to compute the empty-page
+/// forward-skip span (see [`next_cursor_for_page`]).
 async fn process_chunk(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     chunk: &ClaimedChunk,
-) -> Result<Option<DateTime<Utc>>, String> {
+) -> Result<(Option<DateTime<Utc>>, i64), String> {
     // Look up coin's trading symbol and per-coin poll interval from tracked_coins.
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT symbol, live_poll_interval::TEXT FROM tracked_coins WHERE coin_id = $1",
@@ -480,7 +535,7 @@ async fn process_chunk(
     };
 
     if candles.is_empty() {
-        return Ok(None);
+        return Ok((None, interval_secs));
     }
 
     // Filter to range (provider may return slightly outside bounds).
@@ -515,7 +570,7 @@ async fn process_chunk(
 
     // Return the max timestamp for cursor advancement.
     let max_ts = filtered.iter().map(|c| c.ts).max();
-    Ok(max_ts)
+    Ok((max_ts, interval_secs))
 }
 
 /// Run the backfill worker loop (REQ-SCHED-020/050/051).
@@ -583,18 +638,29 @@ pub async fn run_backfill_worker(
         hb_handle.abort();
 
         match result {
-            Ok(Some(max_ts)) => {
-                // Advance cursor (REQ-SCHED-024).
-                if let Err(e) = advance_cursor(&pool, chunk.id, &claimed_by, max_ts).await {
-                    error!(
-                        "backfill_worker: cursor advance error for chunk {}: {e}",
-                        chunk.id
-                    );
+            Ok((max_ts, interval_secs)) => {
+                // Empty-page forward-skip span: a fixed step tied to the candle
+                // interval and the largest provider page cap (Binance: 1000 candles
+                // per page) guarantees forward progress and termination even when a
+                // single page is empty or fully filtered out of range (REQ-SCHED-024/025/026).
+                let page_span_secs = interval_secs.max(1) * EMPTY_PAGE_SKIP_CANDLES;
+
+                let start = resume_start(chunk.cursor, chunk.range_start);
+                let (next_cursor, done) =
+                    next_cursor_for_page(start, chunk.range_end, max_ts, page_span_secs);
+
+                if let Some(cursor) = next_cursor {
+                    // Advance cursor (REQ-SCHED-024). Also covers the empty-page
+                    // forward-skip: the computed cursor still durably records progress.
+                    if let Err(e) = advance_cursor(&pool, chunk.id, &claimed_by, cursor).await {
+                        error!(
+                            "backfill_worker: cursor advance error for chunk {}: {e}",
+                            chunk.id
+                        );
+                    }
                 }
 
-                // Mark done if range is exhausted (REQ-SCHED-026).
-                let exhausted = chunk.range_end.is_none_or(|end| max_ts >= end);
-                if exhausted {
+                if done {
                     if let Err(e) = complete_backfill_chunk(&pool, chunk.id, &claimed_by).await {
                         error!(
                             "backfill_worker: complete error for chunk {}: {e}",
@@ -603,7 +669,11 @@ pub async fn run_backfill_worker(
                     }
                     info!("backfill_worker: chunk {} done", chunk.id);
                 } else {
-                    // More data in range: release for next cycle (re-claim will resume from cursor).
+                    // More data in range (or an empty page was skipped forward):
+                    // release for next cycle. Uses i32::MAX for max_attempts so a
+                    // partial release / forward-skip is never counted as a failure
+                    // toward the chunk's retry/fail limit (matches the non-empty
+                    // partial-release path below).
                     if let Err(e) = fail_or_retry_backfill_chunk(
                         &pool,
                         chunk.id,
@@ -619,17 +689,6 @@ pub async fn run_backfill_worker(
                         );
                     }
                 }
-            }
-            Ok(None) => {
-                // No candles returned (empty range or provider returned nothing).
-                // Treat as done — the chunk's range simply has no data.
-                if let Err(e) = complete_backfill_chunk(&pool, chunk.id, &claimed_by).await {
-                    error!(
-                        "backfill_worker: complete (empty) error for chunk {}: {e}",
-                        chunk.id
-                    );
-                }
-                info!("backfill_worker: chunk {} done (empty range)", chunk.id);
             }
             Err(e) => {
                 warn!(
@@ -739,6 +798,71 @@ mod tests {
         let t = ts(2026, 1, 1, 0, 0);
         let days = range_to_days(Some(t), Some(t), 90);
         assert_eq!(days, 1);
+    }
+
+    // ── next_cursor_for_page: empty-page-forward-skip invariant ──────────────
+
+    #[test]
+    fn next_cursor_empty_page_advances_forward_when_below_range_end() {
+        let start = ts(2016, 1, 1, 0, 0);
+        let end = ts(2026, 1, 1, 0, 0); // far in the future — well beyond one skip
+        let page_span_secs = 60 * 1000; // 1m candles, 1000-candle page
+        let (next, done) = next_cursor_for_page(Some(start), Some(end), None, page_span_secs);
+        assert_eq!(
+            next,
+            Some(start + chrono::Duration::seconds(page_span_secs))
+        );
+        assert!(!done, "must not complete on a mid-range empty page");
+    }
+
+    #[test]
+    fn next_cursor_empty_page_completes_when_advanced_cursor_reaches_range_end() {
+        let start = ts(2026, 1, 1, 0, 0);
+        let end = ts(2026, 1, 1, 0, 10); // 10 minutes away — closer than one full skip
+        let page_span_secs = 60 * 1000; // would overshoot range_end
+        let (next, done) = next_cursor_for_page(Some(start), Some(end), None, page_span_secs);
+        assert_eq!(next, Some(end), "advance must be capped at range_end");
+        assert!(
+            done,
+            "must complete once the advanced cursor reaches range_end"
+        );
+    }
+
+    #[test]
+    fn next_cursor_nonempty_page_partial_when_below_range_end() {
+        let start = ts(2026, 1, 1, 0, 0);
+        let end = ts(2026, 1, 8, 0, 0);
+        let max_ts = ts(2026, 1, 3, 0, 0); // below range_end
+        let (next, done) = next_cursor_for_page(Some(start), Some(end), Some(max_ts), 60_000);
+        assert_eq!(next, Some(max_ts), "cursor advances to max_ts, unchanged");
+        assert!(!done, "must partial-release when max_ts < range_end");
+    }
+
+    #[test]
+    fn next_cursor_nonempty_page_done_when_at_or_past_range_end() {
+        let start = ts(2026, 1, 1, 0, 0);
+        let end = ts(2026, 1, 8, 0, 0);
+        let max_ts = ts(2026, 1, 8, 0, 0); // == range_end
+        let (next, done) = next_cursor_for_page(Some(start), Some(end), Some(max_ts), 60_000);
+        assert_eq!(next, Some(max_ts));
+        assert!(done, "must complete when max_ts >= range_end");
+    }
+
+    #[test]
+    fn next_cursor_legacy_empty_page_completes_without_cursor_advance() {
+        // Legacy whole-dataset chunk: neither bound known — behavior unchanged.
+        let (next, done) = next_cursor_for_page(None, None, None, 60_000);
+        assert_eq!(next, None, "legacy empty path must not synthesize a cursor");
+        assert!(done, "legacy empty path completes immediately, as before");
+    }
+
+    #[test]
+    fn next_cursor_legacy_empty_page_missing_range_end_completes_unchanged() {
+        // Only resume_start known (range_end missing) — not on the range path.
+        let start = ts(2026, 1, 1, 0, 0);
+        let (next, done) = next_cursor_for_page(Some(start), None, None, 60_000);
+        assert_eq!(next, None);
+        assert!(done);
     }
 
     // ── should_use_range_path: worker range-path selection (pure logic) ───────
