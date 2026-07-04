@@ -13,8 +13,6 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 
-use crate::models::quote::CoinCandle;
-
 // ── Halving-date constants (D6) ────────────────────────────────────────────────
 
 /// Compiled-in halving dates (block-derived, approximate; D6, REQ-CYCLE-010).
@@ -278,7 +276,7 @@ async fn aggregate_daily_from_finer(
     coin_id: &str,
     vs_currency: &str,
 ) -> Result<Vec<(NaiveDate, Decimal)>> {
-    use crate::api::candles_agg::{aggregate_candles, interval_to_seconds};
+    use crate::api::candles_agg::interval_to_seconds;
 
     // Per-interval coverage span, so we can prefer the interval that reaches furthest back
     // rather than the coarsest one (which may only hold recent live data).
@@ -303,14 +301,23 @@ async fn aggregate_daily_from_finer(
     };
     let source_interval = source_interval.to_string();
 
-    let source_secs = interval_to_seconds(&source_interval)
-        .expect("source interval selected from interval_to_seconds must have a known second count");
-
-    let source_rows: Vec<CoinCandle> = sqlx::query_as(
-        "SELECT coin_id, vs_currency, interval, ts, open, high, low, close, volume, source \
+    // Aggregate to a daily `(date, close)` series IN SQL. A multi-year finer series (e.g. 5m
+    // over 9 years ≈ 1M rows) must never be materialised in the app — doing so OOM-kills the
+    // 256Mi pod. `DISTINCT ON (day) ... ORDER BY day, ts DESC` returns one row per UTC day
+    // whose `close` is the last intraday candle's close — the same "last value in bucket"
+    // daily-close semantics as SPEC-API-003 aggregation, at ~one row per day instead of ~1M.
+    //
+    // @MX:WARN: [AUTO] SQL-side daily aggregation — do NOT revert to fetch_all of the finer
+    //           series; a deep backfill makes that OOM the pod (256Mi limit).
+    // @MX:REASON: aggregate_daily_from_finer previously loaded every source candle; with the
+    //             widest-coverage interval that is the full multi-year 5m history.
+    // @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-041 OR-CYCLE-4
+    let daily: Vec<(NaiveDate, Decimal)> = sqlx::query_as(
+        "SELECT DISTINCT ON ((ts AT TIME ZONE 'UTC')::date) \
+                (ts AT TIME ZONE 'UTC')::date, close \
          FROM coin_candles \
          WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 \
-         ORDER BY ts ASC",
+         ORDER BY (ts AT TIME ZONE 'UTC')::date, ts DESC",
     )
     .bind(coin_id)
     .bind(vs_currency)
@@ -318,20 +325,7 @@ async fn aggregate_daily_from_finer(
     .fetch_all(pool)
     .await?;
 
-    let now = Utc::now();
-    let agg = aggregate_candles(
-        source_rows,
-        target_secs,
-        source_secs,
-        now,
-        &source_interval,
-        "1d",
-    );
-
-    Ok(agg
-        .into_iter()
-        .map(|c| (c.ts.date_naive(), c.close))
-        .collect())
+    Ok(daily)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
