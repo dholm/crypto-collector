@@ -7,7 +7,7 @@
 
 db:
   # [System] Enabled when /moai db init has run. Default false until user opts in.
-  enabled: false
+  enabled: true
 
   # [System] Documentation folder (relative to project root)
   dir: ".moai/project/db"
@@ -32,13 +32,13 @@ db:
     - "sql/migrations/**/*.sql"
 
   # [System] Primary database engine (set during /moai db init interview)
-  engine: "_TBD_"
+  engine: "PostgreSQL"
 
   # [Interview] ORM/ODM (set during /moai db init interview)
-  orm: "_TBD_"
+  orm: "sqlx"
 
   # [Interview] Multi-tenant strategy (set during /moai db init interview)
   multi_tenant: "none"
 
   # [Interview] Migration tool (set during /moai db init interview)
-  migration_tool: "_TBD_"
+  migration_tool: "sqlx migrate"

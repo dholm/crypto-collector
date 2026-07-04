@@ -1,0 +1,139 @@
+erDiagram
+    tracked_coins {
+        TEXT coin_id PK
+        TEXT symbol
+        TEXT name
+        TEXT status
+        TIMESTAMPTZ registered_at
+        TIMESTAMPTZ last_collected_at
+        TEXT error
+        INTERVAL live_poll_interval
+        TIMESTAMPTZ last_polled_at
+        TIMESTAMPTZ live_poll_claimed_until
+    }
+
+    coin_quotes {
+        TEXT coin_id FK
+        TEXT vs_currency PK
+        TIMESTAMPTZ ts PK
+        NUMERIC price
+        TEXT source
+    }
+
+    coin_candles {
+        TEXT coin_id FK
+        TEXT vs_currency PK
+        TEXT interval PK
+        TIMESTAMPTZ ts PK
+        NUMERIC open
+        NUMERIC high
+        NUMERIC low
+        NUMERIC close
+        NUMERIC volume
+        TEXT source
+    }
+
+    coin_market_snapshots {
+        TEXT coin_id FK
+        TEXT vs_currency PK
+        TIMESTAMPTZ ts PK
+        NUMERIC price
+        NUMERIC market_cap
+        NUMERIC fully_diluted_valuation
+        NUMERIC circulating_supply
+        NUMERIC total_supply
+        NUMERIC volume_24h
+        TEXT source
+    }
+
+    coin_metadata {
+        TEXT coin_id FK
+        INTEGER revision PK
+        TEXT name
+        TEXT symbol
+        TEXT_ARRAY categories
+        TEXT description
+        TEXT homepage
+        JSONB links
+        JSONB contract_addresses
+        NUMERIC max_supply
+        DATE genesis_date
+        TIMESTAMPTZ first_seen_at
+        TIMESTAMPTZ last_seen_at
+    }
+
+    collection_queue {
+        BIGSERIAL id PK
+        TEXT target_kind
+        TEXT target_id
+        TEXT kind
+        TEXT status
+        TEXT claimed_by
+        TIMESTAMPTZ lease_expires_at
+        TIMESTAMPTZ heartbeat_at
+        INTEGER attempts
+        TEXT last_error
+        TIMESTAMPTZ enqueued_at
+        TIMESTAMPTZ updated_at
+    }
+
+    backfill_jobs {
+        BIGSERIAL id PK
+        TEXT coin_id FK
+        TEXT dataset
+        TEXT status
+        TIMESTAMPTZ requested_at
+        TIMESTAMPTZ updated_at
+    }
+
+    backfill_chunks {
+        BIGSERIAL id PK
+        BIGINT job_id FK
+        TEXT coin_id
+        TEXT dataset
+        TEXT interval
+        TIMESTAMPTZ range_start
+        TIMESTAMPTZ range_end
+        TIMESTAMPTZ cursor
+        TEXT status
+        TEXT claimed_by
+        TIMESTAMPTZ lease_expires_at
+        TIMESTAMPTZ heartbeat_at
+        INTEGER attempts
+        TEXT last_error
+        TIMESTAMPTZ created_at
+        TIMESTAMPTZ updated_at
+    }
+
+    upstream_request_pacer {
+        TEXT provider PK
+        TIMESTAMPTZ next_allowed_at
+        INTEGER min_gap_ms
+        TIMESTAMPTZ cooldown_until
+        TIMESTAMPTZ credit_window_start
+        BIGINT credits_used
+        BIGINT credit_limit
+        TIMESTAMPTZ updated_at
+    }
+
+    cycle_overlay_points {
+        TEXT coin_id PK
+        TEXT vs_currency PK
+        INTEGER cycle_number PK
+        DATE halving_date
+        INTEGER days_since_halving PK
+        DATE ts
+        NUMERIC price
+        NUMERIC norm_halving
+        NUMERIC norm_cycle_low
+        BOOLEAN halving_baseline_approximate
+        TIMESTAMPTZ updated_at
+        BOOLEAN projected
+    }
+
+    tracked_coins ||--o{ coin_quotes : "has (ON DELETE CASCADE)"
+    tracked_coins ||--o{ coin_candles : "has (ON DELETE CASCADE)"
+    tracked_coins ||--o{ coin_market_snapshots : "has (ON DELETE CASCADE)"
+    tracked_coins ||--o{ coin_metadata : "has (ON DELETE CASCADE)"
+    tracked_coins ||--o{ backfill_jobs : "has (ON DELETE CASCADE)"
+    backfill_jobs ||--o{ backfill_chunks : "fans out into (ON DELETE CASCADE)"
