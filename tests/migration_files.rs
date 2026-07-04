@@ -9,7 +9,7 @@ use std::path::Path;
 // ── Milestone 1: migration file presence and naming ──────────────────────────
 
 #[test]
-fn all_thirteen_migration_files_exist() {
+fn all_fourteen_migration_files_exist() {
     let expected = [
         "migrations/0001_registries.sql",
         "migrations/0002_live_quotes.sql",
@@ -24,6 +24,7 @@ fn all_thirteen_migration_files_exist() {
         "migrations/0011_remove_markets.sql",
         "migrations/0012_coin_backfill.sql",
         "migrations/0013_cycle_overlay.sql",
+        "migrations/0014_collection_queue_cycle_overlay_kind.sql",
     ];
     for path in &expected {
         assert!(
@@ -373,6 +374,24 @@ fn cycle_overlay_migration_has_required_columns() {
     assert!(
         lower.contains("primary key (coin_id, vs_currency, cycle_number, days_since_halving)"),
         "0013_cycle_overlay.sql must PK on (coin_id, vs_currency, cycle_number, days_since_halving) (REQ-CYCLE-040)"
+    );
+}
+
+/// REQ-CYCLE-041: the collection_queue kind check constraint must permit 'cycle_overlay',
+/// otherwise the periodic recompute enqueue is rejected by the database and the overlay is
+/// never rebuilt.
+#[test]
+fn collection_queue_kind_check_permits_cycle_overlay() {
+    let content = fs::read_to_string("migrations/0014_collection_queue_cycle_overlay_kind.sql")
+        .expect("0014_collection_queue_cycle_overlay_kind.sql must exist")
+        .to_lowercase();
+    assert!(
+        content.contains("cycle_overlay"),
+        "0014 must add 'cycle_overlay' to the collection_queue kind check (REQ-CYCLE-041)"
+    );
+    assert!(
+        content.contains("collection_queue_kind_check"),
+        "0014 must target the collection_queue_kind_check constraint (REQ-CYCLE-041)"
     );
 }
 
