@@ -321,6 +321,24 @@ pub fn metadata_refresh_interval_secs() -> u64 {
     parse_env_u64("METADATA_REFRESH_INTERVAL_SECS", 3_600)
 }
 
+// ── SPEC-CYCLE-001 halving-cycle overlay configuration (REQ-CYCLE-043) ────────
+
+/// Target coin for the Bitcoin halving-cycle overlay.
+///
+/// Env var: `CYCLE_OVERLAY_COIN_ID`. Default: `"bitcoin"`.
+pub fn cycle_overlay_coin_id() -> String {
+    std::env::var("CYCLE_OVERLAY_COIN_ID").unwrap_or_else(|_| "bitcoin".to_string())
+}
+
+/// Quote currency for the halving-cycle overlay's daily price basis.
+///
+/// Env var: `CYCLE_OVERLAY_VS_CURRENCY`. Default: `"usd"`.
+pub fn cycle_overlay_vs_currency() -> String {
+    std::env::var("CYCLE_OVERLAY_VS_CURRENCY")
+        .unwrap_or_else(|_| "usd".to_string())
+        .to_lowercase()
+}
+
 // ── Internal env-var helpers ──────────────────────────────────────────────────
 
 fn parse_env_u16(name: &str, default: u16) -> u16 {
@@ -480,6 +498,22 @@ mod tests {
     fn metadata_refresh_interval_default() {
         if std::env::var("METADATA_REFRESH_INTERVAL_SECS").is_err() {
             assert_eq!(metadata_refresh_interval_secs(), 3_600);
+        }
+    }
+
+    // ── Scenario 13 (REQ-CYCLE-043): cycle-overlay env-var-only defaults ──────
+
+    #[test]
+    fn cycle_overlay_coin_id_defaults_to_bitcoin() {
+        if std::env::var("CYCLE_OVERLAY_COIN_ID").is_err() {
+            assert_eq!(cycle_overlay_coin_id(), "bitcoin");
+        }
+    }
+
+    #[test]
+    fn cycle_overlay_vs_currency_defaults_to_usd() {
+        if std::env::var("CYCLE_OVERLAY_VS_CURRENCY").is_err() {
+            assert_eq!(cycle_overlay_vs_currency(), "usd");
         }
     }
 

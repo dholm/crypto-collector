@@ -17,6 +17,7 @@
 
 pub mod backfill;
 pub mod collection_queue;
+pub mod cycle_overlay;
 pub mod live_poller;
 
 use sqlx::PgPool;

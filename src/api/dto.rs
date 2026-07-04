@@ -16,6 +16,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     coin::{CoinMarketSnapshot, CoinMetadata, TrackedCoin},
+    cycle_overlay::CycleOverlayPoint,
     quote::{CoinCandle, CoinQuote},
 };
 
@@ -280,6 +281,49 @@ impl From<CoinMarketSnapshot> for CoinMarketSnapshotDto {
     }
 }
 
+// ── Bitcoin halving-cycle overlay DTOs (SPEC-CYCLE-001 REQ-CYCLE-050/051) ────
+
+/// Response DTO for a Bitcoin halving-cycle overlay point.
+///
+/// `price`, `norm_halving`, `norm_cycle_low` serialize as JSON strings (REQ-CYCLE-024/051,
+/// OR-API-2 convention). `halving_baseline_approximate` is `true` when the cycle's
+/// halving-day anchor was forward-searched because the exact halving-date candle was
+/// absent (D8, REQ-CYCLE-032) — this cycle's `norm_halving` values are still well-defined
+/// (anchor day = 1.0) but the anchor is not the true halving date.
+#[derive(Debug, Serialize)]
+pub struct CycleOverlayPointDto {
+    pub coin_id: String,
+    pub vs_currency: String,
+    pub cycle_number: i32,
+    pub halving_date: chrono::NaiveDate,
+    pub days_since_halving: i32,
+    pub ts: chrono::NaiveDate,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub norm_halving: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub norm_cycle_low: Decimal,
+    pub halving_baseline_approximate: bool,
+}
+
+impl From<CycleOverlayPoint> for CycleOverlayPointDto {
+    fn from(p: CycleOverlayPoint) -> Self {
+        Self {
+            coin_id: p.coin_id,
+            vs_currency: p.vs_currency,
+            cycle_number: p.cycle_number,
+            halving_date: p.halving_date,
+            days_since_halving: p.days_since_halving,
+            ts: p.ts,
+            price: p.price,
+            norm_halving: p.norm_halving,
+            norm_cycle_low: p.norm_cycle_low,
+            halving_baseline_approximate: p.halving_baseline_approximate,
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -414,5 +458,40 @@ mod tests {
         };
         let dto = CoinDto::from(coin);
         assert_eq!(dto.live_poll_interval, None);
+    }
+
+    // ── CycleOverlayPointDto (SPEC-CYCLE-001) ─────────────────────────────────
+
+    fn sample_cycle_overlay_point() -> CycleOverlayPoint {
+        CycleOverlayPoint {
+            coin_id: "bitcoin".into(),
+            vs_currency: "usd".into(),
+            cycle_number: 3,
+            halving_date: chrono::NaiveDate::from_ymd_opt(2020, 5, 11).unwrap(),
+            days_since_halving: 200,
+            ts: chrono::NaiveDate::from_ymd_opt(2020, 11, 27).unwrap(),
+            price: dec!(4000),
+            norm_halving: dec!(0.465116279069767441860465116),
+            norm_cycle_low: dec!(1),
+            halving_baseline_approximate: false,
+        }
+    }
+
+    // Scenario 6 (REQ-CYCLE-022/050): both baselines present on every point.
+    #[test]
+    fn cycle_overlay_dto_serializes_both_baselines_as_strings() {
+        let dto = CycleOverlayPointDto::from(sample_cycle_overlay_point());
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""norm_halving":"0.465116279069767441860465116""#));
+        assert!(json.contains(r#""norm_cycle_low":"1""#));
+        assert!(json.contains(r#""price":"4000""#));
+    }
+
+    #[test]
+    fn cycle_overlay_dto_from_model_preserves_approximate_flag() {
+        let mut point = sample_cycle_overlay_point();
+        point.halving_baseline_approximate = true;
+        let dto = CycleOverlayPointDto::from(point);
+        assert!(dto.halving_baseline_approximate);
     }
 }

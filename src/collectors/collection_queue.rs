@@ -573,6 +573,17 @@ async fn dispatch_item(
             Ok(true)
         }
 
+        ("coin", "cycle_overlay") => {
+            // SPEC-CYCLE-001 REQ-CYCLE-041/042: full idempotent derived rebuild from
+            // coin_candles. No provider/pacer call — this kind never touches the network.
+            let coin_id = &item.target_id;
+            let vs_currency = crate::config::cycle_overlay_vs_currency();
+            crate::collectors::cycle_overlay::recompute_cycle_overlay(pool, coin_id, &vs_currency)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+
         (target_kind, kind) => Err(format!(
             "unknown dispatch: target_kind={target_kind:?} kind={kind:?}"
         )),

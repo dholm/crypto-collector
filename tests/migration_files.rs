@@ -9,7 +9,7 @@ use std::path::Path;
 // ── Milestone 1: migration file presence and naming ──────────────────────────
 
 #[test]
-fn all_twelve_migration_files_exist() {
+fn all_thirteen_migration_files_exist() {
     let expected = [
         "migrations/0001_registries.sql",
         "migrations/0002_live_quotes.sql",
@@ -23,6 +23,7 @@ fn all_twelve_migration_files_exist() {
         "migrations/0010_coin_live_poll_interval.sql",
         "migrations/0011_remove_markets.sql",
         "migrations/0012_coin_backfill.sql",
+        "migrations/0013_cycle_overlay.sql",
     ];
     for path in &expected {
         assert!(
@@ -347,6 +348,32 @@ fn derivatives_quotes_has_required_columns() {
             col
         );
     }
+}
+
+/// REQ-CYCLE-040: cycle_overlay_points table has the required Decimal columns and PK.
+#[test]
+fn cycle_overlay_migration_has_required_columns() {
+    let content = fs::read_to_string("migrations/0013_cycle_overlay.sql")
+        .expect("0013_cycle_overlay.sql must exist");
+    let lower = content.to_lowercase();
+    for col in &[
+        "price",
+        "norm_halving",
+        "norm_cycle_low",
+        "days_since_halving",
+        "cycle_number",
+        "halving_date",
+        "halving_baseline_approximate",
+    ] {
+        assert!(
+            lower.contains(col),
+            "0013_cycle_overlay.sql missing column '{col}' (REQ-CYCLE-040)"
+        );
+    }
+    assert!(
+        lower.contains("primary key (coin_id, vs_currency, cycle_number, days_since_halving)"),
+        "0013_cycle_overlay.sql must PK on (coin_id, vs_currency, cycle_number, days_since_halving) (REQ-CYCLE-040)"
+    );
 }
 
 /// REQ-DB-043: all migrations must use IF NOT EXISTS for idempotency.

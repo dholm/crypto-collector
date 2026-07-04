@@ -42,6 +42,23 @@ pub struct TsKey {
     pub ts: DateTime<Utc>,
 }
 
+/// Keyset position for `GET /v1/coins/{coin_id}/cycle-overlay` (SPEC-CYCLE-001 REQ-CYCLE-051).
+///
+/// Ordered `(cycle_number ASC, days_since_halving ASC)`. The resource-specific filter
+/// (coin_id, vs_currency, optional cycle_number) is kept in the WHERE clause, not the cursor.
+///
+// @MX:ANCHOR: [AUTO] CycleOverlayKey — the cycle-overlay route's pagination contract.
+// @MX:REASON: fan_in >= 3: cycle_overlay handler, encode/decode round-trip tests, acceptance
+//             Scenario 14. Reuses the generic encode_keyset_cursor/decode_keyset_cursor helpers
+//             unchanged (REQ-CYCLE-051); the ordering key shape must stay in sync with the
+//             cycle_overlay_points read route's ORDER BY (cycle_number ASC, days_since_halving ASC).
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-051
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleOverlayKey {
+    pub cycle_number: i32,
+    pub days_since_halving: i32,
+}
+
 // ── Encode / decode ───────────────────────────────────────────────────────────
 
 /// Encode any serializable keyset key as an opaque base64url (no-pad) cursor string.
@@ -112,6 +129,18 @@ mod tests {
         let key = TsKey { ts: ts() };
         let encoded = encode_keyset_cursor(&key);
         let decoded: TsKey = decode_keyset_cursor(&encoded).unwrap();
+        assert_eq!(decoded, key);
+    }
+
+    // Scenario 14 (REQ-CYCLE-051): cursor round-trips — CycleOverlayKey
+    #[test]
+    fn cycle_overlay_key_roundtrip() {
+        let key = CycleOverlayKey {
+            cycle_number: 3,
+            days_since_halving: 200,
+        };
+        let encoded = encode_keyset_cursor(&key);
+        let decoded: CycleOverlayKey = decode_keyset_cursor(&encoded).unwrap();
         assert_eq!(decoded, key);
     }
 

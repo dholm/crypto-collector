@@ -17,6 +17,7 @@ pub mod candles_agg;
 pub mod coin_market;
 pub mod coins;
 pub mod cursor;
+pub mod cycle_overlay;
 pub mod dto;
 pub mod metadata;
 pub mod poll_interval;
@@ -200,6 +201,11 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/v1/coins/{coin_id}/quotes", get(quotes::list_quotes))
         // ── Coin OHLCV candle endpoints (SPEC-API-002 REQ-API-141/142) ───────
         .route("/v1/coins/{coin_id}/candles", get(candles::list_candles))
+        // ── Bitcoin halving-cycle overlay (SPEC-CYCLE-001 REQ-CYCLE-050) ─────
+        .route(
+            "/v1/coins/{coin_id}/cycle-overlay",
+            get(cycle_overlay::list_cycle_overlay),
+        )
         .with_state(state)
 }
 
@@ -257,6 +263,7 @@ mod tests {
             "/v1/coins/{coin_id}/quotes/latest",
             "/v1/coins/{coin_id}/quotes",
             "/v1/coins/{coin_id}/candles",
+            "/v1/coins/{coin_id}/cycle-overlay",
         ];
         for route in &routes {
             assert!(
@@ -395,6 +402,7 @@ mod tests {
             "listCoinCandles",
             "streamCoinQuotes",
             "streamCoinCandles",
+            "listCycleOverlay",
         ];
         for op_id in &operation_ids {
             assert!(
@@ -420,6 +428,7 @@ mod tests {
             "CoinMarketSnapshot",
             "ApiError",
             "Page",
+            "CycleOverlayPoint",
         ];
         for schema in &schemas {
             assert!(

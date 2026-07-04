@@ -446,6 +446,26 @@ async fn enqueue_periodic_refresh(pool: &sqlx::PgPool) {
             coin_ids.len()
         );
     }
+
+    // SPEC-CYCLE-001 REQ-CYCLE-041: recompute the halving-cycle overlay for the single
+    // configured target coin (default bitcoin) on the same periodic tick that refreshes
+    // candles. Unlike REFRESH_KINDS above, this is NOT fanned out to every active coin —
+    // the overlay is Bitcoin-specific (D6/Exclusions), so only the configured coin id
+    // is enqueued regardless of which coins are currently tracked.
+    let cycle_overlay_coin_id = crypto_collector::config::cycle_overlay_coin_id();
+    if let Err(e) = sqlx::query(crypto_collector::collectors::collection_queue::ENQUEUE_QUEUE_SQL)
+        .bind("coin")
+        .bind(&cycle_overlay_coin_id)
+        .bind("cycle_overlay")
+        .execute(pool)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            coin_id = %cycle_overlay_coin_id,
+            "periodic refresh: cycle_overlay enqueue failed"
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
