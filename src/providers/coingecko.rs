@@ -189,6 +189,12 @@ impl CoinGeckoClient {
         self.config.tier == "demo"
     }
 
+    /// True if this client's configured tier supports the `/ohlc/range` endpoint
+    /// (Analyst/Lite/Pro/Enterprise; REQ-PROV-014).
+    pub fn supports_ohlc_range(&self) -> bool {
+        self.config.supports_ohlc_range()
+    }
+
     // ── Endpoint methods ───────────────────────────────────────────────────────
 
     /// `GET /coins/markets` — spot price + market aggregates for a list of coin IDs.
@@ -269,6 +275,68 @@ impl CoinGeckoClient {
             .json()
             .await
             .map_err(|e| ProviderError::Parse(format!("ohlc parse error: {e}")))?;
+
+        raw.iter()
+            .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
+            .collect()
+    }
+
+    /// `GET /coins/{id}/ohlc/range?vs_currency={vs}&from={iso}&to={iso}&interval={daily|hourly}`
+    ///
+    /// Analyst/Lite/Pro/Enterprise-only endpoint (REQ-PROV-014 tier gating; see
+    /// `CoinGeckoConfig::supports_ohlc_range`). Returns candles at-or-after `start` and
+    /// before `end`, capped at the endpoint's per-request span (180 days for `daily`,
+    /// 31 days for `hourly`) — callers page across multiple calls for wider windows
+    /// (see `collectors::backfill`'s cursor-advance loop).
+    ///
+    /// `from`/`to` are sent as ISO 8601 date-time strings (`YYYY-MM-DDTHH:MM`), which the
+    /// CoinGecko docs recommend over raw UNIX timestamps "for best compatibility" — this
+    /// sidesteps ambiguity over seconds-vs-milliseconds for the request parameters (the
+    /// *response* payload uses epoch milliseconds, confirmed via CoinGecko's official API
+    /// reference at https://docs.coingecko.com/reference/coins-id-ohlc-range).
+    ///
+    /// Returns candles with `volume = None` and `source = "coingecko"` (REQ-PROV-013/031),
+    /// same as the day-bucketed `/ohlc` endpoint.
+    pub async fn fetch_ohlc_range(
+        &self,
+        coin_id: &str,
+        vs_currency: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        market_id: i64,
+        interval_secs: i64,
+    ) -> Result<Vec<OhlcCandle>, ProviderError> {
+        let interval = coingecko_range_snap_interval(interval_secs);
+        let max_span = coingecko_range_max_span(interval);
+        let clamped_end = end.min(start + max_span);
+
+        let from_str = start.format("%Y-%m-%dT%H:%M").to_string();
+        let to_str = clamped_end.format("%Y-%m-%dT%H:%M").to_string();
+
+        let resp = self
+            .get(&format!("/api/v3/coins/{coin_id}/ohlc/range"))
+            .query(&[
+                ("vs_currency", vs_currency),
+                ("from", &from_str),
+                ("to", &to_str),
+                ("interval", interval),
+            ])
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        if status == 429 {
+            return Err(ProviderError::RateLimited);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http { status, body });
+        }
+
+        let raw: Vec<Value> = resp
+            .json()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("ohlc/range parse error: {e}")))?;
 
         raw.iter()
             .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
@@ -572,6 +640,33 @@ pub fn coingecko_days_for_interval(interval: &str, requested_days: u32) -> u32 {
     }
 }
 
+/// Snap an interval in seconds to the `/ohlc/range` endpoint's two supported bands.
+///
+/// Unlike `coingecko_snap_interval` (three bands for the day-bucketed `/ohlc` endpoint),
+/// `/ohlc/range` accepts only `"daily"` or `"hourly"` (confirmed via CoinGecko's official
+/// API reference). We snap by nearest-neighbour distance to the band midpoint
+/// (1h = 3 600 s, 1d = 86 400 s); ties resolve to `"hourly"`.
+pub fn coingecko_range_snap_interval(interval_secs: i64) -> &'static str {
+    const BANDS: &[(i64, &str)] = &[(3_600, "hourly"), (86_400, "daily")];
+    BANDS
+        .iter()
+        .min_by_key(|(s, _)| (interval_secs - s).abs())
+        .map(|(_, name)| *name)
+        .unwrap_or("daily")
+}
+
+/// Maximum time span the `/ohlc/range` endpoint accepts in a single request, per interval.
+///
+/// Per CoinGecko's official API reference: `daily` allows up to 180 days (180 candles);
+/// `hourly` allows up to 31 days (744 candles). Callers clamp `end` to `start + max_span`
+/// and page across repeated calls for windows wider than this.
+pub fn coingecko_range_max_span(interval: &str) -> chrono::Duration {
+    match interval {
+        "hourly" => chrono::Duration::days(31),
+        _ => chrono::Duration::days(180),
+    }
+}
+
 /// Legacy helper kept for backward compatibility with existing tests.
 ///
 /// Maps a `days` count to the CoinGecko auto-selected interval string.
@@ -774,14 +869,17 @@ impl Provider for CoinGeckoProvider {
     }
 
     fn supports(&self, cap: Capability) -> bool {
-        matches!(
-            cap,
+        match cap {
             Capability::Spot
-                | Capability::Ohlc
-                | Capability::CoinMetadata
-                | Capability::CoinMarket
-                | Capability::Derivatives
-        )
+            | Capability::Ohlc
+            | Capability::CoinMetadata
+            | Capability::CoinMarket
+            | Capability::Derivatives => true,
+            // Tier-gated: only Analyst/Lite/Pro/Enterprise expose `/ohlc/range`
+            // (REQ-PROV-014). Demo returns false so the chain falls through to the
+            // next declared provider (e.g. Binance) for historical backfill.
+            Capability::OhlcRange => self.client.supports_ohlc_range(),
+        }
     }
 
     async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
@@ -836,9 +934,9 @@ impl Provider for CoinGeckoProvider {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC"))
         })?;
 
-        // Tier-limited endpoint degrades (REQ-PROV-014): Demo cannot use /ohlc/range.
-        // Use day-bucketed endpoint for all tiers; surface limitation via OhlcCandle interval.
-        // (Analyst+ range endpoint is a future enhancement: OR-PROV-2)
+        // Day-bucketed `/coins/{id}/ohlc` endpoint: available on every tier, but windows
+        // relative to "now" only (REQ-PROV-014). For an arbitrary historical range, see
+        // `fetch_ohlc_range` (Analyst+ only; gated via `Capability::OhlcRange`).
 
         // Pacer: acquire slot before outbound HTTP (REQ-PROV-040)
         self.local_throttle.acquire().await;
@@ -852,6 +950,54 @@ impl Provider for CoinGeckoProvider {
                 coin_id,
                 &market.vs_currency,
                 days,
+                market.market_id,
+                interval_secs,
+            )
+            .await
+        {
+            Ok(c) => Ok(c),
+            Err(ProviderError::RateLimited) => {
+                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
+                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
+                Err(ProviderError::RateLimited)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Fetch one page of candles within `[start, end)` via `/ohlc/range` (Analyst+ only).
+    ///
+    /// Returns `Err(NotSupported)` on unsupported tiers rather than degrading silently,
+    /// so `chain_fetch_ohlc_range` can distinguish this from a genuine upstream failure —
+    /// though in practice the chain orchestrator checks `supports(OhlcRange)` first and
+    /// skips the call entirely.
+    async fn fetch_ohlc_range(
+        &self,
+        market: &MarketQuery,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        interval_secs: i64,
+    ) -> Result<Vec<OhlcCandle>, ProviderError> {
+        if !self.client.supports_ohlc_range() {
+            return Err(ProviderError::NotSupported(Capability::OhlcRange));
+        }
+
+        let coin_id = market.coin_id.as_deref().ok_or_else(|| {
+            ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC range"))
+        })?;
+
+        self.local_throttle.acquire().await;
+        pacer::acquire_slot(&self.pool, "coingecko")
+            .await
+            .map_err(ProviderError::Pacer)?;
+
+        match self
+            .client
+            .fetch_ohlc_range(
+                coin_id,
+                &market.vs_currency,
+                start,
+                end,
                 market.market_id,
                 interval_secs,
             )
@@ -1248,6 +1394,163 @@ mod tests {
             cfg.supports_ohlc_range(),
             "Analyst tier must support /ohlc/range"
         );
+    }
+
+    // ── OhlcRange capability gating on CoinGeckoProvider ──────────────────────
+
+    #[tokio::test]
+    async fn coingecko_provider_demo_tier_does_not_support_ohlc_range_capability() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let cfg = CoinGeckoConfig {
+            base_url: "https://api.coingecko.com".to_string(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let provider = CoinGeckoProvider::new(cfg, pool);
+        assert!(!provider.supports(Capability::OhlcRange));
+    }
+
+    #[tokio::test]
+    async fn coingecko_provider_analyst_tier_supports_ohlc_range_capability() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let cfg = CoinGeckoConfig {
+            base_url: "https://pro-api.coingecko.com".to_string(),
+            api_key: Some("key".to_string()),
+            tier: "analyst".to_string(),
+        };
+        let provider = CoinGeckoProvider::new(cfg, pool);
+        assert!(provider.supports(Capability::OhlcRange));
+    }
+
+    #[tokio::test]
+    async fn coingecko_provider_demo_tier_fetch_ohlc_range_returns_not_supported() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let cfg = CoinGeckoConfig {
+            base_url: "https://api.coingecko.com".to_string(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let provider = CoinGeckoProvider::new(cfg, pool);
+        let market = MarketQuery {
+            market_id: 1,
+            coin_id: Some("bitcoin".to_string()),
+            base: "BTC".to_string(),
+            quote: "USD".to_string(),
+            venue: None,
+            vs_currency: "usd".to_string(),
+        };
+        let start = Utc::now() - chrono::Duration::days(30);
+        let end = Utc::now();
+        let result = provider.fetch_ohlc_range(&market, start, end, 86_400).await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::NotSupported(Capability::OhlcRange))
+        ));
+    }
+
+    // ── coingecko_range_snap_interval: two-band snapping (daily/hourly) ──────
+
+    #[test]
+    fn range_snap_interval_near_hourly_gives_hourly() {
+        assert_eq!(coingecko_range_snap_interval(3_600), "hourly");
+        assert_eq!(coingecko_range_snap_interval(60), "hourly");
+    }
+
+    #[test]
+    fn range_snap_interval_near_daily_gives_daily() {
+        assert_eq!(coingecko_range_snap_interval(86_400), "daily");
+        assert_eq!(coingecko_range_snap_interval(200_000), "daily");
+    }
+
+    #[test]
+    fn range_max_span_daily_is_180_days() {
+        assert_eq!(
+            coingecko_range_max_span("daily"),
+            chrono::Duration::days(180)
+        );
+    }
+
+    #[test]
+    fn range_max_span_hourly_is_31_days() {
+        assert_eq!(
+            coingecko_range_max_span("hourly"),
+            chrono::Duration::days(31)
+        );
+    }
+
+    // ── fetch_ohlc_range: URL/param building via wiremock ─────────────────────
+
+    #[tokio::test]
+    async fn http_ohlc_range_endpoint_sends_expected_params_and_parses() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!([
+            [1719820000000i64, 94000.0, 96000.0, 93000.0, 95000.0],
+            [1719906400000i64, 95000.0, 97000.0, 94500.0, 96800.0]
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/ohlc/range"))
+            .and(query_param("vs_currency", "usd"))
+            .and(query_param("interval", "daily"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: Some("key".to_string()),
+            tier: "analyst".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+
+        let start = DateTime::from_timestamp(1_719_820_000, 0).unwrap();
+        let end = DateTime::from_timestamp(1_719_910_000, 0).unwrap();
+        let candles = client
+            .fetch_ohlc_range("bitcoin", "usd", start, end, 1, 86_400)
+            .await
+            .expect("fetch_ohlc_range");
+
+        assert_eq!(candles.len(), 2);
+        assert!(candles.iter().all(|c| c.volume.is_none()));
+        assert!(candles.iter().all(|c| c.source == "coingecko"));
+        assert!(candles.iter().all(|c| c.interval == "daily"));
+    }
+
+    #[tokio::test]
+    async fn http_ohlc_range_429_returns_rate_limited() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/ohlc/range"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "analyst".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let start = Utc::now() - chrono::Duration::days(1);
+        let end = Utc::now();
+        let result = client
+            .fetch_ohlc_range("bitcoin", "usd", start, end, 1, 86_400)
+            .await;
+        assert!(matches!(result, Err(ProviderError::RateLimited)));
     }
 
     // ── Scenario 14 (REQ-PROV-032): timestamps normalised to UTC ─────────────

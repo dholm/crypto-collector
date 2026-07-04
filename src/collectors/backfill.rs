@@ -26,6 +26,11 @@ use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
 
+/// Dataset tag used for the startup once-per-coin historical backfill job
+/// (`enqueue_startup_backfills`). Matches the `ON CONFLICT (coin_id, dataset)`
+/// idempotency key on `backfill_jobs`.
+pub const STARTUP_BACKFILL_DATASET: &str = "candles";
+
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
 
 /// Determine the resume start for a backfill chunk (REQ-SCHED-024/025).
@@ -59,6 +64,18 @@ pub fn range_to_days(
         }
         _ => max_days,
     }
+}
+
+/// Decide whether `process_chunk` should use the date-range-bounded fetch
+/// (`chain_fetch_ohlc_range`) instead of the `days`-based recent-window fetch
+/// (`chain_fetch_ohlc`). Range path requires both bounds to be known; chunks
+/// missing either (e.g. legacy whole-dataset chunks with `range_start`/`range_end`
+/// both `NULL`) fall back to the `days`-based path.
+pub fn should_use_range_path(
+    start: Option<DateTime<Utc>>,
+    range_end: Option<DateTime<Utc>>,
+) -> bool {
+    start.is_some() && range_end.is_some()
 }
 
 // ── SQL constants ─────────────────────────────────────────────────────────────
@@ -293,6 +310,57 @@ pub async fn enqueue_backfill_job(
     Ok(true)
 }
 
+/// Enqueue a historical candle backfill job for every currently tracked coin, once
+/// per coin, idempotently (startup hook — see `main.rs`).
+///
+/// Reuses `enqueue_backfill_job`'s `ON CONFLICT (coin_id, dataset) DO NOTHING`
+/// idempotency key (dataset = `STARTUP_BACKFILL_DATASET` = `"candles"`), so re-deploys
+/// never duplicate or restart a backfill that has already been enqueued (completed or
+/// still in progress) — only coins with no existing `candles` job get a new one.
+///
+/// `lookback_days` sets `range_start = now - lookback_days`; `range_end = now`.
+/// Returns `(enqueued, skipped)` counts. Does not fail the caller's startup sequence —
+/// callers should log a warning and continue on `Err` (see `main.rs`).
+///
+// @MX:ANCHOR: [AUTO] enqueue_startup_backfills — once-per-coin idempotent historical backfill trigger
+// @MX:REASON: fan_in >= 3: main.rs startup hook, DB integration tests, future re-trigger callers.
+//             Idempotency invariant: ON CONFLICT (coin_id, dataset) DO NOTHING means re-deploys
+//             never duplicate or restart a backfill already enqueued for a coin.
+pub async fn enqueue_startup_backfills(
+    pool: &PgPool,
+    lookback_days: u32,
+) -> Result<(u64, u64), sqlx::Error> {
+    let coin_ids: Vec<String> = sqlx::query_scalar("SELECT coin_id FROM tracked_coins")
+        .fetch_all(pool)
+        .await?;
+
+    let range_end = Utc::now();
+    let range_start = range_end - chrono::Duration::days(lookback_days as i64);
+
+    let mut enqueued = 0u64;
+    let mut skipped = 0u64;
+
+    for coin_id in &coin_ids {
+        let created = enqueue_backfill_job(
+            pool,
+            coin_id,
+            STARTUP_BACKFILL_DATASET,
+            None,
+            Some(range_start),
+            Some(range_end),
+        )
+        .await?;
+
+        if created {
+            enqueued += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+
+    Ok((enqueued, skipped))
+}
+
 // ── Chain dispatch helper ─────────────────────────────────────────────────────
 
 async fn chain_fetch_ohlc_for_chunk(
@@ -305,11 +373,37 @@ async fn chain_fetch_ohlc_for_chunk(
     result
 }
 
+/// Date-range-bounded counterpart of `chain_fetch_ohlc_for_chunk` (see
+/// `providers::chain_fetch_ohlc_range`), used when both `start` and `range_end` are
+/// known so the worker can fetch an arbitrary historical window rather than a
+/// "most recent N days" window.
+async fn chain_fetch_ohlc_range_for_chunk(
+    chain: &[Arc<dyn Provider>],
+    market: &MarketQuery,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    interval_secs: i64,
+) -> Result<Vec<OhlcCandle>, ProviderError> {
+    let (result, _) =
+        crate::providers::chain_fetch_ohlc_range(chain, market, start, end, interval_secs).await;
+    result
+}
+
 fn first_ohlc_provider(chain: &[Arc<dyn Provider>]) -> Option<String> {
     chain
         .iter()
         .find(|p| p.supports(Capability::Ohlc))
         .map(|p| p.name().to_string())
+}
+
+/// First provider supporting `OhlcRange`, falling back to the first `Ohlc`-supporting
+/// provider when none declare range support (REQ backfill pacer-slot keying).
+fn first_range_provider(chain: &[Arc<dyn Provider>]) -> Option<String> {
+    chain
+        .iter()
+        .find(|p| p.supports(Capability::OhlcRange))
+        .map(|p| p.name().to_string())
+        .or_else(|| first_ohlc_provider(chain))
 }
 
 // ── Worker loop ───────────────────────────────────────────────────────────────
@@ -342,17 +436,8 @@ async fn process_chunk(
         vs_currency: "usd".to_string(),
     };
 
-    // Acquire pacer slot OUTSIDE any transaction (REQ-SCHED-041).
-    let provider_name =
-        first_ohlc_provider(chain).ok_or_else(|| "no provider supports OHLC".to_string())?;
-
-    acquire_slot(pool, &provider_name)
-        .await
-        .map_err(|e| format!("pacer: {e}"))?;
-
-    // Compute resume start and effective days (REQ-SCHED-024/025).
+    // Compute resume start (REQ-SCHED-024/025).
     let start = resume_start(chunk.cursor, chunk.range_start);
-    let days = range_to_days(start, chunk.range_end, 90); // 90-day cap per CoinGecko API
 
     // Candle granularity = per-coin poll interval (or global default).
     let global_interval = crate::config::live_quote_poll_interval_secs();
@@ -361,9 +446,38 @@ async fn process_chunk(
         global_interval,
     );
 
-    let candles = chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs)
+    // When both bounds of the chunk's window are known, use the date-range-bounded
+    // fetch so a multi-year backfill can actually reach back that far — the
+    // `days`-based `fetch_ohlc` path only ever windows relative to "now" and cannot
+    // target an arbitrary historical range. Chunks lacking one or both bounds (e.g.
+    // legacy whole-dataset chunks) keep using the `days`-based path.
+    let use_range_path = should_use_range_path(start, chunk.range_end);
+
+    // Acquire pacer slot OUTSIDE any transaction (REQ-SCHED-041). Key on the first
+    // range-capable provider when taking the range path, else the first OHLC provider.
+    let provider_name = if use_range_path {
+        first_range_provider(chain)
+    } else {
+        first_ohlc_provider(chain)
+    }
+    .ok_or_else(|| "no provider supports OHLC".to_string())?;
+
+    acquire_slot(pool, &provider_name)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("pacer: {e}"))?;
+
+    let candles = if use_range_path {
+        let range_start = start.expect("checked by use_range_path");
+        let range_end = chunk.range_end.expect("checked by use_range_path");
+        chain_fetch_ohlc_range_for_chunk(chain, &mq, range_start, range_end, interval_secs)
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        let days = range_to_days(start, chunk.range_end, 90); // fallback: recent-window path
+        chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs)
+            .await
+            .map_err(|e| e.to_string())?
+    };
 
     if candles.is_empty() {
         return Ok(None);
@@ -627,6 +741,126 @@ mod tests {
         assert_eq!(days, 1);
     }
 
+    // ── should_use_range_path: worker range-path selection (pure logic) ───────
+
+    #[test]
+    fn should_use_range_path_true_when_both_bounds_known() {
+        let start = ts(2026, 1, 1, 0, 0);
+        let end = ts(2026, 1, 8, 0, 0);
+        assert!(should_use_range_path(Some(start), Some(end)));
+    }
+
+    #[test]
+    fn should_use_range_path_false_when_start_missing() {
+        let end = ts(2026, 1, 8, 0, 0);
+        assert!(!should_use_range_path(None, Some(end)));
+    }
+
+    #[test]
+    fn should_use_range_path_false_when_end_missing() {
+        let start = ts(2026, 1, 1, 0, 0);
+        assert!(!should_use_range_path(Some(start), None));
+    }
+
+    #[test]
+    fn should_use_range_path_false_when_both_missing() {
+        assert!(!should_use_range_path(None, None));
+    }
+
+    // ── first_range_provider: prefers OhlcRange, falls back to Ohlc ──────────
+
+    struct StubProvider {
+        provider_name: &'static str,
+        caps: &'static [Capability],
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for StubProvider {
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+        fn supports(&self, cap: Capability) -> bool {
+            self.caps.contains(&cap)
+        }
+        async fn fetch_spot(
+            &self,
+            _m: &MarketQuery,
+        ) -> Result<crate::providers::SpotQuote, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Spot))
+        }
+        async fn fetch_ohlc(
+            &self,
+            _m: &MarketQuery,
+            _d: u32,
+            _i: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_metadata(
+            &self,
+            _id: &str,
+        ) -> Result<crate::providers::CoinMeta, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMetadata))
+        }
+        async fn fetch_coin_market(
+            &self,
+            _id: &str,
+            _vs: &str,
+        ) -> Result<crate::providers::CoinMarket, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMarket))
+        }
+        async fn fetch_derivatives(
+            &self,
+            _m: &MarketQuery,
+        ) -> Result<crate::providers::DerivTick, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Derivatives))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<crate::providers::CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_tickers(
+            &self,
+            _coin_id: &str,
+            _cap: usize,
+        ) -> Result<Vec<crate::providers::MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn first_range_provider_prefers_range_capable() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(StubProvider {
+                provider_name: "coingecko",
+                caps: &[Capability::Ohlc],
+            }),
+            Arc::new(StubProvider {
+                provider_name: "binance",
+                caps: &[Capability::Ohlc, Capability::OhlcRange],
+            }),
+        ];
+        assert_eq!(first_range_provider(&chain).as_deref(), Some("binance"));
+    }
+
+    #[test]
+    fn first_range_provider_falls_back_to_ohlc_when_none_support_range() {
+        let chain: Vec<Arc<dyn Provider>> = vec![Arc::new(StubProvider {
+            provider_name: "coingecko",
+            caps: &[Capability::Ohlc],
+        })];
+        assert_eq!(first_range_provider(&chain).as_deref(), Some("coingecko"));
+    }
+
+    #[test]
+    fn first_range_provider_none_when_chain_empty() {
+        let chain: Vec<Arc<dyn Provider>> = vec![];
+        assert_eq!(first_range_provider(&chain), None);
+    }
+
     // ── SQL-shape assertions ──────────────────────────────────────────────────
 
     #[test]
@@ -783,5 +1017,100 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup job");
+    }
+
+    /// `enqueue_startup_backfills` idempotency: re-invocation for the same coin must
+    /// skip rather than duplicate/restart (ON CONFLICT DO NOTHING invariant).
+    #[tokio::test]
+    #[ignore]
+    async fn db_enqueue_startup_backfills_is_idempotent() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        // Use a throwaway coin_id unlikely to collide with seeded fixtures, and clean
+        // up any prior run's leftovers before asserting.
+        let coin_id = "test-startup-backfill-coin";
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup tracked_coins");
+
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+             VALUES ($1, 'TSBC', 'Test Startup Backfill Coin', 'active', now())",
+        )
+        .bind(coin_id)
+        .execute(&pool)
+        .await
+        .expect("insert tracked coin");
+
+        // First call: must enqueue exactly one job for our test coin.
+        let (enqueued_1, _skipped_1) = enqueue_startup_backfills(&pool, 3650)
+            .await
+            .expect("first enqueue_startup_backfills");
+        assert!(
+            enqueued_1 >= 1,
+            "first call must enqueue at least our test coin"
+        );
+
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backfill_jobs WHERE coin_id = $1 AND dataset = $2",
+        )
+        .bind(coin_id)
+        .bind(STARTUP_BACKFILL_DATASET)
+        .fetch_one(&pool)
+        .await
+        .expect("count jobs after first call");
+        assert_eq!(job_count, 1, "exactly one job must exist after first call");
+
+        // Second call (simulating a re-deploy): must skip, not duplicate/restart.
+        let (_enqueued_2, skipped_2) = enqueue_startup_backfills(&pool, 3650)
+            .await
+            .expect("second enqueue_startup_backfills");
+        assert!(
+            skipped_2 >= 1,
+            "second call must skip our already-enqueued test coin"
+        );
+
+        let job_count_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backfill_jobs WHERE coin_id = $1 AND dataset = $2",
+        )
+        .bind(coin_id)
+        .bind(STARTUP_BACKFILL_DATASET)
+        .fetch_one(&pool)
+        .await
+        .expect("count jobs after second call");
+        assert_eq!(
+            job_count_after, 1,
+            "re-invocation must not duplicate the job row"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup tracked_coins");
     }
 }

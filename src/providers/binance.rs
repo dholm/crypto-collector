@@ -11,7 +11,7 @@ use super::{
     OhlcCandle, Provider, ProviderError, SpotQuote,
 };
 use async_trait::async_trait;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -73,6 +73,49 @@ impl BinanceClient {
         resp.json::<Vec<Value>>()
             .await
             .map_err(|e| ProviderError::Parse(format!("klines parse error: {e}")))
+    }
+
+    /// `GET /api/v3/klines?symbol={symbol}&interval={interval}&startTime={ms}&endTime={ms}&limit={limit}`
+    ///
+    /// Date-range-bounded variant used for historical backfill (SPEC-SCHED-001). Binance
+    /// returns candles ascending from `start_ms`, capped at `limit` (max 1000 per call) —
+    /// callers page forward across multiple calls for windows wider than the page limit.
+    pub async fn fetch_klines_range(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+    ) -> Result<Vec<Value>, ProviderError> {
+        let limit_str = limit.to_string();
+        let start_str = start_ms.to_string();
+        let end_str = end_ms.to_string();
+        let resp = self
+            .client
+            .get(format!("{}/api/v3/klines", self.base_url))
+            .query(&[
+                ("symbol", symbol),
+                ("interval", interval),
+                ("startTime", &start_str),
+                ("endTime", &end_str),
+                ("limit", &limit_str),
+            ])
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        if status == 429 {
+            return Err(ProviderError::RateLimited);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ProviderError::Http { status, body });
+        }
+
+        resp.json::<Vec<Value>>()
+            .await
+            .map_err(|e| ProviderError::Parse(format!("klines range parse error: {e}")))
     }
 }
 
@@ -227,7 +270,10 @@ impl Provider for BinanceProvider {
     }
 
     fn supports(&self, cap: Capability) -> bool {
-        matches!(cap, Capability::Spot | Capability::Ohlc)
+        matches!(
+            cap,
+            Capability::Spot | Capability::Ohlc | Capability::OhlcRange
+        )
     }
 
     async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
@@ -286,6 +332,53 @@ impl Provider for BinanceProvider {
             .map_err(ProviderError::Pacer)?;
 
         let klines = match self.client.fetch_klines(&symbol, interval, limit).await {
+            Ok(k) => k,
+            Err(ProviderError::RateLimited) => {
+                let cooldown_ms = crate::config::pacer_cooldown_ms("binance");
+                let _ = pacer::signal_cooldown(&self.pool, "binance", cooldown_ms).await;
+                return Err(ProviderError::RateLimited);
+            }
+            Err(e) => return Err(e),
+        };
+
+        klines
+            .iter()
+            .map(|v| normalise_kline(v, market.market_id, interval, &market.vs_currency))
+            .collect()
+    }
+
+    /// Fetch one page of candles at-or-after `start` and before `end` (REQ backfill).
+    ///
+    /// Binance's `startTime`/`endTime` are inclusive-ish on the open_time axis; the
+    /// server returns up to `limit` ascending klines starting from `start`. A single
+    /// call may not cover the whole `[start, end)` window if it exceeds 1000 candles —
+    /// the backfill worker's cursor-advance loop pages forward across repeated calls.
+    async fn fetch_ohlc_range(
+        &self,
+        market: &MarketQuery,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        interval_secs: i64,
+    ) -> Result<Vec<OhlcCandle>, ProviderError> {
+        let symbol = Self::ticker_symbol(market);
+        let interval = secs_to_kline_interval(interval_secs);
+
+        self.local_throttle.acquire().await;
+        pacer::acquire_slot(&self.pool, "binance")
+            .await
+            .map_err(ProviderError::Pacer)?;
+
+        let klines = match self
+            .client
+            .fetch_klines_range(
+                &symbol,
+                interval,
+                start.timestamp_millis(),
+                end.timestamp_millis(),
+                1000,
+            )
+            .await
+        {
             Ok(k) => k,
             Err(ProviderError::RateLimited) => {
                 let cooldown_ms = crate::config::pacer_cooldown_ms("binance");
@@ -628,6 +721,160 @@ mod tests {
         let client = BinanceClient::new(Some(server.uri()));
         let result = client.fetch_klines("BTCUSDT", "1d", 10).await;
         assert!(matches!(result, Err(ProviderError::RateLimited)));
+    }
+
+    // ── fetch_klines_range: startTime/endTime/limit param correctness ────────
+
+    #[tokio::test]
+    async fn http_klines_range_sends_start_end_limit_params_and_parses() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!([
+            [
+                1719820000000i64,
+                "94000.50",
+                "96000.25",
+                "93000.75",
+                "95000.10",
+                "1234.56",
+                1719823599999i64,
+                "117000000.00",
+                85432,
+                "617.89",
+                "58500000.00",
+                "0"
+            ],
+            [
+                1719906400000i64,
+                "95000.10",
+                "97000.00",
+                "94500.00",
+                "96800.00",
+                "2345.67",
+                1719909999999i64,
+                "226000000.00",
+                92000,
+                "1170.00",
+                "113000000.00",
+                "0"
+            ]
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/klines"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("interval", "1d"))
+            .and(query_param("startTime", "1719820000000"))
+            .and(query_param("endTime", "1719910000000"))
+            .and(query_param("limit", "1000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let client = BinanceClient::new(Some(server.uri()));
+        let klines = client
+            .fetch_klines_range("BTCUSDT", "1d", 1_719_820_000_000, 1_719_910_000_000, 1000)
+            .await
+            .expect("fetch range");
+        assert_eq!(klines.len(), 2);
+
+        let candles: Vec<OhlcCandle> = klines
+            .iter()
+            .map(|v| normalise_kline(v, 1, "1d", "usdt"))
+            .collect::<Result<_, _>>()
+            .expect("normalise all");
+        assert!(candles[0].ts < candles[1].ts);
+        assert!(candles.iter().all(|c| c.volume.is_some()));
+    }
+
+    #[tokio::test]
+    async fn http_klines_range_429_returns_rate_limited() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/klines"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let client = BinanceClient::new(Some(server.uri()));
+        let result = client.fetch_klines_range("BTCUSDT", "1d", 0, 1, 1000).await;
+        assert!(matches!(result, Err(ProviderError::RateLimited)));
+    }
+
+    #[tokio::test]
+    async fn binance_supports_ohlc_range() {
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let provider = BinanceProvider::new(None, pool);
+        assert!(provider.supports(Capability::OhlcRange));
+    }
+
+    // Requires a live PostgreSQL instance: Provider::fetch_ohlc_range goes through
+    // `pacer::acquire_slot`, which performs a real DB round-trip. Opt-in via
+    // `DATABASE_URL=... cargo test -- --ignored`, consistent with the db_integration
+    // convention; lower-level param/normalisation coverage lives in the wiremock-only
+    // `http_klines_range_*` tests above, which need no DB.
+    #[tokio::test]
+    #[ignore]
+    async fn fetch_ohlc_range_normalises_candles_from_provider() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        let body = json!([[
+            1719820000000i64,
+            "94000.50",
+            "96000.25",
+            "93000.75",
+            "95000.10",
+            "1234.56",
+            1719823599999i64,
+            "117000000.00",
+            85432,
+            "617.89",
+            "58500000.00",
+            "0"
+        ]]);
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/klines"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let provider = BinanceProvider::new(Some(server.uri()), pool);
+
+        let market = MarketQuery {
+            market_id: 7,
+            coin_id: Some("bitcoin".to_string()),
+            base: "BTC".to_string(),
+            quote: "USDT".to_string(),
+            venue: None,
+            vs_currency: "usdt".to_string(),
+        };
+
+        let start = chrono::DateTime::from_timestamp_millis(1_719_820_000_000).unwrap();
+        let end = chrono::DateTime::from_timestamp_millis(1_719_910_000_000).unwrap();
+        let candles = provider
+            .fetch_ohlc_range(&market, start, end, 86_400)
+            .await
+            .expect("fetch_ohlc_range");
+
+        assert_eq!(candles.len(), 1);
+        assert_eq!(candles[0].source, "binance");
+        assert!(candles[0].volume.is_some());
     }
 
     // Live smoke test (gated)

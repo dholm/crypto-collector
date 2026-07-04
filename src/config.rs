@@ -321,6 +321,14 @@ pub fn metadata_refresh_interval_secs() -> u64 {
     parse_env_u64("METADATA_REFRESH_INTERVAL_SECS", 3_600)
 }
 
+/// Historical lookback window (in days) for the once-per-coin startup backfill
+/// (`collectors::backfill::enqueue_startup_backfills`).
+///
+/// Env var: `BACKFILL_LOOKBACK_DAYS`. Default: 3 650 days (~10 years).
+pub fn backfill_lookback_days() -> u32 {
+    parse_env_u32("BACKFILL_LOOKBACK_DAYS", 3_650)
+}
+
 // ── SPEC-CYCLE-001 halving-cycle overlay configuration (REQ-CYCLE-043) ────────
 
 /// Target coin for the Bitcoin halving-cycle overlay.
@@ -363,6 +371,13 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn parse_env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -498,6 +513,13 @@ mod tests {
     fn metadata_refresh_interval_default() {
         if std::env::var("METADATA_REFRESH_INTERVAL_SECS").is_err() {
             assert_eq!(metadata_refresh_interval_secs(), 3_600);
+        }
+    }
+
+    #[test]
+    fn backfill_lookback_days_default_is_3650() {
+        if std::env::var("BACKFILL_LOOKBACK_DAYS").is_err() {
+            assert_eq!(backfill_lookback_days(), 3_650);
         }
     }
 

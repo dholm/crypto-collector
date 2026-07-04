@@ -32,6 +32,10 @@ pub use kraken::KrakenProvider;
 pub enum Capability {
     Spot,
     Ohlc,
+    /// Date-range-bounded OHLC fetch (`fetch_ohlc_range`). Distinct from `Ohlc` because
+    /// not every provider/tier can serve an arbitrary historical window in one call
+    /// (e.g. CoinGecko Demo tier only exposes the "most recent N days" `/ohlc` endpoint).
+    OhlcRange,
     CoinMetadata,
     CoinMarket,
     Derivatives,
@@ -259,6 +263,28 @@ pub trait Provider: Send + Sync {
         interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError>;
 
+    /// Fetch one page of OHLC candles at-or-after `start` and before `end`, ordered
+    /// ascending, capped at the provider's per-call page limit (REQ-PROV-001 backfill).
+    ///
+    /// Unlike `fetch_ohlc` (which windows relative to "now"), this method targets an
+    /// arbitrary historical `[start, end)` range — the primitive multi-year backfill
+    /// needs. Callers page through a wide range across repeated calls (see
+    /// `collectors::backfill`'s cursor-advance loop); a single call does not need to
+    /// return the whole window.
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::OhlcRange))`. Providers
+    /// that cannot serve an arbitrary historical window (stubs, tier-gated CoinGecko
+    /// Demo) rely on this default and need no override.
+    async fn fetch_ohlc_range(
+        &self,
+        _market: &MarketQuery,
+        _start: DateTime<Utc>,
+        _end: DateTime<Utc>,
+        _interval_secs: i64,
+    ) -> Result<Vec<OhlcCandle>, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::OhlcRange))
+    }
+
     /// Fetch slowly-changing coin metadata (descriptions, links, supply cap).
     async fn fetch_coin_metadata(&self, coin_id: &str) -> Result<CoinMeta, ProviderError>;
 
@@ -387,6 +413,65 @@ pub async fn chain_fetch_ohlc(
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
                     capability: Capability::Ohlc,
+                    outcome: ProviderOutcome::Failure,
+                });
+                last_err = e;
+            }
+        }
+    }
+
+    (Err(last_err), records)
+}
+
+/// Try providers in declared order for `fetch_ohlc_range`; return first success.
+///
+/// Mirrors `chain_fetch_ohlc`, but dispatches on `Capability::OhlcRange` and calls the
+/// range-bounded fetch. Providers that do not support `OhlcRange` (checked via
+/// `supports`) are skipped and recorded as `Unsupported`, letting e.g. CoinGecko Demo
+/// fall through to Binance in the declared fallback order.
+///
+// @MX:ANCHOR: [AUTO] chain_fetch_ohlc_range — date-range OHLC dispatch for historical backfill
+// @MX:REASON: fan_in >= 3: backfill worker process_chunk, provider chain tests, future callers
+//             needing bounded historical windows. Tier-gating invariant: skips providers whose
+//             `supports(OhlcRange)` is false (e.g. CoinGecko Demo) rather than erroring, so the
+//             chain falls through to the next declared provider (REQ-PROV-003/004).
+// @MX:SPEC: SPEC-PROV-001
+pub async fn chain_fetch_ohlc_range(
+    chain: &[Arc<dyn Provider>],
+    market: &MarketQuery,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    interval_secs: i64,
+) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
+    let mut records = Vec::new();
+    let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
+
+    for provider in chain {
+        if !provider.supports(Capability::OhlcRange) {
+            records.push(AttemptRecord {
+                provider: provider.name().to_string(),
+                capability: Capability::OhlcRange,
+                outcome: ProviderOutcome::Unsupported,
+            });
+            continue;
+        }
+
+        match provider
+            .fetch_ohlc_range(market, start, end, interval_secs)
+            .await
+        {
+            Ok(candles) => {
+                records.push(AttemptRecord {
+                    provider: provider.name().to_string(),
+                    capability: Capability::OhlcRange,
+                    outcome: ProviderOutcome::Success,
+                });
+                return (Ok(candles), records);
+            }
+            Err(e) => {
+                records.push(AttemptRecord {
+                    provider: provider.name().to_string(),
+                    capability: Capability::OhlcRange,
                     outcome: ProviderOutcome::Failure,
                 });
                 last_err = e;
@@ -731,5 +816,155 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
+    }
+
+    // ── chain_fetch_ohlc_range: skips non-range providers, returns first success ──
+
+    struct RangeIncapableProvider;
+    struct RangeCapableProvider {
+        candles: Vec<OhlcCandle>,
+    }
+
+    #[async_trait]
+    impl Provider for RangeIncapableProvider {
+        fn name(&self) -> &str {
+            "stub_no_range"
+        }
+        fn supports(&self, cap: Capability) -> bool {
+            matches!(cap, Capability::Ohlc) // Ohlc yes, OhlcRange no
+        }
+        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Spot))
+        }
+        async fn fetch_ohlc(
+            &self,
+            _m: &MarketQuery,
+            _d: u32,
+            _interval_secs: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMetadata))
+        }
+        async fn fetch_coin_market(
+            &self,
+            _id: &str,
+            _vs: &str,
+        ) -> Result<CoinMarket, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMarket))
+        }
+        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Derivatives))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_tickers(
+            &self,
+            _coin_id: &str,
+            _cap: usize,
+        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        // fetch_ohlc_range: relies on the trait default (NotSupported).
+    }
+
+    #[async_trait]
+    impl Provider for RangeCapableProvider {
+        fn name(&self) -> &str {
+            "stub_range"
+        }
+        fn supports(&self, cap: Capability) -> bool {
+            matches!(cap, Capability::Ohlc | Capability::OhlcRange)
+        }
+        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Spot))
+        }
+        async fn fetch_ohlc(
+            &self,
+            _m: &MarketQuery,
+            _d: u32,
+            _interval_secs: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_ohlc_range(
+            &self,
+            _m: &MarketQuery,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+            _interval_secs: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(self.candles.clone())
+        }
+        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMetadata))
+        }
+        async fn fetch_coin_market(
+            &self,
+            _id: &str,
+            _vs: &str,
+        ) -> Result<CoinMarket, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMarket))
+        }
+        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Derivatives))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_tickers(
+            &self,
+            _coin_id: &str,
+            _cap: usize,
+        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_ohlc_range_skips_non_range_provider_and_returns_first_success() {
+        let candle = OhlcCandle {
+            market_id: 1,
+            interval: "1d".to_string(),
+            ts: Utc::now(),
+            open: rust_decimal_macros::dec!(1),
+            high: rust_decimal_macros::dec!(2),
+            low: rust_decimal_macros::dec!(1),
+            close: rust_decimal_macros::dec!(1.5),
+            volume: None,
+            vs_currency: "usd".to_string(),
+            source: "stub_range".to_string(),
+        };
+
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(RangeIncapableProvider),
+            Arc::new(RangeCapableProvider {
+                candles: vec![candle],
+            }),
+        ];
+
+        let market = stub_market();
+        let start = Utc::now() - chrono::Duration::days(30);
+        let end = Utc::now();
+        let (result, records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+
+        let candles = result.expect("should fall through to range-capable provider");
+        assert_eq!(candles.len(), 1);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].provider, "stub_no_range");
+        assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
+        assert_eq!(records[1].provider, "stub_range");
+        assert_eq!(records[1].outcome, ProviderOutcome::Success);
     }
 }

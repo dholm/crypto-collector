@@ -209,6 +209,27 @@ async fn main() -> Result<()> {
     );
     info!("crypto-collector: provider chain = {:?}", provider_names);
 
+    // ── Step 8b: Once-per-coin startup historical backfill (idempotent) ───────
+    // Enqueues a `candles` backfill job per tracked coin with a multi-year lookback
+    // window; `ON CONFLICT (coin_id, dataset) DO NOTHING` means re-deploys never
+    // duplicate or restart a backfill already enqueued for a coin. A failure here
+    // must not abort startup — the workers still run without it.
+    let backfill_lookback_days = config::backfill_lookback_days();
+    match crypto_collector::collectors::backfill::enqueue_startup_backfills(
+        &pool,
+        backfill_lookback_days,
+    )
+    .await
+    {
+        Ok((enqueued, skipped)) => info!(
+            enqueued,
+            skipped,
+            lookback_days = backfill_lookback_days,
+            "startup backfill: enqueued {enqueued}, skipped {skipped} (lookback {backfill_lookback_days}d)"
+        ),
+        Err(e) => tracing::warn!(error = %e, "startup backfill: enqueue failed; continuing without it"),
+    }
+
     // ── Step 9: Spawn workers (SPEC-SCHED-001) + gauge-refresh task ───────────
     let worker_cfg = crypto_collector::collectors::WorkerConfig::from_env();
     let supervisor = crypto_collector::collectors::spawn_workers(
