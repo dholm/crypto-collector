@@ -305,6 +305,10 @@ pub struct CycleOverlayPointDto {
     #[serde(with = "rust_decimal::serde::str")]
     pub norm_cycle_low: Decimal,
     pub halving_baseline_approximate: bool,
+    /// `true` when this point is a forward projection of the last completed cycle's shape
+    /// onto the current cycle, out to the next halving, rather than a real observed daily
+    /// candle (REQ-CYCLE-060). Additive/backward-compatible field.
+    pub projected: bool,
 }
 
 impl From<CycleOverlayPoint> for CycleOverlayPointDto {
@@ -320,6 +324,7 @@ impl From<CycleOverlayPoint> for CycleOverlayPointDto {
             norm_halving: p.norm_halving,
             norm_cycle_low: p.norm_cycle_low,
             halving_baseline_approximate: p.halving_baseline_approximate,
+            projected: p.projected,
         }
     }
 }
@@ -474,6 +479,7 @@ mod tests {
             norm_halving: dec!(0.465116279069767441860465116),
             norm_cycle_low: dec!(1),
             halving_baseline_approximate: false,
+            projected: false,
         }
     }
 

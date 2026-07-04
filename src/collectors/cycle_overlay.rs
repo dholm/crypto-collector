@@ -83,6 +83,9 @@ pub struct OverlayPoint {
     pub norm_halving: Decimal,
     pub norm_cycle_low: Decimal,
     pub halving_baseline_approximate: bool,
+    /// `true` when this point is a forward projection (REQ-CYCLE-060), not a real candle.
+    /// Always `false` for points produced by `compute_overlay`.
+    pub projected: bool,
 }
 
 /// Compute the cycle overlay from a coin's daily `(date, close)` series (D7/D8/D9).
@@ -155,11 +158,107 @@ pub fn compute_overlay(mut daily: Vec<(NaiveDate, Decimal)>) -> Vec<OverlayPoint
                 norm_halving: price / anchor_price,
                 norm_cycle_low: price / cycle_low,
                 halving_baseline_approximate: approximate,
+                projected: false,
             });
         }
     }
 
     result
+}
+
+// ── Forward projection: extend the current cycle to the next halving (REQ-CYCLE-060) ──
+
+/// Project the current (in-progress) cycle forward by repeating the last completed cycle's
+/// shape, out to that reference cycle's own extent (i.e. to the next halving).
+///
+/// `current_cycle` is the highest `cycle_number` present in `real_points`. `reference_cycle`
+/// is the highest cycle_number below it that is "completed" — it has a successor halving date
+/// in `halving_dates` — and has at least one real point. For each reference-cycle point whose
+/// `days_since_halving` exceeds the current cycle's real max, a projected point is emitted with
+/// `cycle_number` = current cycle, a real future `ts`, and the reference cycle's
+/// `norm_halving`/`norm_cycle_low` shape re-applied to the current cycle's own anchor price.
+/// Returns an empty vec (not an error) when there are no real points, no completed reference
+/// cycle, or the reference cycle has no points beyond the current cycle's real coverage.
+///
+// @MX:ANCHOR: [AUTO] project_current_cycle — forward-projection boundary consumed by the
+//             recompute driver; the read route's ordering/cursor contract depends on
+//             projected points continuing to carry `cycle_number` = current cycle so they sort
+//             after real current-cycle points under the existing `(cycle_number,
+//             days_since_halving)` keyset order.
+// @MX:REASON: Projected points repeat the last COMPLETED cycle's shape onto the current cycle,
+//             only out to the next halving, and are recomputed (shrinking) on every tick as
+//             real data grows — never persisted as if they were observed candles. Getting the
+//             "completed" test wrong (e.g. allowing the current cycle as its own reference)
+//             would project a cycle onto itself. Decimal throughout — never f64 (REQ-PROV-012).
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-060 REQ-CYCLE-061 REQ-CYCLE-062
+pub fn project_current_cycle(
+    real_points: &[OverlayPoint],
+    halving_dates: &[NaiveDate],
+) -> Vec<OverlayPoint> {
+    let Some(current_cycle) = real_points.iter().map(|p| p.cycle_number).max() else {
+        return vec![];
+    };
+
+    let mut current_points: Vec<&OverlayPoint> = real_points
+        .iter()
+        .filter(|p| p.cycle_number == current_cycle)
+        .collect();
+    if current_points.is_empty() {
+        return vec![];
+    }
+    current_points.sort_by_key(|p| p.days_since_halving);
+    let current_halving_date = current_points[0].halving_date;
+    let current_max_dsh = current_points
+        .last()
+        .expect("non-empty by construction")
+        .days_since_halving;
+    let anchor_price = current_points[0].price;
+    let approximate = current_points[0].halving_baseline_approximate;
+
+    // The reference cycle is the highest cycle below current_cycle that is fully completed —
+    // i.e. it has a successor halving date in the compiled table — and has real points.
+    let mut candidate_cycles: Vec<i32> = real_points
+        .iter()
+        .map(|p| p.cycle_number)
+        .filter(|&c| c < current_cycle)
+        .collect();
+    candidate_cycles.sort_unstable();
+    candidate_cycles.dedup();
+
+    let Some(reference_cycle) = candidate_cycles
+        .into_iter()
+        .rev()
+        .find(|&c| (c as usize) < halving_dates.len())
+    else {
+        return vec![];
+    };
+
+    let mut reference_points: Vec<&OverlayPoint> = real_points
+        .iter()
+        .filter(|p| p.cycle_number == reference_cycle)
+        .collect();
+    reference_points.sort_by_key(|p| p.days_since_halving);
+
+    let mut projected = Vec::new();
+    for rp in reference_points {
+        if rp.days_since_halving <= current_max_dsh {
+            continue;
+        }
+        let dsh = rp.days_since_halving;
+        projected.push(OverlayPoint {
+            cycle_number: current_cycle,
+            halving_date: current_halving_date,
+            days_since_halving: dsh,
+            ts: current_halving_date + chrono::Duration::days(dsh),
+            price: anchor_price * rp.norm_halving,
+            norm_halving: rp.norm_halving,
+            norm_cycle_low: rp.norm_cycle_low,
+            halving_baseline_approximate: approximate,
+            projected: true,
+        });
+    }
+
+    projected
 }
 
 // ── Recompute driver (REQ-CYCLE-041/042/043) ──────────────────────────────────
@@ -198,7 +297,9 @@ pub async fn recompute_cycle_overlay(
         native_rows
     };
 
-    let points = compute_overlay(daily);
+    let mut points = compute_overlay(daily);
+    let projected = project_current_cycle(&points, &halving_dates());
+    points.extend(projected);
 
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM cycle_overlay_points WHERE coin_id = $1 AND vs_currency = $2")
@@ -211,8 +312,9 @@ pub async fn recompute_cycle_overlay(
         sqlx::query(
             "INSERT INTO cycle_overlay_points \
                 (coin_id, vs_currency, cycle_number, halving_date, days_since_halving, \
-                 ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate, \
+                 projected) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(coin_id)
         .bind(vs_currency)
@@ -224,6 +326,7 @@ pub async fn recompute_cycle_overlay(
         .bind(p.norm_halving)
         .bind(p.norm_cycle_low)
         .bind(p.halving_baseline_approximate)
+        .bind(p.projected)
         .execute(&mut *tx)
         .await?;
     }
@@ -552,6 +655,113 @@ mod tests {
         let _price: Decimal = points[0].price;
         let _nh: Decimal = points[0].norm_halving;
         let _ncl: Decimal = points[0].norm_cycle_low;
+    }
+
+    // ── project_current_cycle: forward projection (REQ-CYCLE-060/061/062) ────────
+
+    // Repeats the reference (last completed) cycle's shape onto the current cycle for days
+    // beyond the current cycle's real coverage, with correct future ts/price/projected flag.
+    #[test]
+    fn project_current_cycle_repeats_reference_shape_beyond_real_coverage() {
+        let cycle3_halving = d(2020, 5, 11);
+        let cycle4_halving = d(2024, 4, 20);
+
+        // Reference cycle 3: halving day + a day at dsh=500 with norm_halving = 2.0.
+        let daily = vec![
+            (cycle3_halving, dec!(8600)),
+            (cycle3_halving + chrono::Duration::days(500), dec!(17200)),
+            // Current cycle 4: only the halving day is real so far (dsh 0).
+            (cycle4_halving, dec!(60000)),
+        ];
+        let real_points = compute_overlay(daily);
+
+        let projected = project_current_cycle(&real_points, &halving_dates());
+
+        // Only one projected point beyond dsh=0: the reference's dsh=500 point.
+        assert_eq!(projected.len(), 1);
+        let p = &projected[0];
+        assert_eq!(p.cycle_number, 4);
+        assert_eq!(p.halving_date, cycle4_halving);
+        assert_eq!(p.days_since_halving, 500);
+        assert_eq!(p.ts, cycle4_halving + chrono::Duration::days(500));
+        assert!(p.projected);
+        // price = current cycle's anchor (60000) * reference norm_halving (2.0) = 120000.
+        assert_eq!(p.price, dec!(120000));
+        assert_eq!(p.norm_halving, dec!(2));
+    }
+
+    // Does NOT emit points at or below the current cycle's real max days_since_halving —
+    // real points are never overwritten/duplicated by projection.
+    #[test]
+    fn project_current_cycle_does_not_emit_at_or_below_real_max_dsh() {
+        let cycle3_halving = d(2020, 5, 11);
+        let cycle4_halving = d(2024, 4, 20);
+        let daily = vec![
+            (cycle3_halving, dec!(8600)),
+            (cycle3_halving + chrono::Duration::days(100), dec!(9000)),
+            (cycle4_halving, dec!(60000)),
+            (cycle4_halving + chrono::Duration::days(100), dec!(65000)),
+        ];
+        let real_points = compute_overlay(daily);
+        let projected = project_current_cycle(&real_points, &halving_dates());
+        assert!(
+            projected.iter().all(|p| p.days_since_halving > 100),
+            "no projected point may fall at or below the real max dsh (100)"
+        );
+    }
+
+    // Stops at the reference cycle's own max days_since_halving (extent = next halving) —
+    // never extends further than the reference cycle itself reached.
+    #[test]
+    fn project_current_cycle_stops_at_reference_cycle_extent() {
+        let cycle3_halving = d(2020, 5, 11);
+        let cycle4_halving = d(2024, 4, 20);
+        let daily = vec![
+            (cycle3_halving, dec!(8600)),
+            (cycle3_halving + chrono::Duration::days(300), dec!(9000)), // reference max dsh
+            (cycle4_halving, dec!(60000)),
+        ];
+        let real_points = compute_overlay(daily);
+        let projected = project_current_cycle(&real_points, &halving_dates());
+        assert!(projected.iter().all(|p| p.days_since_halving <= 300));
+        assert!(projected.iter().any(|p| p.days_since_halving == 300));
+    }
+
+    // Missing reference cycle (no completed prior cycle with data) → zero projected points,
+    // not an error.
+    #[test]
+    fn project_current_cycle_missing_reference_yields_zero_points() {
+        // Only current-cycle (4) data — no earlier completed cycle present.
+        let cycle4_halving = d(2024, 4, 20);
+        let daily = vec![(cycle4_halving, dec!(60000))];
+        let real_points = compute_overlay(daily);
+        let projected = project_current_cycle(&real_points, &halving_dates());
+        assert!(projected.is_empty());
+    }
+
+    // No real points at all → zero projected points.
+    #[test]
+    fn project_current_cycle_no_real_points_yields_zero_points() {
+        let projected = project_current_cycle(&[], &halving_dates());
+        assert!(projected.is_empty());
+    }
+
+    // norm_halving/price on projected points are Decimal-typed (REQ-PROV-012/024).
+    #[test]
+    fn project_current_cycle_fields_are_decimal_typed() {
+        let cycle3_halving = d(2020, 5, 11);
+        let cycle4_halving = d(2024, 4, 20);
+        let daily = vec![
+            (cycle3_halving, dec!(8600)),
+            (cycle3_halving + chrono::Duration::days(50), dec!(9000)),
+            (cycle4_halving, dec!(60000)),
+        ];
+        let real_points = compute_overlay(daily);
+        let projected = project_current_cycle(&real_points, &halving_dates());
+        assert!(!projected.is_empty());
+        let _price: Decimal = projected[0].price;
+        let _nh: Decimal = projected[0].norm_halving;
+        let _ncl: Decimal = projected[0].norm_cycle_low;
     }
 
     // ── select_widest_source_interval: overlay daily-source selection ─────────────

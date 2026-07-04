@@ -775,6 +775,7 @@ components:
         - norm_halving
         - norm_cycle_low
         - halving_baseline_approximate
+        - projected
       properties:
         coin_id:
           type: string
@@ -811,6 +812,13 @@ components:
           description: >
             true when the exact halving-date candle was absent and the anchor was
             forward-searched to the first available day (REQ-CYCLE-032).
+        projected:
+          type: boolean
+          description: >
+            true when this point is a forward projection of the last completed cycle's shape
+            onto the current cycle, out to the next halving, rather than a real observed daily
+            candle (REQ-CYCLE-060). Projected points are provisional and recomputed on every
+            recompute tick.
 
     CycleOverlayPointPage:
       allOf:

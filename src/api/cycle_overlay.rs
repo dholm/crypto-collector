@@ -70,7 +70,8 @@ pub async fn list_cycle_overlay(
     // coin with no computed overlay simply matches zero rows below — HTTP 200 empty page.
     let items: Vec<CycleOverlayPoint> = sqlx::query_as(
         "SELECT coin_id, vs_currency, cycle_number, halving_date, days_since_halving, \
-                ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate \
+                ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate, \
+                projected \
          FROM cycle_overlay_points \
          WHERE coin_id = $1 \
            AND vs_currency = $2 \
@@ -166,6 +167,7 @@ mod tests {
             norm_halving: dec!(1),
             norm_cycle_low: dec!(1),
             halving_baseline_approximate: false,
+            projected: false,
         }
     }
 

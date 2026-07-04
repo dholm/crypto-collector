@@ -32,6 +32,11 @@ recomputation is [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (collection-queue w
 
 ## HISTORY
 
+- 2026-07-04 (v0.2.0): Added a forward-projected extension of the current (in-progress) cycle
+  (REQ-CYCLE-060/061/062): repeats the last COMPLETED cycle's shape onto the current cycle out
+  to the next halving, flagged `projected = true`. New `projected` column/field
+  (backward-compatible, defaults `false`). Supersedes the "No forecasting" exclusion for this
+  narrow, clearly-flagged case — real historical points and their semantics are unchanged.
 - 2026-07-04 (v0.1.0): Initial draft. Derived Bitcoin halving-cycle overlay computed locally
   from persisted daily (`1d`) `coin_candles` — no Bitbo scrape, no new upstream provider. Two
   normalization baselines stored per point (halving-day anchor and cycle-low anchor), both
@@ -283,6 +288,28 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   (SPEC-API-001 REQ-API-002/003), the system shall add this endpoint, its response schema (both
   baselines), and its operationId to that document and keep it in parity via the doc-parity test.
 
+### Forward-projected current cycle (v0.2.0)
+
+- **REQ-CYCLE-060** (Ubiquitous): The system shall extend the current (highest-numbered,
+  in-progress) cycle with forward-projected points that repeat the last COMPLETED cycle's
+  shape — the highest cycle_number below the current cycle that has a successor halving date
+  and at least one real point — for each of that reference cycle's points whose
+  `days_since_halving` exceeds the current cycle's real maximum, up to the reference cycle's own
+  maximum `days_since_halving` (i.e. out to the next halving).
+- **REQ-CYCLE-061** (Ubiquitous): Each projected point shall carry `cycle_number` equal to the
+  current cycle, a real future `ts` (`current cycle's halving_date + days_since_halving days`), a
+  `price` computed as `current_cycle_anchor_price * reference_point.norm_halving` (`Decimal`,
+  never `f64` — REQ-CYCLE-024/REQ-PROV-012), the reference point's `norm_halving` and
+  `norm_cycle_low` values re-applied unchanged, and `projected = true`; real historical points
+  shall carry `projected = false`. Projected points shall sort after real current-cycle points
+  under the existing `(cycle_number, days_since_halving)` order (REQ-CYCLE-050/051) with no
+  change to the cursor/keyset contract.
+- **REQ-CYCLE-062** (Unwanted): If there is no completed reference cycle with real points, or the
+  current cycle has no real points at all, then the system shall emit zero projected points — this
+  is not an error (mirrors REQ-CYCLE-030/031). Projected points are provisional: they are
+  recomputed on every recompute tick and their span shrinks as the current cycle's real data grows
+  (same idempotent-rebuild contract as REQ-CYCLE-034/041).
+
 ## Exclusions (What NOT to Build)
 
 - **No Bitbo scraping / no Turnstile bypass** — the "Cycle Repeat" data is derived locally from
@@ -295,8 +322,10 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
 - **No days-since-low X-axis** — the cycle-low baseline is deliberately plotted against
   `days_since_halving`; a days-since-low re-basing is explicitly out of scope and must not be added
   as a "fix" (REQ-CYCLE-023).
-- **No forecasting** — the next halving date and future prices are not predicted; the in-progress
-  cycle is open-ended and extends only to real data (REQ-CYCLE-012).
+- **No forecasting beyond the flagged projection** — the next halving date and future prices are
+  not predicted using models, trends, or external inputs; the only forward-looking data is the
+  explicitly `projected = true` repetition of the last completed cycle's shape (REQ-CYCLE-060),
+  which is provisional, recomputed every tick, and never presented as an unflagged real point.
 - **No generic / altcoin cycle model** — halving cycles are Bitcoin-specific; the overlay is
   computed for the single configured target coin, and other coins yield an empty page
   (REQ-CYCLE-052). No configurable per-coin cycle schedules.

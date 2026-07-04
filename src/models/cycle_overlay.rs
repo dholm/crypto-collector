@@ -28,4 +28,7 @@ pub struct CycleOverlayPoint {
     /// `true` when the halving-day anchor was forward-searched because the exact
     /// halving-date candle was absent (D8, REQ-CYCLE-032).
     pub halving_baseline_approximate: bool,
+    /// `true` when this point is a forward projection of the last completed cycle's shape
+    /// onto the current cycle, rather than a real observed daily candle (REQ-CYCLE-060).
+    pub projected: bool,
 }
