@@ -181,7 +181,7 @@ Durable work queue for coin/market data collection tasks. Workers claim rows ato
 | `id` | BIGSERIAL | NOT NULL | — | |
 | `target_kind` | TEXT | NOT NULL | — | CHECK IN (`coin`, `market`) |
 | `target_id` | TEXT | NOT NULL | — | coin_id text, or market_id-as-text (legacy) |
-| `kind` | TEXT | NOT NULL | — | CHECK IN (`spot`, `candles`, `metadata`, `market`, `derivatives`, `cycle_overlay`) — widened by 0014 |
+| `kind` | TEXT | NOT NULL | — | CHECK IN (`spot`, `candles`, `metadata`, `market`, `derivatives`, `cycle_overlay`, `rollup`) — widened by 0014 (cycle_overlay) and 0016 (rollup) |
 | `status` | TEXT | NOT NULL | `'pending'` | CHECK IN (`pending`, `claimed`, `running`, `done`, `failed`) |
 | `claimed_by` | TEXT | NULL | — | |
 | `lease_expires_at` | TIMESTAMPTZ | NULL | — | |
@@ -194,13 +194,13 @@ Durable work queue for coin/market data collection tasks. Workers claim rows ato
 - **PK**: `(id)`
 - **FK**: none (target is polymorphic via `target_kind`/`target_id`)
 - **Constraints**:
-  - `collection_queue_kind_check` — CHECK on `kind`, redefined by `0014` to add `'cycle_overlay'`
+  - `collection_queue_kind_check` — CHECK on `kind`, redefined by `0014` to add `'cycle_overlay'`, further widened by `0016` to add `'rollup'`
   - `target_kind` CHECK, `status` CHECK (both from 0007, unchanged)
 - **Indexes**:
   - `collection_queue_dedup_idx` — UNIQUE(`target_kind, target_id, kind`) WHERE `status IN ('pending','claimed','running')` — at most one live item per target+kind
   - `collection_queue_claim_pending_idx` — btree(`enqueued_at`) WHERE `status = 'pending'`
   - `collection_queue_claim_lease_expired_idx` — btree(`lease_expires_at`) WHERE `status IN ('claimed','running')`
-- **Last migration touching this table**: `0014_collection_queue_cycle_overlay_kind.sql`
+- **Last migration touching this table**: `0016_collection_queue_rollup_kind.sql`
 
 ---
 

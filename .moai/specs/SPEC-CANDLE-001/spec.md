@@ -1,7 +1,7 @@
 ---
 id: SPEC-CANDLE-001
-version: 0.2.2
-status: draft
+version: 1.0.0
+status: completed
 created: 2026-07-05
 updated: 2026-07-05
 author: dholm
@@ -64,6 +64,30 @@ new collection-queue kind is [SPEC-CYCLE-001](../SPEC-CYCLE-001/spec.md) (`cycle
   forward-only incremental maintenance on each candle refresh. Read-time coverage-aware
   aggregation is preserved as the fallback for any coin/interval lacking materialized rows. New
   `REQ-CANDLE-0NN` range. Brownfield — see delta markers.
+
+---
+
+## Implementation Notes
+
+**Status**: Completed and deployed to `finance` namespace (2026-07-05).
+
+**Commits**: cdae6eb (SPEC document), daa34c4 (implementation).
+
+**Files Modified**:
+- NEW `src/collectors/rollup.rs` — Rollup materializer implementing three phases: pure-Rust `materialize_from_source` / `reconcile_window` functions for bucketing, batched partition-safe insert via `ensure_candle_partition`, and DB orchestration (`backfill_target` for full-history backfill, `incremental_recompute_target` for window-bounded forward-only recompute, `run_rollup` for queue dispatch).
+- NEW `migrations/0016_collection_queue_rollup_kind.sql` — Widened `collection_queue_kind_check` to include `rollup` (using DROP/ADD pattern from template migration 0014).
+- MODIFIED `src/collectors/mod.rs` — Registered `rollup` module.
+- MODIFIED `src/collectors/collection_queue.rs` — Added network-free `("coin","rollup")` dispatch arm, enqueued after the `("coin","candles")` completion arm.
+- MODIFIED `src/main.rs` — Added `"rollup"` to `REFRESH_KINDS` periodic backstop (REQ-CANDLE-021).
+- NEW tests: 6 unit tests in `src/collectors/rollup.rs`, 1 `#[ignore]` DB native-precedence test in `src/api/candles.rs`, 1 constraint validation test in `tests/migration_files.rs`.
+
+**Implementation Approach**: As-built exactly matches the SPEC — reuses `select_source_interval` / `aggregate_candles` / `bucket_start` / `fold_volume` unchanged; only relabels `source` → `rollup:<interval>`. Backfill is chunked week-aligned per REQ-CANDLE-010/011/012. Forward-only incremental with window-reconcile per REQ-CANDLE-020/022. Network-free dispatch per REQ-CANDLE-024.
+
+**Quality Gate** (independently re-run): `cargo fmt --check` clean, `cargo clippy --all-targets --all-features -- -D warnings` zero warnings, `cargo test` 468 passed / 0 failed / 53 ignored.
+
+**Live Validation** (after `make deploy` to `finance` cluster): New pod 1/1 with 0 restarts (full-history backfill completed with NO 256Mi OOM). Migration 0016 applied. BTC `1d` = 3,210 native `rollup:5m` rows spanning 2017-08-18 → 2026-07-05; full page-walk = 4 pages in **0.139s** (prior ~19 aggregation pages / ~15.4s tripped the client's 3s timeout). BTC `1w` = 433 `rollup:5m` rows, epoch-Thursday-aligned (`ts%604800==0`), 160ms. Forming buckets current (1d=today, 1w=this week) → incremental maintenance confirmed working.
+
+**Read-Path Fallback**: Coverage-aware read-time aggregation preserved for un-materialized coins/intervals (REQ-CANDLE-030/031).
 
 ---
 

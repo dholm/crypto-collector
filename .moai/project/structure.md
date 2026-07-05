@@ -113,6 +113,7 @@ crypto-collector/
 - **`live_poller.rs`**: Spawned background task; polls primary provider at configurable interval (e.g., 30s). Inserts or updates quotes in DB.
 - **`collection_queue.rs`**: Durable work queue for historical data collection. Uses `SELECT ... FOR UPDATE SKIP LOCKED` to claim unprocessed work rows, preventing duplicate work across replicas. Implements lease/heartbeat/retry.
 - **`backfill.rs`**: Spawned background task; fills gaps in historical candle data. Queries the gaps table, requests missing intervals from providers, and backfills the quotes table.
+- **`rollup.rs`**: Network-free materializer that computes and maintains native 1d/1w OHLCV rollups from finer candles; driven by the `collection_queue` `kind='rollup'` dispatch, with chunked full-history backfill and forward-only incremental maintenance via window-reconcile.
 
 **`api/v1/`**
 - **`quotes.rs`**: `GET /api/v1/quotes` (list recent snapshots), `GET /api/v1/quotes/:pair` (latest quote for a pair).

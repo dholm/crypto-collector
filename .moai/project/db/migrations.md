@@ -25,6 +25,7 @@ for the final, cumulative table state — this file documents intent per migrati
 | 0013 | `0013_cycle_overlay.sql` | Creates `cycle_overlay_points`, a materialised, idempotently-rebuilt derived-analytics table for the Bitcoin halving-cycle overlay, with a read-route pagination index. | No |
 | 0014 | `0014_collection_queue_cycle_overlay_kind.sql` | Drops and recreates the `collection_queue_kind_check` CHECK constraint on `collection_queue.kind` to widen the enum with `'cycle_overlay'` (fixes a runtime constraint-violation bug that silently prevented the overlay recompute from being enqueued). | Constraint replace (not data-destructive) |
 | 0015 | `0015_cycle_overlay_projected.sql` | `ALTER TABLE cycle_overlay_points ADD COLUMN projected BOOLEAN NOT NULL DEFAULT FALSE` to distinguish real vs. projected (next-cycle-repeat) overlay points. | No (additive) |
+| 0016 | `0016_collection_queue_rollup_kind.sql` | Drops and recreates the `collection_queue_kind_check` CHECK constraint to widen the enum with `'rollup'` (SPEC-CANDLE-001, native 1d/1w OHLCV materialization). Follows the same DROP/ADD pattern as migration 0014. | Constraint replace (not data-destructive) |
 
 ## Destructive operations summary
 
