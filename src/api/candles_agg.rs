@@ -47,39 +47,91 @@ pub fn interval_to_seconds(interval: &str) -> Option<i64> {
     }
 }
 
-/// Select the largest stored interval that evenly divides the target.
+/// Stored-interval coverage: the `[earliest, latest]` timestamp span actually present
+/// for one interval of a `(coin_id, vs_currency)` series.
 ///
-/// Filters `stored` to those whose second-count satisfies
-/// `target_secs % source_secs == 0` (with `source_secs < target_secs`),
-/// excludes non-fixed-duration strings via `interval_to_seconds` returning `None`,
-/// and returns the largest matching divisor (the stored interval closest to the
-/// target). Returns `None` when no stored interval qualifies.
+/// The caller supplies this (from a `MIN(ts)/MAX(ts) … GROUP BY interval` probe) so the
+/// pure selector can weigh **history depth and staleness**, not just bucket divisibility.
+#[derive(Debug, Clone, Copy)]
+pub struct IntervalCoverage<'a> {
+    pub interval: &'a str,
+    pub earliest: DateTime<Utc>,
+    pub latest: DateTime<Utc>,
+}
+
+/// Select the stored interval that best covers the requested window and evenly divides
+/// the target.
 ///
-/// The largest-divisor rule is authoritative: for a complete bucket, source
-/// granularity does not change the OHLC result at all; it only affects incomplete
-/// buckets, where a larger divisor needs fewer source candles per bucket and
-/// therefore drops fewer interior buckets (REQ-API-205 / D1).
+/// Candidate divisors are the fixed-duration stored intervals with
+/// `source_secs < target_secs` and `target_secs % source_secs == 0` (non-fixed-duration
+/// strings like `1M` are excluded via `interval_to_seconds` returning `None`).
+///
+/// Among divisors, the one whose stored span best covers the requested window
+/// `[floor, now]` is chosen. Each divisor is scored by the seconds of that window it
+/// **cannot** serve — unreached history at the old end plus staleness at the fresh end:
+///
+/// ```text
+/// floor      = window_start, or the deepest available `earliest` when the request is unbounded
+/// score(c)   = max(0, c.earliest − floor)  +  max(0, now − c.latest)
+/// ```
+///
+/// The lowest score wins; ties fall back to the **larger** divisor. The tie-break
+/// preserves the original fidelity rule: for equally-covering intervals a larger divisor
+/// needs fewer source candles per bucket and therefore drops fewer interior buckets on
+/// gaps (REQ-API-205 / D1). Returns `None` when no stored interval qualifies.
+///
+/// Rationale: divisibility alone is blind to coverage. Two stored intervals can both
+/// divide `1d` while spanning wildly different date ranges (e.g. a 9-year `5m` backfill
+/// vs a 1-month `4h` series); picking the largest divisor silently served the shallow,
+/// stale one. Coverage scoring picks the series that actually holds the requested history
+/// and reaches the freshest candle, while keeping largest-divisor fidelity when spans tie.
 ///
 // @MX:ANCHOR: [AUTO] select_source_interval — correctness core for aggregation source selection
 // @MX:REASON: Divisibility is `target_secs % source_secs == 0`; non-fixed-duration
 //             intervals (e.g. `1M`) are excluded via interval_to_seconds returning None.
-//             Largest divisor must be returned, not smallest (REQ-API-205). fan_in >= 3:
-//             list_candles handler + T-002/T-008 unit tests + acceptance scenarios.
+//             Coverage score (deep-miss + stale-miss) is minimized; ties fall back to the
+//             larger divisor (REQ-API-205). fan_in >= 3: list_candles handler + unit tests
+//             + acceptance scenarios.
 // @MX:SPEC: SPEC-API-003 REQ-API-203 REQ-API-204 REQ-API-205
-pub fn select_source_interval<'a>(stored: &[&'a str], target_secs: i64) -> Option<&'a str> {
-    stored
+pub fn select_source_interval<'a>(
+    stored: &[IntervalCoverage<'a>],
+    target_secs: i64,
+    window_start: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<&'a str> {
+    // Candidate divisors: fixed-duration intervals strictly smaller than the target that
+    // divide it evenly (non-fixed-duration strings excluded via interval_to_seconds → None).
+    let divisors: Vec<(i64, &IntervalCoverage)> = stored
         .iter()
-        .filter_map(|&s| {
-            let secs = interval_to_seconds(s)?;
-            // source must be strictly smaller than target AND divide it evenly
-            if secs < target_secs && target_secs % secs == 0 {
-                Some((secs, s))
-            } else {
-                None
-            }
+        .filter_map(|c| {
+            let secs = interval_to_seconds(c.interval)?;
+            (secs < target_secs && target_secs % secs == 0).then_some((secs, c))
         })
-        .max_by_key(|&(secs, _)| secs)
-        .map(|(_, s)| s)
+        .collect();
+
+    // Requested-window floor: an explicit `start` bounds the old end; an unbounded request
+    // wants full history, so the floor is the deepest available `earliest` — giving the
+    // interval that reaches furthest back a zero deep-miss.
+    let floor = window_start.unwrap_or_else(|| {
+        divisors
+            .iter()
+            .map(|(_, c)| c.earliest)
+            .min()
+            .unwrap_or(now)
+    });
+
+    // Score = seconds of the requested window [floor, now] the interval cannot serve:
+    // unreached history at the old end (deep-miss) plus staleness at the fresh end
+    // (stale-miss). Lowest score wins; ties fall back to the larger divisor for
+    // gap-tolerant fidelity (REQ-API-205).
+    divisors
+        .iter()
+        .min_by_key(|(secs, c)| {
+            let deep_miss = (c.earliest - floor).num_seconds().max(0);
+            let stale_miss = (now - c.latest).num_seconds().max(0);
+            (deep_miss + stale_miss, std::cmp::Reverse(*secs))
+        })
+        .map(|(_, c)| c.interval)
 }
 
 // ── Bucket alignment ──────────────────────────────────────────────────────────
@@ -252,6 +304,20 @@ mod tests {
         DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
     }
 
+    // Equal-coverage helper for divisibility-focused selector tests: every interval shares
+    // one span [epoch 0, epoch 1_000_000], so coverage is held constant and the test isolates
+    // the divisibility rule + largest-divisor tie-break. Paired with `now = ts_epoch(1_000_000)`
+    // so `stale_miss` is zero for all candidates.
+    fn cov(interval: &str) -> IntervalCoverage<'_> {
+        IntervalCoverage {
+            interval,
+            earliest: ts_epoch(0),
+            latest: ts_epoch(1_000_000),
+        }
+    }
+
+    const SEL_NOW: i64 = 1_000_000;
+
     fn make_candle(
         ts: DateTime<Utc>,
         open: Decimal,
@@ -418,26 +484,29 @@ mod tests {
     }
 
     // ── T-002: select_source_interval ──────────────────────────────────────────
-    // Scenario 2 (REQ-API-205): 4h←1h when {1h,15m,5m,1m} are stored.
+    // With coverage held equal (via `cov` + `SEL_NOW`), these isolate the divisibility rule
+    // and the largest-divisor tie-break — the behaviour preserved from the pre-coverage rule.
 
     #[test]
     fn select_4h_from_mixed_picks_1h() {
         // Target 4h = 14400s. Largest divisor among {3600,900,300,60} is 3600 (1h).
-        let result = select_source_interval(&["1h", "15m", "5m", "1m"], 14_400);
+        let stored = ["1h", "15m", "5m", "1m"].map(cov);
+        let result = select_source_interval(&stored, 14_400, None, ts_epoch(SEL_NOW));
         assert_eq!(result, Some("1h"));
     }
 
-    // Scenario 3 (REQ-API-205): 1d←4h on a CoinGecko coin storing 30m/4h/4d.
+    // Scenario 3 (REQ-API-205): equal coverage → largest divisor. 1d over 30m/4h/4d.
     #[test]
     fn select_1d_picks_largest_divisor_4h_scenario_3() {
         // Target 1d = 86400. Divisors among stored: 30m(1800, 86400%1800==0 ✓),
         // 4h(14400, 86400%14400==0 ✓), 4d(345600 > 86400 → excluded).
-        // Largest divisor: 14400 → "4h".
-        let result = select_source_interval(&["30m", "4h", "4d"], 86_400);
+        // Coverage equal → tie-break to the largest divisor: 14400 → "4h".
+        let stored = ["30m", "4h", "4d"].map(cov);
+        let result = select_source_interval(&stored, 86_400, None, ts_epoch(SEL_NOW));
         assert_eq!(
             result,
             Some("4h"),
-            "largest divisor of 1d among stored must be 4h"
+            "equal coverage → largest divisor of 1d must be 4h"
         );
     }
 
@@ -446,21 +515,24 @@ mod tests {
     fn select_1h_from_30m_scenario_4() {
         // Target 1h = 3600. 4h(14400 > 3600 → excluded), 4d(345600 → excluded),
         // 30m(1800, 3600%1800==0 ✓) → "30m".
-        let result = select_source_interval(&["30m", "4h", "4d"], 3_600);
+        let stored = ["30m", "4h", "4d"].map(cov);
+        let result = select_source_interval(&stored, 3_600, None, ts_epoch(SEL_NOW));
         assert_eq!(result, Some("30m"));
     }
 
     // Scenario 9/10 (REQ-API-203): 1h over {4h,4d} → None (3600 % 14400 != 0).
     #[test]
     fn select_none_when_no_divisor_scenario_9() {
-        let result = select_source_interval(&["4h", "4d"], 3_600);
+        let stored = ["4h", "4d"].map(cov);
+        let result = select_source_interval(&stored, 3_600, None, ts_epoch(SEL_NOW));
         assert_eq!(result, None, "neither 4h nor 4d divides 1h");
     }
 
     // Scenario 10 (REQ-API-203): 1w←30m (604800 % 1800 == 0 → valid).
     #[test]
     fn select_1w_from_30m_scenario_10() {
-        let result = select_source_interval(&["30m"], 604_800);
+        let stored = ["30m"].map(cov);
+        let result = select_source_interval(&stored, 604_800, None, ts_epoch(SEL_NOW));
         assert_eq!(result, Some("30m"));
     }
 
@@ -469,7 +541,8 @@ mod tests {
     fn select_excludes_calendar_month_interval() {
         // 1M has no fixed second count → interval_to_seconds returns None → excluded.
         // "30m" remains as the only valid divisor of 1d (86400 % 1800 == 0).
-        let result = select_source_interval(&["1M", "30m"], 86_400);
+        let stored = ["1M", "30m"].map(cov);
+        let result = select_source_interval(&stored, 86_400, None, ts_epoch(SEL_NOW));
         assert_eq!(
             result,
             Some("30m"),
@@ -480,15 +553,164 @@ mod tests {
     // Empty stored set.
     #[test]
     fn select_none_on_empty_stored() {
-        assert_eq!(select_source_interval(&[], 14_400), None);
+        let stored: [IntervalCoverage; 0] = [];
+        assert_eq!(
+            select_source_interval(&stored, 14_400, None, ts_epoch(SEL_NOW)),
+            None
+        );
     }
 
     // Source with same secs as target must not be selected (target itself is native path).
     #[test]
     fn select_none_when_source_equals_target() {
         // "4h" stored, target is also 4h — same interval, not a divisor (secs < target required).
-        let result = select_source_interval(&["4h"], 14_400);
+        let stored = ["4h"].map(cov);
+        let result = select_source_interval(&stored, 14_400, None, ts_epoch(SEL_NOW));
         assert_eq!(result, None, "source == target must not be selected");
+    }
+
+    // ── T-002b: coverage-aware selection (this bug) ────────────────────────────
+    // Divisibility alone is blind to how much history each interval holds. When a deep,
+    // fine series and a shallow, stale coarse series both divide the target, the deep one
+    // must win so the derived series spans full history and reaches the freshest candle.
+
+    fn dt(y: i32, mo: u32, d: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(y, mo, d, 0, 0, 0).unwrap()
+    }
+
+    // REGRESSION (reported bug): BTC stores a 9-year 5m backfill plus a 1-month, 4-day-stale
+    // 4h series. A 1d request must aggregate from 5m (deep + fresh), NOT the shallow 4h that
+    // the old largest-divisor rule selected.
+    #[test]
+    fn select_1d_prefers_deep_5m_over_shallow_stale_4h() {
+        let now = dt(2026, 7, 5);
+        let stored = [
+            IntervalCoverage {
+                interval: "5m",
+                earliest: dt(2017, 8, 17),
+                latest: now,
+            },
+            IntervalCoverage {
+                interval: "4h",
+                earliest: dt(2026, 6, 3),
+                latest: dt(2026, 7, 1), // 4 days stale
+            },
+            IntervalCoverage {
+                interval: "1m",
+                earliest: dt(2026, 6, 30),
+                latest: now,
+            },
+        ];
+        let result = select_source_interval(&stored, 86_400, None, now);
+        assert_eq!(
+            result,
+            Some("5m"),
+            "1d must aggregate from the deep 5m series, not the shallow 4h"
+        );
+    }
+
+    // Same defect for 1w — the coarsest divisor was equally blind to depth.
+    #[test]
+    fn select_1w_prefers_deep_5m_over_shallow_stale_4h() {
+        let now = dt(2026, 7, 5);
+        let stored = [
+            IntervalCoverage {
+                interval: "5m",
+                earliest: dt(2017, 8, 17),
+                latest: now,
+            },
+            IntervalCoverage {
+                interval: "4h",
+                earliest: dt(2026, 6, 3),
+                latest: dt(2026, 7, 1),
+            },
+        ];
+        let result = select_source_interval(&stored, 604_800, None, now);
+        assert_eq!(
+            result,
+            Some("5m"),
+            "1w must aggregate from the deep 5m series, not the shallow 4h"
+        );
+    }
+
+    // Fidelity preserved: when a coarser divisor covers the window just as well and is
+    // equally fresh, it wins the tie-break (fewer source candles per bucket → fewer
+    // gap-dropped buckets). No needless downgrade to the finest interval.
+    #[test]
+    fn select_1d_prefers_larger_divisor_when_coverage_equal() {
+        let now = dt(2026, 7, 5);
+        let earliest = dt(2026, 6, 1);
+        let stored = [
+            IntervalCoverage {
+                interval: "5m",
+                earliest,
+                latest: now,
+            },
+            IntervalCoverage {
+                interval: "4h",
+                earliest,
+                latest: now,
+            },
+        ];
+        let result = select_source_interval(&stored, 86_400, None, now);
+        assert_eq!(
+            result,
+            Some("4h"),
+            "equal coverage → larger divisor for gap-tolerant fidelity"
+        );
+    }
+
+    // Staleness term: a fresh fine interval beats a stale coarse one even when both reach
+    // equally far back — this kills the "4-days-stale tail" symptom.
+    #[test]
+    fn select_1d_prefers_fresh_source_over_stale_coarse() {
+        let now = dt(2026, 7, 5);
+        let earliest = dt(2026, 6, 1);
+        let stored = [
+            IntervalCoverage {
+                interval: "5m",
+                earliest,
+                latest: now, // fresh
+            },
+            IntervalCoverage {
+                interval: "4h",
+                earliest,
+                latest: dt(2026, 7, 1), // 4 days stale
+            },
+        ];
+        let result = select_source_interval(&stored, 86_400, None, now);
+        assert_eq!(
+            result,
+            Some("5m"),
+            "stale 4h must lose to fresh 5m via the staleness term"
+        );
+    }
+
+    // Bounded request: an explicit `start` sets the floor. A coarse interval that fully
+    // covers [start, now] wins on fidelity even though a finer one reaches deeper history
+    // the caller did not ask for.
+    #[test]
+    fn select_1d_bounded_window_prefers_covering_larger_divisor() {
+        let now = dt(2026, 7, 5);
+        let start = dt(2026, 6, 10);
+        let stored = [
+            IntervalCoverage {
+                interval: "5m",
+                earliest: dt(2017, 8, 17),
+                latest: now,
+            },
+            IntervalCoverage {
+                interval: "4h",
+                earliest: dt(2026, 6, 3), // covers `start`
+                latest: now,              // fresh in this scenario
+            },
+        ];
+        let result = select_source_interval(&stored, 86_400, Some(start), now);
+        assert_eq!(
+            result,
+            Some("4h"),
+            "both cover [start, now] → larger divisor 4h wins on fidelity"
+        );
     }
 
     // ── T-003: bucket_start ────────────────────────────────────────────────────

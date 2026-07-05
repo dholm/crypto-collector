@@ -20,7 +20,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 
 use super::{
-    candles_agg::{aggregate_candles, interval_to_seconds, select_source_interval},
+    candles_agg::{
+        aggregate_candles, interval_to_seconds, select_source_interval, IntervalCoverage,
+    },
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
     dto::{CoinCandleDto, Page},
     quotes::paginate_ts,
@@ -150,8 +152,14 @@ pub async fn list_candles(
     // Discover the stored interval strings for this coin + currency, select the largest
     // divisor, fetch source candles, fold into target-interval buckets.
 
-    let stored_intervals: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT interval FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2",
+    // Per-interval coverage span (earliest/latest ts), so source selection can weigh history
+    // depth and staleness — not just bucket divisibility. Two stored intervals may both divide
+    // the target while spanning wildly different date ranges (e.g. a 9-year 5m backfill vs a
+    // 1-month 4h series); coverage-aware selection avoids silently serving the shallow one.
+    let coverage_rows: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT interval, MIN(ts) AS earliest, MAX(ts) AS latest \
+         FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2 \
+         GROUP BY interval",
     )
     .bind(&coin_id)
     .bind(&vs_currency)
@@ -163,8 +171,20 @@ pub async fn list_candles(
     let target_secs =
         interval_to_seconds(interval).expect("validated interval must have a known second count");
 
-    let stored_refs: Vec<&str> = stored_intervals.iter().map(String::as_str).collect();
-    let source_interval = match select_source_interval(&stored_refs, target_secs) {
+    // Wall-clock `now` is captured before source selection (staleness weighting) and reused
+    // for aggregation bucket classification, so the pure logic never reads the system clock.
+    let now = Utc::now();
+
+    let coverage: Vec<IntervalCoverage> = coverage_rows
+        .iter()
+        .map(|(iv, earliest, latest)| IntervalCoverage {
+            interval: iv.as_str(),
+            earliest: *earliest,
+            latest: *latest,
+        })
+        .collect();
+
+    let source_interval = match select_source_interval(&coverage, target_secs, params.start, now) {
         Some(si) => si,
         // REQ-API-202: no stored interval divides the target → empty page, not an error.
         None => {
@@ -231,10 +251,6 @@ pub async fn list_candles(
     .await?;
 
     let source_hit_cap = source_rows.len() as i64 >= row_cap;
-
-    // Wall-clock `now` is captured here in the handler so the pure aggregate_candles
-    // function never reads the system clock (makes it hermetically testable).
-    let now = Utc::now();
 
     let mut agg = aggregate_candles(
         source_rows,

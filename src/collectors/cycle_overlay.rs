@@ -916,12 +916,23 @@ mod tests {
             ("1m", 2 * DAY),    // 2 days recent
         ];
         assert_eq!(select_widest_source_interval(&candidates, DAY), Some("5m"));
-        // Document the bug being fixed: the coarsest-divisor selector picks 4h.
-        let names: Vec<&str> = candidates.iter().map(|&(n, _)| n).collect();
+        // Contrast: with coverage held equal, the API selector tie-breaks to the coarser 4h.
+        // (The API selector is now coverage-aware too; fed real spans it also prefers 5m — the
+        // overlay keeps its own selector for its distinct coverage_secs/tie-break contract.)
+        use crate::api::candles_agg::IntervalCoverage;
+        let anchor = chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap();
+        let equal_cov: Vec<IntervalCoverage> = candidates
+            .iter()
+            .map(|&(n, _)| IntervalCoverage {
+                interval: n,
+                earliest: anchor,
+                latest: anchor,
+            })
+            .collect();
         assert_eq!(
-            crate::api::candles_agg::select_source_interval(&names, DAY),
+            crate::api::candles_agg::select_source_interval(&equal_cov, DAY, None, anchor),
             Some("4h"),
-            "old coarsest-divisor selector picks the recent-only 4h — the bug this fixes"
+            "with coverage held equal, the API selector tie-breaks to the coarser 4h"
         );
     }
 
