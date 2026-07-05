@@ -608,6 +608,49 @@ mod tests {
         }
     }
 
+    // Reproduction test 3 (SPEC-CANDLE-001): when materialized rollup 1d rows exist for a
+    // coin, the endpoint must serve them natively — every returned source starts with
+    // `rollup:`, never `aggregated:` — because the coin-scoped native EXISTS probe
+    // short-circuits before read-time aggregation is ever invoked (Load-Bearing Premise).
+    //
+    // Requires: bitcoin registered in tracked_coins with at least one materialized
+    // `interval='1d'` row whose `source` starts with `rollup:` (produced by a prior
+    // `("coin","rollup")` dispatch run).
+    #[tokio::test]
+    #[ignore]
+    async fn db_candle_001_rollup_native_precedence_no_aggregated_source() {
+        let (server, _) = db_test_server();
+        let resp = server
+            .get("/v1/coins/bitcoin/candles")
+            .add_query_param("interval", "1d")
+            .add_query_param("vs_currency", "usd")
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            200,
+            "SPEC-CANDLE-001: native 1d rollup read must be 200"
+        );
+        let body: serde_json::Value = resp.json();
+        let items = body["items"].as_array().expect("items array");
+        assert!(
+            !items.is_empty(),
+            "SPEC-CANDLE-001: materialized 1d rollup rows must exist for this fixture"
+        );
+        for item in items {
+            let src = item["source"].as_str().unwrap_or("");
+            assert!(
+                src.starts_with("rollup:"),
+                "SPEC-CANDLE-001 (Load-Bearing Premise): materialized rows must be served \
+                 natively with a rollup: source, never aggregated: — got {src}"
+            );
+            assert!(
+                !src.starts_with("aggregated:"),
+                "SPEC-CANDLE-001: read-time aggregation must not be invoked when native \
+                 rollup rows exist — got {src}"
+            );
+        }
+    }
+
     // Scenario 2 (REQ-API-201/205/206/208/212): aggregate 4h from 1h candles.
     // Requires: bitcoin with 1h candles, no native 4h.
     #[tokio::test]

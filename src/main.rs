@@ -427,7 +427,10 @@ async fn refresh_tracked_gauges(pool: &sqlx::PgPool) {
 ///
 /// `candles` is included so OHLCV history keeps advancing: without it, candle jobs
 /// are only ever enqueued once at coin registration (`api::coins`) and never refresh.
-const REFRESH_KINDS: &[&str] = &["market", "metadata", "candles"];
+/// `rollup` is included as a backstop (SPEC-CANDLE-001 REQ-CANDLE-021) so materialized
+/// 1d/1w rows stay current even if the post-candles enqueue (REQ-CANDLE-020) is ever missed;
+/// duplicates are dedup-absorbed by the queue's ON CONFLICT DO NOTHING (REQ-CANDLE-023).
+const REFRESH_KINDS: &[&str] = &["market", "metadata", "candles", "rollup"];
 
 /// Enqueue periodic collection tasks (see [`REFRESH_KINDS`]) for every active coin.
 ///
@@ -509,6 +512,15 @@ mod tests {
         // The pre-existing kinds must remain covered.
         assert!(REFRESH_KINDS.contains(&"market"));
         assert!(REFRESH_KINDS.contains(&"metadata"));
+    }
+
+    // SPEC-CANDLE-001 REQ-CANDLE-021: periodic tick must enqueue `rollup` as a backstop.
+    #[test]
+    fn periodic_refresh_includes_rollup_backstop() {
+        assert!(
+            REFRESH_KINDS.contains(&"rollup"),
+            "REQ-CANDLE-021: periodic refresh must enqueue rollup as a backstop"
+        );
     }
 
     // ── Scenario 11: startup sequence SQL targets (REQ-OBS-013) ───────────────

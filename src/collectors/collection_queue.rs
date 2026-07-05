@@ -408,6 +408,13 @@ async fn dispatch_item(
                     .map_err(|e| e.to_string())?;
             }
 
+            // SPEC-CANDLE-001 REQ-CANDLE-020: enqueue a network-free rollup recompute after
+            // every candle refresh so materialized 1d/1w rows stay current. Duplicate items
+            // are dedup-absorbed by enqueue_queue_item's ON CONFLICT DO NOTHING.
+            if let Err(e) = enqueue_queue_item(pool, "coin", coin_id, "rollup").await {
+                warn!("queue_worker: rollup enqueue failed for coin {coin_id}: {e}");
+            }
+
             Ok(true)
         }
 
@@ -581,6 +588,22 @@ async fn dispatch_item(
             crate::collectors::cycle_overlay::recompute_cycle_overlay(pool, coin_id, &vs_currency)
                 .await
                 .map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+
+        ("coin", "rollup") => {
+            // SPEC-CANDLE-001 REQ-CANDLE-024: materialize native 1d/1w OHLCV rollups from
+            // coin_candles. No provider/pacer call — this kind never touches the network,
+            // mirroring the ("coin","cycle_overlay") arm above.
+            let coin_id = &item.target_id;
+            crate::collectors::rollup::run_rollup(
+                pool,
+                coin_id,
+                crate::collectors::rollup::ROLLUP_VS_CURRENCY,
+                Utc::now(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             Ok(true)
         }
 

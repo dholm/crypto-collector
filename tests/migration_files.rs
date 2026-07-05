@@ -395,6 +395,24 @@ fn collection_queue_kind_check_permits_cycle_overlay() {
     );
 }
 
+/// SPEC-CANDLE-001 REQ-CANDLE-042: the collection_queue kind check constraint must permit
+/// 'rollup', otherwise both the post-candles enqueue and the periodic backstop enqueue are
+/// rejected by the database and native 1d/1w rows are never materialized.
+#[test]
+fn collection_queue_kind_check_permits_rollup() {
+    let content = fs::read_to_string("migrations/0016_collection_queue_rollup_kind.sql")
+        .expect("0016_collection_queue_rollup_kind.sql must exist")
+        .to_lowercase();
+    assert!(
+        content.contains("rollup"),
+        "0016 must add 'rollup' to the collection_queue kind check (REQ-CANDLE-042)"
+    );
+    assert!(
+        content.contains("collection_queue_kind_check"),
+        "0016 must target the collection_queue_kind_check constraint (REQ-CANDLE-042)"
+    );
+}
+
 /// REQ-DB-043: all migrations must use IF NOT EXISTS for idempotency.
 #[test]
 fn all_migrations_use_if_not_exists() {
