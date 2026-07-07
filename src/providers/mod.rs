@@ -444,16 +444,25 @@ pub async fn chain_fetch_ohlc(
 /// this historical window" and the chain advances to the next provider — a wider
 /// history source can then fill it. This is what routes a pre-2017 window (empty from
 /// Binance, whose BTC/USDT klines start 2017-08) to Bitstamp (daily BTC/USD from 2011).
-/// If every range-capable provider returns empty, the result is `Ok(vec![])` (no data
-/// anywhere — the backfill worker's empty-page-forward-skip then advances the cursor);
-/// only when every attempt *errors* is an `Err` returned.
+///
+/// Result resolution after the walk:
+/// - a non-empty page short-circuits and returns immediately (first data wins);
+/// - **`Ok(vec![])` only when EVERY range-capable provider returned `Ok(empty)`** — a
+///   genuine "no data anywhere", so the backfill worker's empty-page-forward-skip
+///   advances the cursor;
+/// - **`Err` when ANY provider errored** (even if an earlier one returned `Ok(empty)`) —
+///   an error is not proof of "no data", so the chunk must retry and surface the error
+///   rather than silently skip history. This is deliberately stricter than a plain
+///   "Err only if all error": masking a deep-history source's failure behind a shallow
+///   source's empty page is exactly the bug that hid a missing Bitstamp pacer row.
 ///
 // @MX:ANCHOR: [AUTO] chain_fetch_ohlc_range — date-range OHLC dispatch for historical backfill
 // @MX:REASON: fan_in >= 3: backfill worker process_chunk, provider chain tests, future callers
 //             needing bounded historical windows. Tier-gating invariant: skips providers whose
 //             `supports(OhlcRange)` is false (e.g. CoinGecko Demo). Continue-on-empty invariant:
 //             an Ok(empty) advances to the next provider (deep-history fallthrough to Bitstamp),
-//             NOT short-circuit as in the live path (REQ-PROV-003/004).
+//             NOT short-circuit as in the live path. Error-surfacing invariant: ANY provider
+//             error yields Err (retry) — never masked by an earlier Ok(empty) (REQ-PROV-003/004).
 // @MX:SPEC: SPEC-PROV-001 SPEC-SCHED-001
 pub async fn chain_fetch_ohlc_range(
     chain: &[Arc<dyn Provider>],
@@ -463,10 +472,7 @@ pub async fn chain_fetch_ohlc_range(
     interval_secs: i64,
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
-    let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
-    // At least one provider returned Ok (possibly empty). When true, an all-empty walk
-    // resolves to Ok(vec![]) rather than the placeholder Err above.
-    let mut any_ok = false;
+    let mut last_err: Option<ProviderError> = None;
 
     for provider in chain {
         if !provider.supports(Capability::OhlcRange) {
@@ -492,7 +498,6 @@ pub async fn chain_fetch_ohlc_range(
                     return (Ok(candles), records);
                 }
                 // Empty: this provider has no data for the window — try the next.
-                any_ok = true;
             }
             Err(e) => {
                 records.push(AttemptRecord {
@@ -500,15 +505,15 @@ pub async fn chain_fetch_ohlc_range(
                     capability: Capability::OhlcRange,
                     outcome: ProviderOutcome::Failure,
                 });
-                last_err = e;
+                last_err = Some(e);
             }
         }
     }
 
-    if any_ok {
-        (Ok(vec![]), records)
-    } else {
-        (Err(last_err), records)
+    // Any error along the way must surface (retry) rather than be masked as "no data".
+    match last_err {
+        Some(e) => (Err(e), records),
+        None => (Ok(vec![]), records),
     }
 }
 
@@ -1123,6 +1128,31 @@ mod tests {
                 .expect("all-empty must be Ok(empty), not Err")
                 .is_empty(),
             "all-empty range walk must resolve to an empty page"
+        );
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_ohlc_range_error_not_masked_by_earlier_empty() {
+        // binance returns Ok(empty) (pre-2017 window), then the deep-history source
+        // ERRORS. The error MUST surface so the chunk retries — it must NOT be masked as
+        // Ok(empty), which would silently forward-skip and lose the history (the real
+        // production bug: a missing Bitstamp pacer row made its fetch error out).
+        // AlwaysFailProvider reports supports(_) = true and has no fetch_ohlc_range
+        // override, so the range dispatch calls it and gets the trait-default
+        // Err(NotSupported) — an "errored" attempt for this test's purpose.
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(RangeEmptyProvider {
+                provider_name: "binance",
+            }),
+            Arc::new(AlwaysFailProvider),
+        ];
+        let market = stub_market();
+        let start = Utc::now() - chrono::Duration::days(4000);
+        let end = start + chrono::Duration::days(30);
+        let (result, _records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        assert!(
+            result.is_err(),
+            "a provider error after an earlier Ok(empty) must surface as Err, not Ok(empty)"
         );
     }
 }
