@@ -18,6 +18,7 @@
 pub mod backfill;
 pub mod collection_queue;
 pub mod cycle_overlay;
+pub mod cycle_projection;
 pub mod live_poller;
 pub mod rollup;
 

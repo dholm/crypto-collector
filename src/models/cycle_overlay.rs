@@ -28,7 +28,11 @@ pub struct CycleOverlayPoint {
     /// `true` when the halving-day anchor was forward-searched because the exact
     /// halving-date candle was absent (D8, REQ-CYCLE-032).
     pub halving_baseline_approximate: bool,
-    /// `true` when this point is a forward projection of the last completed cycle's shape
-    /// onto the current cycle, rather than a real observed daily candle (REQ-CYCLE-060).
+    /// `true` when this point is a forward projection produced by the composite model
+    /// (SPEC-CYCLE-001 v0.4.0), rather than a real observed daily candle (REQ-CYCLE-060).
     pub projected: bool,
+    /// P10 confidence band (projected points only, REQ-CYCLE-064); `NULL` on real points.
+    pub price_low: Option<Decimal>,
+    /// P90 confidence band (projected points only, REQ-CYCLE-064); `NULL` on real points.
+    pub price_high: Option<Decimal>,
 }

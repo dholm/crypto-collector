@@ -305,10 +305,18 @@ pub struct CycleOverlayPointDto {
     #[serde(with = "rust_decimal::serde::str")]
     pub norm_cycle_low: Decimal,
     pub halving_baseline_approximate: bool,
-    /// `true` when this point is a forward projection of the last completed cycle's shape
-    /// onto the current cycle, out to the next halving, rather than a real observed daily
-    /// candle (REQ-CYCLE-060). Additive/backward-compatible field.
+    /// `true` when this point is a forward projection produced by the composite
+    /// projection model (SPEC-CYCLE-001 v0.4.0, REQ-CYCLE-060) rather than a real
+    /// observed daily candle. Additive/backward-compatible field.
     pub projected: bool,
+    /// P10 confidence band, projected points only (REQ-CYCLE-064); `null` on real points.
+    /// Additive/backward-compatible field.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub price_low: Option<Decimal>,
+    /// P90 confidence band, projected points only (REQ-CYCLE-064); `null` on real points.
+    /// Additive/backward-compatible field.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub price_high: Option<Decimal>,
 }
 
 impl From<CycleOverlayPoint> for CycleOverlayPointDto {
@@ -325,6 +333,8 @@ impl From<CycleOverlayPoint> for CycleOverlayPointDto {
             norm_cycle_low: p.norm_cycle_low,
             halving_baseline_approximate: p.halving_baseline_approximate,
             projected: p.projected,
+            price_low: p.price_low,
+            price_high: p.price_high,
         }
     }
 }
@@ -480,6 +490,8 @@ mod tests {
             norm_cycle_low: dec!(1),
             halving_baseline_approximate: false,
             projected: false,
+            price_low: None,
+            price_high: None,
         }
     }
 
@@ -491,6 +503,23 @@ mod tests {
         assert!(json.contains(r#""norm_halving":"0.465116279069767441860465116""#));
         assert!(json.contains(r#""norm_cycle_low":"1""#));
         assert!(json.contains(r#""price":"4000""#));
+    }
+
+    // REQ-CYCLE-064: real points carry null bands; projected points carry DecimalStrings.
+    #[test]
+    fn cycle_overlay_dto_band_fields_serialize_null_and_string() {
+        let dto = CycleOverlayPointDto::from(sample_cycle_overlay_point());
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""price_low":null"#));
+        assert!(json.contains(r#""price_high":null"#));
+
+        let mut projected = sample_cycle_overlay_point();
+        projected.projected = true;
+        projected.price_low = Some(dec!(3000));
+        projected.price_high = Some(dec!(6000));
+        let json = serde_json::to_string(&CycleOverlayPointDto::from(projected)).unwrap();
+        assert!(json.contains(r#""price_low":"3000""#));
+        assert!(json.contains(r#""price_high":"6000""#));
     }
 
     #[test]

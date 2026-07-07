@@ -32,6 +32,20 @@ recomputation is [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (collection-queue w
 
 ## HISTORY
 
+- 2026-07-07 (v0.4.0): Replaced the v0.3.0 cycle-repeat replay with a **composite projection
+  model** (`src/collectors/cycle_projection.rs`; research + validation in
+  `docs/prediction-research.md`): power-law spine (log-log OLS over the full daily history,
+  augmented for `bitcoin`/`usd` by 25 compiled-in pre-2017 quarterly calibration anchors) + a
+  damped, phase-conditioned cycle component (encoding measured diminishing returns) + a
+  mean-reversion continuity term (half-life 180 days, join-continuous at today's real price).
+  Projected points now carry P10/P90 confidence bands (`price_low`/`price_high`, additive
+  nullable columns + DTO fields, REQ-CYCLE-064); `price` is the P50 path. Selected by
+  walk-forward backtest: log10 RMSE 0.21 vs the replay's 0.47 on yearly origins 2016–2025
+  (deterministic regression test `tests/backtest_projection.rs` on the committed fixture
+  `tests/fixtures/btc_daily_close.csv`). The REQ-CYCLE-060 replay formula is superseded; the
+  REQ-CYCLE-061/062/063 contracts (cycle assignment via the extended halving list, projected
+  flags, provisional recompute, zero points under insufficient history) are preserved
+  verbatim. All model math is `Decimal` (`maths` feature), deterministic, no RNG.
 - 2026-07-04 (v0.3.0): Replaced the v0.2.0 "repeat the reference cycle's shape onto the current
   cycle's own anchor price" projection with Bitbo's "cycle-repeat" replay methodology
   (REQ-CYCLE-060/061/062/063, superseding the v0.2.0 wording of REQ-CYCLE-060/061/062 below).
@@ -339,6 +353,17 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   points on the correct side of that future boundary. This extended list is entirely separate
   from `halving_dates()`/`assign_cycle`, which remain unchanged for real data — cycle 4 stays
   open-ended for real points regardless of the projection (REQ-CYCLE-012 preserved verbatim).
+- **REQ-CYCLE-064** (Ubiquitous, v0.4.0): Each projected point shall carry P10 and P90
+  confidence bands (`price_low`, `price_high`; `Decimal`, additive nullable columns/fields —
+  `NULL` on real points), derived from deterministic empirical horizon quantiles of the
+  model's historical errors blended with residual-change quantiles (see
+  `docs/prediction-research.md` §5/§7.4); `price` on a projected point is the model's median
+  (P50) path, and `price_low <= price <= price_high` shall hold on every projected point.
+  The projection model itself is the composite decomposition of v0.4.0 (power-law spine +
+  damped cycle-phase component + mean-reversion continuity term), which supersedes the
+  REQ-CYCLE-060 replay formula while preserving the REQ-CYCLE-061/062/063 contracts, and
+  any change to its constants shall be re-validated against the walk-forward backtest
+  (`tests/backtest_projection.rs`).
 
 ## Exclusions (What NOT to Build)
 
