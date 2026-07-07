@@ -358,17 +358,19 @@ pub fn deep_backfill_start_date() -> chrono::NaiveDate {
         })
 }
 
-/// Exclusive end date for the deep-history daily backfill window.
+/// Date where native (exchange) daily history begins — the deep-history window's upper
+/// bound. Default: `2017-08-17`, Binance's first BTC/USDT candle.
 ///
-/// Env var: `DEEP_BACKFILL_END_DATE` (`YYYY-MM-DD`). Default: `2017-08-17`, the day
-/// Binance's BTC/USDT klines begin — i.e. where the regular exchange-sourced history
-/// takes over. This bound is deliberately set at (not past) the primary exchange's
-/// listing date: a deep-history page whose window *spans* the listing would get
-/// Binance's partial slice from that date (non-empty), short-circuiting the chain
-/// before the deep-history source and skipping the exchange-less sub-window. Ending the
-/// deep window here keeps every deep page entirely pre-listing (Binance returns empty →
-/// Bitstamp fills), so the daily series is contiguous: deep source below this date,
-/// exchange/rollup at and above it.
+/// Env var: `DEEP_BACKFILL_END_DATE` (`YYYY-MM-DD`). The deep window is
+/// `[DEEP_BACKFILL_START_DATE, this_date)` and must stop before the primary exchange's
+/// first candle: the range chain hands each page's `end` to Binance first, and if that
+/// `end` reaches Binance's listing candle, Binance returns it (non-empty) and
+/// short-circuits the chain before the deep-history source — so Bitstamp is never
+/// reached and the pre-2017 years stay empty. `main.rs` ends the window one second
+/// before this date's midnight so Binance's `endTime` stays strictly before its listing
+/// candle (Binance returns empty → Bitstamp fills) while the window still covers the
+/// prior day. The daily series is then contiguous: deep source below this date, native
+/// data from it onward.
 pub fn deep_backfill_end_date() -> chrono::NaiveDate {
     std::env::var("DEEP_BACKFILL_END_DATE")
         .ok()

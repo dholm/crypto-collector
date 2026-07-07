@@ -245,10 +245,18 @@ async fn main() -> Result<()> {
             .and_hms_opt(0, 0, 0)
             .expect("valid midnight")
             .and_utc();
+        // `deep_backfill_end_date` is where native (exchange) data begins — 2017-08-17,
+        // Binance's first BTC/USDT candle. The deep window ends one second before that
+        // midnight so it covers through the prior day (2017-08-16) yet the `end` handed
+        // to Binance stays strictly BEFORE its listing candle: Binance then returns empty
+        // for every deep page (rather than its single boundary candle, which would
+        // short-circuit the range chain before Bitstamp), so the deep-history source
+        // fills the whole window. Contiguous with native data from the end date onward.
         let deep_end = config::deep_backfill_end_date()
             .and_hms_opt(0, 0, 0)
             .expect("valid midnight")
-            .and_utc();
+            .and_utc()
+            - chrono::Duration::seconds(1);
         if deep_start < deep_end {
             match crypto_collector::collectors::backfill::enqueue_deep_history_backfills(
                 &pool,
