@@ -89,6 +89,15 @@ For **backtesting** we assembled a full daily-close series 2011-08-18 → presen
 Bitstamp public API (pre-2017) merged with the production DB export (2017+): 5 404 daily
 closes, 30 small gaps (checked into `tests/fixtures/btc_daily_close.csv`).
 
+**Update (2026-07-07):** the production gap is now closed at the source. A deep-history
+daily backfill (SPEC-SCHED-001 v1.2.0 / SPEC-PROV-001 v1.2.0) pulls native `1d` BTC/USD
+candles from Bitstamp back to 2011-08-18 into `coin_candles`. Once that job completes in
+production, the power-law spine fits directly on real pre-2017 daily data and the
+compiled-in `CALIBRATION_ANCHORS` become a redundant safety net (they remain as a
+deterministic fallback for environments where the deep backfill has not run or is
+disabled). The anchors and the backfilled data are the *same* Bitstamp daily closes, so
+the two agree by construction.
+
 ---
 
 ## 3. Empirical cycle statistics (measured from the assembled series)

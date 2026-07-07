@@ -24,6 +24,18 @@ Consumers: [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (workers call the chain).
 
 ## HISTORY
 
+- 2026-07-07 (v1.2.0): Added the **Bitstamp** provider as a deep-history OHLC source
+  (`Ohlc` + `OhlcRange` only; no spot/metadata/market/derivatives). Motivation: no existing
+  chain member serves pre-2017 candles — Binance BTC/USDT klines begin 2017-08-17 — but
+  Bitstamp's public `/api/v2/ohlc/{pair}` exposes BTC/USD **daily** candles back to
+  2011-08-18 (intraday only from ~2013), keyless, with volume. Two supporting changes:
+  (1) `chain_fetch_ohlc_range` now uses **continue-on-empty** — a range provider returning
+  `Ok(empty)` advances to the next provider instead of short-circuiting, so a pre-2017
+  window (empty from Binance) reaches Bitstamp; all-empty resolves to `Ok(empty)`, all-error
+  to `Err` (the live `chain_fetch_ohlc` is unchanged). (2) `build_chain` accepts `bitstamp`
+  and it is recommended placed AFTER `binance` (`PROVIDERS=coingecko,binance,bitstamp`) so
+  Binance stays primary for recent candles and Bitstamp only fills what Binance cannot. The
+  deep daily backfill is driven by SPEC-SCHED-001's `enqueue_deep_history_backfills`.
 - 2026-06-28 (v1.1.0): Stated explicitly that CoinMarketCap is OUT of foundation scope
   (CoinGecko is the foundation primary; CMC is future work) to reconcile the SPEC suite
   with the product/structure docs, which had shown CMC as a co-primary. (audit M1)

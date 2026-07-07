@@ -230,6 +230,48 @@ async fn main() -> Result<()> {
         Err(e) => tracing::warn!(error = %e, "startup backfill: enqueue failed; continuing without it"),
     }
 
+    // ── Step 8c: Deep-history daily backfill (idempotent) ─────────────────────
+    // Enqueues a `1d` backfill for configured coins (default: bitcoin) over
+    // [deep_start, now - lookback) — the pre-regular-lookback window that only a
+    // deep-history source (Bitstamp: BTC/USD daily from 2011-08) can serve, since
+    // Binance klines begin 2017-08. Contiguous with the Step 8b regular backfill.
+    // Same idempotency + fail-soft contract as Step 8b.
+    let deep_coins = config::deep_backfill_coins();
+    if !deep_coins.is_empty() {
+        let deep_end = chrono::Utc::now() - chrono::Duration::days(backfill_lookback_days as i64);
+        let deep_start = config::deep_backfill_start_date()
+            .and_hms_opt(0, 0, 0)
+            .expect("valid midnight")
+            .and_utc();
+        if deep_start < deep_end {
+            match crypto_collector::collectors::backfill::enqueue_deep_history_backfills(
+                &pool,
+                &deep_coins,
+                deep_start,
+                deep_end,
+            )
+            .await
+            {
+                Ok((enqueued, skipped)) => info!(
+                    enqueued,
+                    skipped,
+                    deep_start = %deep_start.date_naive(),
+                    deep_end = %deep_end.date_naive(),
+                    "deep-history backfill: enqueued {enqueued}, skipped {skipped}"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, "deep-history backfill: enqueue failed; continuing")
+                }
+            }
+        } else {
+            tracing::warn!(
+                deep_start = %deep_start.date_naive(),
+                deep_end = %deep_end.date_naive(),
+                "deep-history backfill: start >= end (lookback covers the deep window); skipping"
+            );
+        }
+    }
+
     // ── Step 9: Spawn workers (SPEC-SCHED-001) + gauge-refresh task ───────────
     let worker_cfg = crypto_collector::collectors::WorkerConfig::from_env();
     let supervisor = crypto_collector::collectors::spawn_workers(

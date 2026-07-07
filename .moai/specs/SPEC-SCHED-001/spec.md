@@ -24,6 +24,19 @@ safety, §1.1 24/7 no-calendar).
 
 ## HISTORY
 
+- 2026-07-07 (v1.2.0): Added a **deep-history daily backfill** alongside the once-per-coin
+  startup backfill. `enqueue_deep_history_backfills` enqueues an idempotent `1d` job (new
+  dataset tag `candles_deep_1d`, distinct from `candles` under the
+  `ON CONFLICT (coin_id, dataset)` key) for configured coins (default `bitcoin`) over
+  `[DEEP_BACKFILL_START_DATE, now − BACKFILL_LOOKBACK_DAYS)` — the pre-lookback window only a
+  deep-history source can serve (Bitstamp BTC/USD daily from 2011-08; see SPEC-PROV-001
+  v1.2.0). Two supporting changes: (1) `process_chunk` now honours a chunk's explicit
+  `interval` column (previously ignored) via `resolve_interval_secs`, so the deep job can pin
+  `1d` while startup/legacy chunks keep the per-coin poll interval; (2) daily granularity is
+  the only one that reaches 2011 (intraday backfill via the existing 5m path fills the
+  ~2013→now tail through the SPEC-PROV-001 continue-on-empty fallthrough to Bitstamp). Env:
+  `DEEP_BACKFILL_COINS`, `DEEP_BACKFILL_START_DATE`. Wired into `main.rs` startup (Step 8c),
+  fail-soft like the regular backfill.
 - 2026-06-28 (v1.1.0): Clarified the "no new schema" Exclusion — the poller's
   `last_polled_at`/`live_poll_claimed_until`/`live_poll_interval` columns are now defined
   by SPEC-DB-001 (REQ-DB-002) and are *consumed* here, not introduced. Relabelled

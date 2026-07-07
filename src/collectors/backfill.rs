@@ -31,6 +31,14 @@ use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderEr
 /// idempotency key on `backfill_jobs`.
 pub const STARTUP_BACKFILL_DATASET: &str = "candles";
 
+/// Dataset tag for the deep-history **daily** backfill job (`enqueue_deep_history_backfills`).
+///
+/// Distinct from `STARTUP_BACKFILL_DATASET` so the two coexist under the
+/// `ON CONFLICT (coin_id, dataset)` idempotency key: the startup job backfills the
+/// recent window at the coin's fine interval, while this job backfills the deep pre-2017
+/// window at `1d` — the only granularity a source like Bitstamp serves that far back.
+pub const DEEP_HISTORY_BACKFILL_DATASET: &str = "candles_deep_1d";
+
 /// Empty-page forward-skip step size, expressed as a candle count and multiplied by
 /// the chunk's `interval_secs` to get the skip span (REQ-SCHED-024/025/026,
 /// see [`next_cursor_for_page`]). 1000 matches Binance's OHLC page cap — the largest
@@ -71,6 +79,24 @@ pub fn range_to_days(
         }
         _ => max_days,
     }
+}
+
+/// Resolve the candle granularity (seconds) for a claimed chunk.
+///
+/// An explicit `chunk_interval` (canonical string, e.g. `"1d"`) takes precedence — this
+/// is how a deep-history job pins the daily granularity that deep sources serve. When the
+/// chunk leaves it `NULL` (legacy / startup chunks), fall back to the per-coin poll
+/// interval, then the global default (`effective_candle_interval_secs`).
+pub fn resolve_interval_secs(
+    chunk_interval: Option<&str>,
+    live_poll_interval: Option<&str>,
+    global_secs: i64,
+) -> i64 {
+    chunk_interval
+        .and_then(crate::api::candles_agg::interval_to_seconds)
+        .unwrap_or_else(|| {
+            crate::config::effective_candle_interval_secs(live_poll_interval, global_secs)
+        })
 }
 
 /// Decide whether `process_chunk` should use the date-range-bounded fetch
@@ -413,6 +439,65 @@ pub async fn enqueue_startup_backfills(
     Ok((enqueued, skipped))
 }
 
+/// Enqueue a deep-history **daily** backfill job for each of `coin_ids`, once per coin,
+/// idempotently (startup hook — see `main.rs`).
+///
+/// Covers the pre-regular-lookback window `[start, end)` at the `1d` interval, sourced
+/// (via the provider chain's continue-on-empty fallthrough) from whichever provider has
+/// data that far back — for BTC/USD that is Bitstamp, whose daily candles reach 2011-08.
+/// Only coins that are actually tracked get a job (an untracked coin would produce chunks
+/// that always fail the `tracked_coins` lookup in `process_chunk`).
+///
+/// Idempotent via `ON CONFLICT (coin_id, dataset) DO NOTHING` on
+/// `DEEP_HISTORY_BACKFILL_DATASET`, so re-deploys never duplicate or restart it. Returns
+/// `(enqueued, skipped)`. Does not fail the caller's startup sequence.
+///
+// @MX:ANCHOR: [AUTO] enqueue_deep_history_backfills — once-per-coin idempotent deep 1d backfill
+// @MX:REASON: fan_in >= 2: main.rs startup hook, DB integration tests. Idempotency invariant:
+//             ON CONFLICT (coin_id, DEEP_HISTORY_BACKFILL_DATASET) DO NOTHING means re-deploys
+//             never duplicate/restart. Interval is pinned to '1d' (the deep-history granularity).
+// @MX:SPEC: SPEC-PROV-001 SPEC-SCHED-001
+pub async fn enqueue_deep_history_backfills(
+    pool: &PgPool,
+    coin_ids: &[String],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(u64, u64), sqlx::Error> {
+    let mut enqueued = 0u64;
+    let mut skipped = 0u64;
+
+    for coin_id in coin_ids {
+        // Skip untracked coins — process_chunk requires a tracked_coins row.
+        let tracked: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM tracked_coins WHERE coin_id = $1")
+                .bind(coin_id)
+                .fetch_optional(pool)
+                .await?;
+        if tracked.is_none() {
+            skipped += 1;
+            continue;
+        }
+
+        let created = enqueue_backfill_job(
+            pool,
+            coin_id,
+            DEEP_HISTORY_BACKFILL_DATASET,
+            Some("1d"),
+            Some(start),
+            Some(end),
+        )
+        .await?;
+
+        if created {
+            enqueued += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+
+    Ok((enqueued, skipped))
+}
+
 // ── Chain dispatch helper ─────────────────────────────────────────────────────
 
 async fn chain_fetch_ohlc_for_chunk(
@@ -494,9 +579,13 @@ async fn process_chunk(
     // Compute resume start (REQ-SCHED-024/025).
     let start = resume_start(chunk.cursor, chunk.range_start);
 
-    // Candle granularity = per-coin poll interval (or global default).
+    // Candle granularity: an explicit chunk `interval` wins (a deep-history job pins
+    // `1d` — the only granularity Bitstamp serves before ~2013), otherwise fall back to
+    // the per-coin poll interval (or global default). Legacy/startup chunks leave
+    // `interval` NULL and keep the poll-interval behaviour.
     let global_interval = crate::config::live_quote_poll_interval_secs();
-    let interval_secs = crate::config::effective_candle_interval_secs(
+    let interval_secs = resolve_interval_secs(
+        chunk.interval.as_deref(),
         live_poll_interval.as_deref(),
         global_interval,
     );
@@ -865,6 +954,35 @@ mod tests {
         assert!(done);
     }
 
+    // ── resolve_interval_secs: chunk.interval wins, else poll-interval fallback ──
+
+    #[test]
+    fn resolve_interval_prefers_explicit_chunk_interval() {
+        // Deep-history job pins "1d" → 86400, regardless of poll-interval.
+        assert_eq!(
+            resolve_interval_secs(Some("1d"), Some("00:05:00"), 60),
+            86_400
+        );
+        assert_eq!(resolve_interval_secs(Some("5m"), None, 60), 300);
+    }
+
+    #[test]
+    fn resolve_interval_falls_back_to_poll_interval_when_chunk_null() {
+        // Legacy/startup chunk (interval NULL): per-coin poll interval (5m) wins.
+        assert_eq!(resolve_interval_secs(None, Some("00:05:00"), 60), 300);
+    }
+
+    #[test]
+    fn resolve_interval_falls_back_to_global_when_both_absent() {
+        assert_eq!(resolve_interval_secs(None, None, 60), 60);
+    }
+
+    #[test]
+    fn resolve_interval_unparseable_chunk_interval_falls_back() {
+        // A non-canonical interval string is ignored, not fatal.
+        assert_eq!(resolve_interval_secs(Some("bogus"), None, 60), 60);
+    }
+
     // ── should_use_range_path: worker range-path selection (pure logic) ───────
 
     #[test]
@@ -1060,6 +1178,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn deep_history_dataset_distinct_from_startup_dataset() {
+        // The two coexist under the ON CONFLICT (coin_id, dataset) key; a shared tag
+        // would make them clobber each other.
+        assert_ne!(DEEP_HISTORY_BACKFILL_DATASET, STARTUP_BACKFILL_DATASET);
+        assert_eq!(DEEP_HISTORY_BACKFILL_DATASET, "candles_deep_1d");
+    }
+
     // ── DB-gated integration tests ─────────────────────────────────────────────
 
     /// REQ-SCHED-021/022/024/026: claim → cursor advance → complete cycle.
@@ -1219,6 +1345,109 @@ mod tests {
             job_count_after, 1,
             "re-invocation must not duplicate the job row"
         );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup tracked_coins");
+    }
+
+    /// `enqueue_deep_history_backfills`: creates a distinct `1d` deep job for a tracked
+    /// coin, is idempotent on re-invocation, and skips untracked coins.
+    #[tokio::test]
+    #[ignore]
+    async fn db_enqueue_deep_history_backfills_idempotent_and_skips_untracked() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        let coin_id = "test-deep-history-coin";
+        let untracked = "test-deep-history-untracked";
+        for c in [coin_id, untracked] {
+            sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+                .bind(c)
+                .execute(&pool)
+                .await
+                .expect("pre-cleanup chunks");
+            sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+                .bind(c)
+                .execute(&pool)
+                .await
+                .expect("pre-cleanup jobs");
+        }
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup tracked");
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+             VALUES ($1, 'TDHC', 'Test Deep History Coin', 'active', now())",
+        )
+        .bind(coin_id)
+        .execute(&pool)
+        .await
+        .expect("insert tracked coin");
+
+        let start = chrono::Utc.with_ymd_and_hms(2011, 8, 18, 0, 0, 0).unwrap();
+        let end = chrono::Utc.with_ymd_and_hms(2016, 7, 1, 0, 0, 0).unwrap();
+
+        // First call: tracked coin enqueued, untracked skipped.
+        let (enqueued, skipped) = enqueue_deep_history_backfills(
+            &pool,
+            &[coin_id.to_string(), untracked.to_string()],
+            start,
+            end,
+        )
+        .await
+        .expect("first deep enqueue");
+        assert_eq!(enqueued, 1, "only the tracked coin is enqueued");
+        assert_eq!(skipped, 1, "the untracked coin is skipped");
+
+        // The chunk must carry interval='1d' and the requested range.
+        let (interval, range_start): (Option<String>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT c.interval, c.range_start FROM backfill_chunks c \
+             JOIN backfill_jobs j ON j.id = c.job_id \
+             WHERE c.coin_id = $1 AND j.dataset = $2",
+        )
+        .bind(coin_id)
+        .bind(DEEP_HISTORY_BACKFILL_DATASET)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch deep chunk");
+        assert_eq!(interval.as_deref(), Some("1d"), "deep chunk pins 1d");
+        assert_eq!(range_start, Some(start));
+
+        // Second call: idempotent — the tracked coin is now skipped too.
+        let (enqueued_2, _skipped_2) =
+            enqueue_deep_history_backfills(&pool, &[coin_id.to_string()], start, end)
+                .await
+                .expect("second deep enqueue");
+        assert_eq!(
+            enqueued_2, 0,
+            "re-invocation must not duplicate the deep job"
+        );
+
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM backfill_jobs WHERE coin_id = $1 AND dataset = $2",
+        )
+        .bind(coin_id)
+        .bind(DEEP_HISTORY_BACKFILL_DATASET)
+        .fetch_one(&pool)
+        .await
+        .expect("count deep jobs");
+        assert_eq!(job_count, 1, "exactly one deep job after two calls");
 
         // Cleanup.
         sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")

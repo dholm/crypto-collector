@@ -97,6 +97,7 @@ coingecko:
 providers:
   - binance
   - coingecko
+  - bitstamp
 
 # ── Per-provider pacer (SPEC-PROV-001) ────────────────────────────────────────
 # Inter-request cooldown in milliseconds between consecutive calls to each provider.

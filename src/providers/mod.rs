@@ -13,11 +13,13 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod binance;
+pub mod bitstamp;
 pub mod coinbase;
 pub mod coingecko;
 pub mod kraken;
 
 pub use binance::BinanceProvider;
+pub use bitstamp::BitstampProvider;
 pub use coinbase::CoinbaseProvider;
 pub use coingecko::{CoinGeckoConfig, CoinGeckoProvider};
 pub use kraken::KrakenProvider;
@@ -330,27 +332,32 @@ pub trait Provider: Send + Sync {
 /// Fails fast if any name is unknown — returns an error naming the offending value
 /// and listing all valid names. Declared order equals fallback priority.
 ///
-/// Valid names: `coingecko`, `binance`, `coinbase`, `kraken`.
+/// Valid names: `coingecko`, `binance`, `bitstamp`, `coinbase`, `kraken`.
+///
+/// `bitstamp` is a candle-only provider whose value is deep history: place it AFTER
+/// `binance` (e.g. `coingecko,binance,bitstamp`) so Binance serves recent candles and
+/// Bitstamp only fills windows Binance cannot (pre-2017-08 daily) — see
+/// `chain_fetch_ohlc_range`'s continue-on-empty fallthrough.
 ///
 // @MX:ANCHOR: [AUTO] build_chain — ordered fail-fast provider chain constructor
 // @MX:REASON: Every worker and the chain orchestrator depends on this for data acquisition.
 //             Startup invariant: unknown name = immediate error (REQ-PROV-002).
 //             Declared order IS the fallback priority (REQ-PROV-003).
 //             fan_in >= 3: main startup, SPEC-SCHED-001 workers, integration tests.
-// @MX:NOTE: [AUTO] Valid provider names: coingecko, binance, coinbase, kraken
+// @MX:NOTE: [AUTO] Valid provider names: coingecko, binance, bitstamp, coinbase, kraken
 // @MX:SPEC: SPEC-PROV-001 REQ-PROV-002/003
 pub fn build_chain(
     names: &[String],
     coingecko_config: CoinGeckoConfig,
     pool: PgPool,
 ) -> anyhow::Result<Vec<Arc<dyn Provider>>> {
-    const VALID_NAMES: &[&str] = &["coingecko", "binance", "coinbase", "kraken"];
+    const VALID_NAMES: &[&str] = &["coingecko", "binance", "bitstamp", "coinbase", "kraken"];
 
     // Fail-fast validation (REQ-PROV-002)
     for name in names {
         if !VALID_NAMES.contains(&name.as_str()) {
             return Err(anyhow!(
-                "unknown provider: {name:?}. Valid names: coingecko, binance, coinbase, kraken"
+                "unknown provider: {name:?}. Valid names: coingecko, binance, bitstamp, coinbase, kraken"
             ));
         }
     }
@@ -363,6 +370,7 @@ pub fn build_chain(
                 pool.clone(),
             )),
             "binance" => Arc::new(BinanceProvider::new(None, pool.clone())),
+            "bitstamp" => Arc::new(BitstampProvider::new(None, pool.clone())),
             "coinbase" => Arc::new(CoinbaseProvider::new(pool.clone())),
             "kraken" => Arc::new(KrakenProvider::new(pool.clone())),
             _ => unreachable!("validated above"),
@@ -423,19 +431,30 @@ pub async fn chain_fetch_ohlc(
     (Err(last_err), records)
 }
 
-/// Try providers in declared order for `fetch_ohlc_range`; return first success.
+/// Try providers in declared order for `fetch_ohlc_range`; return the first provider
+/// that returns a NON-EMPTY page.
 ///
 /// Mirrors `chain_fetch_ohlc`, but dispatches on `Capability::OhlcRange` and calls the
 /// range-bounded fetch. Providers that do not support `OhlcRange` (checked via
 /// `supports`) are skipped and recorded as `Unsupported`, letting e.g. CoinGecko Demo
 /// fall through to Binance in the declared fallback order.
 ///
+/// **Continue-on-empty (backfill completeness):** unlike the live `chain_fetch_ohlc`,
+/// a provider returning `Ok(vec![])` here is treated as "this provider has no data for
+/// this historical window" and the chain advances to the next provider — a wider
+/// history source can then fill it. This is what routes a pre-2017 window (empty from
+/// Binance, whose BTC/USDT klines start 2017-08) to Bitstamp (daily BTC/USD from 2011).
+/// If every range-capable provider returns empty, the result is `Ok(vec![])` (no data
+/// anywhere — the backfill worker's empty-page-forward-skip then advances the cursor);
+/// only when every attempt *errors* is an `Err` returned.
+///
 // @MX:ANCHOR: [AUTO] chain_fetch_ohlc_range — date-range OHLC dispatch for historical backfill
 // @MX:REASON: fan_in >= 3: backfill worker process_chunk, provider chain tests, future callers
 //             needing bounded historical windows. Tier-gating invariant: skips providers whose
-//             `supports(OhlcRange)` is false (e.g. CoinGecko Demo) rather than erroring, so the
-//             chain falls through to the next declared provider (REQ-PROV-003/004).
-// @MX:SPEC: SPEC-PROV-001
+//             `supports(OhlcRange)` is false (e.g. CoinGecko Demo). Continue-on-empty invariant:
+//             an Ok(empty) advances to the next provider (deep-history fallthrough to Bitstamp),
+//             NOT short-circuit as in the live path (REQ-PROV-003/004).
+// @MX:SPEC: SPEC-PROV-001 SPEC-SCHED-001
 pub async fn chain_fetch_ohlc_range(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
@@ -445,6 +464,9 @@ pub async fn chain_fetch_ohlc_range(
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
     let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
+    // At least one provider returned Ok (possibly empty). When true, an all-empty walk
+    // resolves to Ok(vec![]) rather than the placeholder Err above.
+    let mut any_ok = false;
 
     for provider in chain {
         if !provider.supports(Capability::OhlcRange) {
@@ -466,7 +488,11 @@ pub async fn chain_fetch_ohlc_range(
                     capability: Capability::OhlcRange,
                     outcome: ProviderOutcome::Success,
                 });
-                return (Ok(candles), records);
+                if !candles.is_empty() {
+                    return (Ok(candles), records);
+                }
+                // Empty: this provider has no data for the window — try the next.
+                any_ok = true;
             }
             Err(e) => {
                 records.push(AttemptRecord {
@@ -479,7 +505,11 @@ pub async fn chain_fetch_ohlc_range(
         }
     }
 
-    (Err(last_err), records)
+    if any_ok {
+        (Ok(vec![]), records)
+    } else {
+        (Err(last_err), records)
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -966,5 +996,133 @@ mod tests {
         assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
         assert_eq!(records[1].provider, "stub_range");
         assert_eq!(records[1].outcome, ProviderOutcome::Success);
+    }
+
+    // ── continue-on-empty: an empty earlier provider falls through to a wider source ──
+
+    /// A range provider that always returns `Ok(vec![])` (e.g. Binance for a pre-2017
+    /// window: symbol exists, no candles that far back).
+    struct RangeEmptyProvider {
+        provider_name: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for RangeEmptyProvider {
+        fn name(&self) -> &str {
+            self.provider_name
+        }
+        fn supports(&self, cap: Capability) -> bool {
+            matches!(cap, Capability::Ohlc | Capability::OhlcRange)
+        }
+        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Spot))
+        }
+        async fn fetch_ohlc(
+            &self,
+            _m: &MarketQuery,
+            _d: u32,
+            _i: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_ohlc_range(
+            &self,
+            _m: &MarketQuery,
+            _start: DateTime<Utc>,
+            _end: DateTime<Utc>,
+            _i: i64,
+        ) -> Result<Vec<OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMetadata))
+        }
+        async fn fetch_coin_market(
+            &self,
+            _id: &str,
+            _vs: &str,
+        ) -> Result<CoinMarket, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::CoinMarket))
+        }
+        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
+            Err(ProviderError::NotSupported(Capability::Derivatives))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_tickers(
+            &self,
+            _coin_id: &str,
+            _cap: usize,
+        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_ohlc_range_falls_through_empty_provider_to_data_source() {
+        let candle = OhlcCandle {
+            market_id: 1,
+            interval: "1d".to_string(),
+            ts: Utc::now(),
+            open: rust_decimal_macros::dec!(10),
+            high: rust_decimal_macros::dec!(12),
+            low: rust_decimal_macros::dec!(9),
+            close: rust_decimal_macros::dec!(11),
+            volume: Some(rust_decimal_macros::dec!(1)),
+            vs_currency: "usd".to_string(),
+            source: "stub_range".to_string(),
+        };
+
+        // Mirrors production: binance (empty for pre-2017) then bitstamp (has data).
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(RangeEmptyProvider {
+                provider_name: "binance",
+            }),
+            Arc::new(RangeCapableProvider {
+                candles: vec![candle],
+            }),
+        ];
+
+        let market = stub_market();
+        let start = Utc::now() - chrono::Duration::days(3000);
+        let end = start + chrono::Duration::days(30);
+        let (result, records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+
+        let candles = result.expect("empty binance must fall through to the data source");
+        assert_eq!(candles.len(), 1, "must return the second provider's candle");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].provider, "binance");
+        assert_eq!(records[0].outcome, ProviderOutcome::Success); // Ok(empty) is a success attempt
+        assert_eq!(records[1].provider, "stub_range");
+        assert_eq!(records[1].outcome, ProviderOutcome::Success);
+    }
+
+    #[tokio::test]
+    async fn chain_fetch_ohlc_range_all_empty_returns_ok_empty_not_err() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(RangeEmptyProvider {
+                provider_name: "binance",
+            }),
+            Arc::new(RangeEmptyProvider {
+                provider_name: "bitstamp",
+            }),
+        ];
+        let market = stub_market();
+        let start = Utc::now() - chrono::Duration::days(6000);
+        let end = start + chrono::Duration::days(30);
+        let (result, _records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        // No provider had data for the window → Ok(empty), so the worker's
+        // empty-page-forward-skip advances the cursor rather than failing the chunk.
+        assert!(
+            result
+                .expect("all-empty must be Ok(empty), not Err")
+                .is_empty(),
+            "all-empty range walk must resolve to an empty page"
+        );
     }
 }

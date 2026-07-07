@@ -329,6 +329,36 @@ pub fn backfill_lookback_days() -> u32 {
     parse_env_u32("BACKFILL_LOOKBACK_DAYS", 3_650)
 }
 
+/// Coins to deep-backfill: daily history older than the regular lookback window, sourced
+/// from a deep-history provider (Bitstamp — BTC/USD daily back to 2011-08-18)
+/// via `collectors::backfill::enqueue_deep_history_backfills`.
+///
+/// Env var: `DEEP_BACKFILL_COINS` (comma-separated). Default: `"bitcoin"` (the halving
+/// cycle-overlay coin, SPEC-CYCLE-001). Empty disables the deep-history backfill.
+/// Include only coins the deep-history source actually lists (Bitstamp fiat pairs).
+pub fn deep_backfill_coins() -> Vec<String> {
+    std::env::var("DEEP_BACKFILL_COINS")
+        .unwrap_or_else(|_| "bitcoin".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Earliest date for the deep-history daily backfill window.
+///
+/// Env var: `DEEP_BACKFILL_START_DATE` (`YYYY-MM-DD`). Default: `2011-08-18`, the first
+/// day Bitstamp serves BTC/USD daily candles. The window end is `now - BACKFILL_LOOKBACK_DAYS`
+/// so the deep-history job is contiguous with the regular startup backfill.
+pub fn deep_backfill_start_date() -> chrono::NaiveDate {
+    std::env::var("DEEP_BACKFILL_START_DATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            chrono::NaiveDate::from_ymd_opt(2011, 8, 18).expect("valid default deep-backfill date")
+        })
+}
+
 // ── SPEC-CYCLE-001 halving-cycle overlay configuration (REQ-CYCLE-043) ────────
 
 /// Target coin for the Bitcoin halving-cycle overlay.
