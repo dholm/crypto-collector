@@ -28,17 +28,19 @@ safety, §1.1 24/7 no-calendar).
   startup backfill. `enqueue_deep_history_backfills` enqueues an idempotent `1d` job (new
   dataset tag `candles_deep_1d`, distinct from `candles` under the
   `ON CONFLICT (coin_id, dataset)` key) for configured coins (default `bitcoin`) over
-  `[DEEP_BACKFILL_START_DATE, now]` — a complete standalone daily series: a deep-history
-  source serves the pre-2017 years Binance cannot (Bitstamp BTC/USD daily from 2011-08; see
-  SPEC-PROV-001 v1.2.0) and Binance serves `1d` from 2017-08, overlapping the 5m→1d rollup
-  harmlessly. Running to `now` (not `now − lookback`) means the daily series does not depend
-  on the fine-grained 5m backfill having reached back via Bitstamp. Two supporting changes:
-  (1) `process_chunk` now honours a chunk's explicit `interval` column (previously ignored)
-  via `resolve_interval_secs`, so the deep job can pin `1d` while startup/legacy chunks keep
-  the per-coin poll interval; (2) daily granularity is the only one that reaches 2011 (Bitstamp
-  intraday starts ~2013). Env:
-  `DEEP_BACKFILL_COINS`, `DEEP_BACKFILL_START_DATE`. Wired into `main.rs` startup (Step 8c),
-  fail-soft like the regular backfill.
+  `[DEEP_BACKFILL_START_DATE, DEEP_BACKFILL_END_DATE)` — the pre-exchange window only a
+  deep-history source can serve (Bitstamp BTC/USD daily from 2011-08; see SPEC-PROV-001
+  v1.2.0). `DEEP_BACKFILL_END_DATE` defaults to Binance's BTC listing date (`2017-08-17`),
+  where the exchange/rollup pipeline takes over — the daily series is contiguous across the
+  boundary. The end is bounded at (not past) the listing on purpose: a deep page whose window
+  *spans* the listing would receive Binance's partial slice from that date (non-empty), which
+  short-circuits the range chain before the deep source and skips the exchange-less
+  sub-window. Two supporting changes: (1) `process_chunk` now honours a chunk's explicit
+  `interval` column (previously ignored) via `resolve_interval_secs`, so the deep job can pin
+  `1d` while startup/legacy chunks keep the per-coin poll interval; (2) daily granularity is
+  the only one that reaches 2011 (Bitstamp intraday starts ~2013). Env: `DEEP_BACKFILL_COINS`,
+  `DEEP_BACKFILL_START_DATE`, `DEEP_BACKFILL_END_DATE`. Wired into `main.rs` startup
+  (Step 8c), fail-soft like the regular backfill.
 - 2026-06-28 (v1.1.0): Clarified the "no new schema" Exclusion — the poller's
   `last_polled_at`/`live_poll_claimed_until`/`live_poll_interval` columns are now defined
   by SPEC-DB-001 (REQ-DB-002) and are *consumed* here, not introduced. Relabelled

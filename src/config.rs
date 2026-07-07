@@ -348,14 +348,33 @@ pub fn deep_backfill_coins() -> Vec<String> {
 /// Earliest date for the deep-history daily backfill window.
 ///
 /// Env var: `DEEP_BACKFILL_START_DATE` (`YYYY-MM-DD`). Default: `2011-08-18`, the first
-/// day Bitstamp serves BTC/USD daily candles. The window end is `now - BACKFILL_LOOKBACK_DAYS`
-/// so the deep-history job is contiguous with the regular startup backfill.
+/// day Bitstamp serves BTC/USD daily candles.
 pub fn deep_backfill_start_date() -> chrono::NaiveDate {
     std::env::var("DEEP_BACKFILL_START_DATE")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
             chrono::NaiveDate::from_ymd_opt(2011, 8, 18).expect("valid default deep-backfill date")
+        })
+}
+
+/// Exclusive end date for the deep-history daily backfill window.
+///
+/// Env var: `DEEP_BACKFILL_END_DATE` (`YYYY-MM-DD`). Default: `2017-08-17`, the day
+/// Binance's BTC/USDT klines begin — i.e. where the regular exchange-sourced history
+/// takes over. This bound is deliberately set at (not past) the primary exchange's
+/// listing date: a deep-history page whose window *spans* the listing would get
+/// Binance's partial slice from that date (non-empty), short-circuiting the chain
+/// before the deep-history source and skipping the exchange-less sub-window. Ending the
+/// deep window here keeps every deep page entirely pre-listing (Binance returns empty →
+/// Bitstamp fills), so the daily series is contiguous: deep source below this date,
+/// exchange/rollup at and above it.
+pub fn deep_backfill_end_date() -> chrono::NaiveDate {
+    std::env::var("DEEP_BACKFILL_END_DATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            chrono::NaiveDate::from_ymd_opt(2017, 8, 17).expect("valid default deep-backfill end")
         })
 }
 
