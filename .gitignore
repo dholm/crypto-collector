@@ -180,6 +180,7 @@ secret-*.*
 # ===========================================
 .moai/status_line.sh
 .moai/memory/
+.moai/reports/
 .moai/worktrees/
 
 # ===========================================
