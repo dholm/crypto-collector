@@ -1,9 +1,15 @@
-//! Bitcoin halving-cycle overlay read handler (SPEC-CYCLE-001 REQ-CYCLE-050..054).
+//! Bitcoin halving-cycle overlay read handlers (SPEC-CYCLE-001 REQ-CYCLE-050..054).
 //!
-//! Route:
-//! - `GET /v1/coins/{coin_id}/cycle-overlay` → list_cycle_overlay (keyset-paginated)
+//! Routes:
+//! - `GET /v1/coins/{coin_id}/cycle-overlay` → list_cycle_overlay (replay model, keyset-paginated)
+//! - `GET /v1/coins/{coin_id}/cycle-projection` → list_cycle_projection (composite model,
+//!   keyset-paginated)
 //!
-//! Unlike most `/v1/coins/{coin_id}/...` routes, this endpoint never 404s on an unknown
+//! Both endpoints share the same real (observed) points and the same SELECT/pagination
+//! logic (`list_overlay_for_model`), differing only in which projected `projection_model`
+//! they additionally include.
+//!
+//! Unlike most `/v1/coins/{coin_id}/...` routes, these endpoints never 404 on an unknown
 //! or non-target coin (REQ-CYCLE-052): the query is simply scoped to
 //! `(coin_id, vs_currency)` and an unmatched coin naturally yields an empty page.
 
@@ -36,14 +42,44 @@ pub struct ListCycleOverlayParams {
 
 // ── Handler ───────────────────────────────────────────────────────────────────
 
-/// `GET /v1/coins/{coin_id}/cycle-overlay` — keyset-paginated cycle-overlay read (REQ-CYCLE-050).
+/// `GET /v1/coins/{coin_id}/cycle-overlay` — keyset-paginated cycle-overlay read (REQ-CYCLE-050),
+/// serving the Bitbo-style cycle-repeat REPLAY projection (no confidence bands; `price_low`/
+/// `price_high` are always null on projected points from this endpoint).
 ///
 /// Ordered `(cycle_number ASC, days_since_halving ASC)`. An unknown/non-target coin, or a
 /// coin with no computed overlay, yields HTTP 200 with an empty page — NOT 404 (REQ-CYCLE-052).
 pub async fn list_cycle_overlay(
+    state: State<AppState>,
+    coin_id: Path<String>,
+    params: Query<ListCycleOverlayParams>,
+) -> ApiResult<impl IntoResponse> {
+    list_overlay_for_model(state, coin_id, params, "replay").await
+}
+
+/// `GET /v1/coins/{coin_id}/cycle-projection` — keyset-paginated cycle-overlay read serving the
+/// COMPOSITE forward-projection model (power-law spine + damped phase-conditioned cycle
+/// component + mean-reversion continuity term; `price` is the P50 path, `price_low`/`price_high`
+/// carry the P10/P90 confidence bands).
+///
+/// Same ordering, pagination, and empty-page-not-404 semantics as `list_cycle_overlay`
+/// (REQ-CYCLE-050/051/052).
+pub async fn list_cycle_projection(
+    state: State<AppState>,
+    coin_id: Path<String>,
+    params: Query<ListCycleOverlayParams>,
+) -> ApiResult<impl IntoResponse> {
+    list_overlay_for_model(state, coin_id, params, "composite").await
+}
+
+/// Shared read implementation for both cycle-overlay endpoints: identical limit validation,
+/// cursor decode, `vs_currency` default, pagination, and DTO mapping — the only difference
+/// between callers is which projected `projection_model` is included alongside the always-real
+/// points ('real' is never itself a query parameter; it is unconditionally included).
+async fn list_overlay_for_model(
     State(state): State<AppState>,
     Path(coin_id): Path<String>,
     Query(params): Query<ListCycleOverlayParams>,
+    projected_model: &str,
 ) -> ApiResult<impl IntoResponse> {
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -75,6 +111,7 @@ pub async fn list_cycle_overlay(
          FROM cycle_overlay_points \
          WHERE coin_id = $1 \
            AND vs_currency = $2 \
+           AND projection_model IN ('real', $7) \
            AND ($3::INTEGER IS NULL OR cycle_number = $3) \
            AND ($4::INTEGER IS NULL \
                 OR (cycle_number, days_since_halving) > ($4, $5)) \
@@ -87,6 +124,7 @@ pub async fn list_cycle_overlay(
     .bind(cursor_cycle)
     .bind(cursor_dsh)
     .bind(limit + 1)
+    .bind(projected_model)
     .fetch_all(&state.pool)
     .await?;
 

@@ -206,6 +206,10 @@ pub fn build_api_router(state: AppState) -> Router {
             "/v1/coins/{coin_id}/cycle-overlay",
             get(cycle_overlay::list_cycle_overlay),
         )
+        .route(
+            "/v1/coins/{coin_id}/cycle-projection",
+            get(cycle_overlay::list_cycle_projection),
+        )
         .with_state(state)
 }
 
@@ -264,6 +268,7 @@ mod tests {
             "/v1/coins/{coin_id}/quotes",
             "/v1/coins/{coin_id}/candles",
             "/v1/coins/{coin_id}/cycle-overlay",
+            "/v1/coins/{coin_id}/cycle-projection",
         ];
         for route in &routes {
             assert!(

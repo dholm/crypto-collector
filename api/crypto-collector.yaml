@@ -15,7 +15,7 @@ info:
 
     **live_poll_interval**: H/M/S duration string (e.g. "5m", "1h30m", "30s").
     Per-coin polling cadence override; null = use global default.
-  version: 0.2.0
+  version: 0.3.0
   contact:
     name: Crypto Collector team
 
@@ -434,7 +434,7 @@ paths:
     get:
       operationId: listCycleOverlay
       tags: [cycle-overlay]
-      summary: List the Bitcoin halving-cycle overlay for a coin (keyset-paginated)
+      summary: List the Bitcoin halving-cycle overlay for a coin, replay projection (keyset-paginated)
       description: >
         Returns materialised halving-cycle overlay points derived locally from the
         coin's persisted daily (`1d`) candle history — never scraped from any external
@@ -445,6 +445,16 @@ paths:
         `days_since_halving` X-axis (the cycle-low series is deliberately NOT
         re-based to days-since-low). A coin with no computed overlay (e.g. not the
         configured target coin) yields an empty page (HTTP 200), not 404.
+
+
+        Forward-projected points (see `projected`) on this endpoint use the Bitbo-style
+        cycle-repeat REPLAY projection: it replays the actual daily returns of the
+        trailing one-halving-cycle reference window forward from today, scaled to
+        today's real price. This reproduces local swings (peaks/dips) more faithfully
+        than a smooth trend model, at the cost of no statistical confidence bands —
+        replay-projected points always carry null `price_low`/`price_high`. For the
+        smoother composite model with P10/P90 bands, see
+        `GET /coins/{coin_id}/cycle-projection`.
       parameters:
         - name: vs_currency
           in: query
@@ -462,7 +472,50 @@ paths:
         - $ref: '#/components/parameters/limit'
       responses:
         '200':
-          description: Paginated halving-cycle overlay points
+          description: Paginated halving-cycle overlay points (replay projection)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CycleOverlayPointPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /coins/{coin_id}/cycle-projection:
+    parameters:
+      - $ref: '#/components/parameters/coin_id'
+    get:
+      operationId: listCycleProjection
+      tags: [cycle-overlay]
+      summary: List the Bitcoin halving-cycle overlay for a coin, composite projection (keyset-paginated)
+      description: >
+        Returns the same real (observed) halving-cycle overlay points as
+        `GET /coins/{coin_id}/cycle-overlay`, plus forward-projected points from the
+        COMPOSITE model (SPEC-CYCLE-001 v0.4.0, docs/prediction-research.md): a
+        power-law trend fit of the coin's full daily history, plus a damped
+        halving-cycle phase component (encoding measured diminishing returns), plus a
+        mean-reversion term that keeps the path continuous with the last real close
+        (half-life ~180 days). `price` on projected points is the median (P50) path;
+        `price_low`/`price_high` carry the P10/P90 confidence bands. Ordered by
+        `(cycle_number ASC, days_since_halving ASC)`. A coin with no computed overlay
+        (e.g. not the configured target coin) yields an empty page (HTTP 200), not 404.
+      parameters:
+        - name: vs_currency
+          in: query
+          schema:
+            type: string
+            default: usd
+          description: Quote currency (default `usd`); unrecognised values yield an empty page.
+        - name: cycle
+          in: query
+          schema:
+            type: integer
+            format: int32
+          description: Optional filter to a single cycle ordinal (1 = 2012-11-28 halving, etc.).
+        - $ref: '#/components/parameters/cursor'
+        - $ref: '#/components/parameters/limit'
+      responses:
+        '200':
+          description: Paginated halving-cycle overlay points (composite projection)
           content:
             application/json:
               schema:
@@ -821,30 +874,39 @@ components:
           type: boolean
           description: >
             true when this point is a forward projection rather than a real observed daily
-            candle (REQ-CYCLE-060/063). Projections come from the composite model
-            (SPEC-CYCLE-001 v0.4.0, docs/prediction-research.md): a power-law trend fit of
-            the coin's full daily history, plus a damped halving-cycle phase component
-            (encoding measured diminishing returns), plus a mean-reversion term that keeps
-            the path continuous with the last real close (half-life ~180 days). `price` is
-            the median (P50) path; `price_low`/`price_high` carry the P10/P90 bands.
-            Projected points span up to 1458 days forward, may cross into a projected
-            cycle 5 (estimated 2028-04-20 halving), and are provisional — recomputed on
-            every recompute tick as real data grows.
+            candle (REQ-CYCLE-060/063). Projected points span up to 1458 days forward, may
+            cross into a projected cycle 5 (estimated 2028-04-20 halving), and are
+            provisional — recomputed on every recompute tick as real data grows. Which
+            projection model produced a given point depends on which endpoint served it:
+            `GET /coins/{coin_id}/cycle-overlay` serves the Bitbo-style cycle-repeat REPLAY
+            model (replays the trailing one-halving-cycle's actual daily returns forward
+            from today, scaled to today's price; no confidence bands — `price_low`/
+            `price_high` are always null). `GET /coins/{coin_id}/cycle-projection` serves
+            the COMPOSITE model (SPEC-CYCLE-001 v0.4.0, docs/prediction-research.md): a
+            power-law trend fit of the coin's full daily history, plus a damped
+            halving-cycle phase component (encoding measured diminishing returns), plus a
+            mean-reversion term that keeps the path continuous with the last real close
+            (half-life ~180 days); `price` is the median (P50) path, `price_low`/
+            `price_high` carry the P10/P90 bands.
         price_low:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           nullable: true
           description: >
-            P10 confidence band of the projection (REQ-CYCLE-064), derived from empirical
-            horizon quantiles of the model's historical errors. Present only on
-            projected points; null on real observed points.
+            P10 confidence band of the composite projection (REQ-CYCLE-064), derived from
+            empirical horizon quantiles of the model's historical errors. Present only on
+            projected points served by `GET /coins/{coin_id}/cycle-projection`; null on
+            real observed points and on all points from `GET /coins/{coin_id}/cycle-overlay`
+            (the replay model has no confidence bands).
         price_high:
           allOf:
             - $ref: '#/components/schemas/DecimalString'
           nullable: true
           description: >
-            P90 confidence band of the projection (REQ-CYCLE-064). Present only on
-            projected points; null on real observed points.
+            P90 confidence band of the composite projection (REQ-CYCLE-064). Present only
+            on projected points served by `GET /coins/{coin_id}/cycle-projection`; null on
+            real observed points and on all points from `GET /coins/{coin_id}/cycle-overlay`
+            (the replay model has no confidence bands).
 
     CycleOverlayPointPage:
       allOf:
