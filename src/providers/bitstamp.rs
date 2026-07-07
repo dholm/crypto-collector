@@ -196,6 +196,18 @@ fn snap_to_bitstamp_step(interval_secs: i64) -> (i64, &'static str) {
     (best.0, best.1)
 }
 
+/// Cap a range request's `end` so Bitstamp returns a page ascending from `start`.
+///
+/// Bitstamp returns the most recent `limit` candles of `[start, end]`; to page forward
+/// from `start` we bound the window to at most `limit` candles: `min(end, start +
+/// limit*step)`. `end` is never moved earlier than `start` (returns `start` for an
+/// inverted or empty window).
+fn page_end_secs(start_secs: i64, end_secs: i64, step_secs: i64, limit: u32) -> i64 {
+    let window = step_secs.saturating_mul(limit as i64);
+    let capped = start_secs.saturating_add(window);
+    end_secs.min(capped).max(start_secs)
+}
+
 // ── Provider ─────────────────────────────────────────────────────────────────────
 
 /// Bitstamp exchange `Provider` — deep historical OHLC source (`Ohlc`, `OhlcRange`).
@@ -283,9 +295,15 @@ impl Provider for BitstampProvider {
             .collect()
     }
 
-    /// Fetch one page of candles in `[start, end)` (REQ backfill). Bitstamp returns up
-    /// to `limit` (1000) ascending candles from `start`; the backfill worker's
-    /// cursor-advance loop pages forward across calls for wider windows.
+    /// Fetch one page of candles anchored at `start` (REQ backfill).
+    ///
+    /// **Bitstamp paging quirk:** when the `[start, end]` window spans more than `limit`
+    /// candles, Bitstamp returns the most recent `limit` candles *before `end`*, NOT the
+    /// earliest `limit` from `start`. The backfill worker's cursor-advance loop assumes
+    /// ascending-from-start paging (as Binance does), so we cap the request's `end` at
+    /// `start + limit*step` — a window of at most `limit` candles — which makes Bitstamp
+    /// return the page ascending from `start`. The worker then advances its cursor past
+    /// the page's max timestamp and calls again for the next window.
     async fn fetch_ohlc_range(
         &self,
         market: &MarketQuery,
@@ -295,6 +313,12 @@ impl Provider for BitstampProvider {
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         let pair = Self::pair_symbol(market);
         let (step, interval) = snap_to_bitstamp_step(interval_secs);
+        let page_end = page_end_secs(
+            start.timestamp(),
+            end.timestamp(),
+            step,
+            BITSTAMP_PAGE_LIMIT,
+        );
 
         self.acquire().await?;
         let rows = match self
@@ -304,7 +328,7 @@ impl Provider for BitstampProvider {
                 step,
                 BITSTAMP_PAGE_LIMIT,
                 Some(start.timestamp()),
-                Some(end.timestamp()),
+                Some(page_end),
             )
             .await
         {
@@ -419,6 +443,35 @@ mod tests {
         assert_eq!(snap_to_bitstamp_step(604_800), (259_200, "3d"));
         // Sub-minute → finest step 1m.
         assert_eq!(snap_to_bitstamp_step(30), (60, "1m"));
+    }
+
+    #[test]
+    fn page_end_caps_wide_window_to_limit_candles() {
+        // 2011-08-18 → 2016-07-09 (~1786 days) at 1d, limit 1000: the request end must be
+        // capped to start + 1000 days so Bitstamp returns ascending from start, not the
+        // most-recent 1000 before the real end.
+        let start = 1_313_625_600; // 2011-08-18
+        let real_end = 1_468_022_400; // 2016-07-09
+        let capped = page_end_secs(start, real_end, 86_400, 1000);
+        assert_eq!(capped, start + 86_400 * 1000);
+        assert!(
+            capped < real_end,
+            "wide window must be capped below the real end"
+        );
+    }
+
+    #[test]
+    fn page_end_leaves_narrow_window_unchanged() {
+        // A window already within limit candles is passed through untouched.
+        let start = 1_313_625_600;
+        let end = start + 86_400 * 10; // 10 days ≤ 1000
+        assert_eq!(page_end_secs(start, end, 86_400, 1000), end);
+    }
+
+    #[test]
+    fn page_end_never_precedes_start() {
+        let start = 1_313_625_600;
+        assert_eq!(page_end_secs(start, start - 999, 86_400, 1000), start);
     }
 
     #[test]
