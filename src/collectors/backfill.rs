@@ -468,12 +468,14 @@ pub async fn enqueue_deep_history_backfills(
 
     for coin_id in coin_ids {
         // Skip untracked coins — process_chunk requires a tracked_coins row.
-        let tracked: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM tracked_coins WHERE coin_id = $1")
+        // EXISTS returns a non-null bool (BOOL), avoiding the INT4/INT8 decode mismatch
+        // that a bare `SELECT 1` (typed INT4) would cause against a Rust integer.
+        let tracked: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tracked_coins WHERE coin_id = $1)")
                 .bind(coin_id)
-                .fetch_optional(pool)
+                .fetch_one(pool)
                 .await?;
-        if tracked.is_none() {
+        if !tracked {
             skipped += 1;
             continue;
         }
