@@ -232,13 +232,16 @@ async fn main() -> Result<()> {
 
     // ── Step 8c: Deep-history daily backfill (idempotent) ─────────────────────
     // Enqueues a `1d` backfill for configured coins (default: bitcoin) over
-    // [deep_start, now - lookback) — the pre-regular-lookback window that only a
-    // deep-history source (Bitstamp: BTC/USD daily from 2011-08) can serve, since
-    // Binance klines begin 2017-08. Contiguous with the Step 8b regular backfill.
+    // [deep_start, now]. This provides a COMPLETE standalone daily series: a
+    // deep-history source (Bitstamp: BTC/USD daily from 2011-08) serves the
+    // pre-2017 years Binance cannot, and Binance serves 1d from 2017-08 on. The
+    // window deliberately runs to `now` (not `now - lookback`) so it does not
+    // depend on the fine-grained 5m backfill having reached back via Bitstamp —
+    // the daily rows overlap the 5m→1d rollup harmlessly (idempotent upsert).
     // Same idempotency + fail-soft contract as Step 8b.
     let deep_coins = config::deep_backfill_coins();
     if !deep_coins.is_empty() {
-        let deep_end = chrono::Utc::now() - chrono::Duration::days(backfill_lookback_days as i64);
+        let deep_end = chrono::Utc::now();
         let deep_start = config::deep_backfill_start_date()
             .and_hms_opt(0, 0, 0)
             .expect("valid midnight")
