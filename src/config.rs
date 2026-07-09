@@ -398,6 +398,169 @@ pub fn cycle_overlay_vs_currency() -> String {
         .to_lowercase()
 }
 
+// ── SPEC-ALARM-001 Alarm Center integration configuration ─────────────────────
+
+/// Alarm Center base URL — the feature gate (REQ-ALARM-001/002/050, D5).
+///
+/// Env var: `ALARM_CENTER_URL`. Unset or empty = the whole alarm feature is disabled:
+/// no `AlarmClient` is built, no reconciler is spawned, no request is ever sent.
+pub fn alarm_center_url() -> Option<String> {
+    std::env::var("ALARM_CENTER_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Alarm Center API key, attached best-effort as an auth header (REQ-ALARM-009, OR-ALARM-6).
+///
+/// Env var: `ALARM_CENTER_API_KEY`. Unset = no auth header is sent.
+pub fn alarm_center_api_key() -> Option<String> {
+    std::env::var("ALARM_CENTER_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Per-attempt timeout for alarm-center HTTP requests, in milliseconds (REQ-ALARM-006).
+///
+/// Env var: `ALARM_CENTER_TIMEOUT_MS`. Default: 5000 ms.
+pub fn alarm_center_timeout_ms() -> u64 {
+    parse_env_u64("ALARM_CENTER_TIMEOUT_MS", 5_000)
+}
+
+/// Maximum retry attempts for a raise/clear before the client swallows the error and logs
+/// (REQ-ALARM-006/007).
+///
+/// Env var: `ALARM_CENTER_MAX_RETRIES`. Default: 3.
+pub fn alarm_center_max_retries() -> u32 {
+    parse_env_u32("ALARM_CENTER_MAX_RETRIES", 3)
+}
+
+/// Reconciler sweep cadence in seconds (REQ-ALARM-011, D2).
+///
+/// Env var: `ALARM_RECONCILE_INTERVAL_SECS`. Default: 30 s (aligned with
+/// `TRACKED_GAUGE_INTERVAL_SECS`).
+pub fn alarm_reconcile_interval_secs() -> u64 {
+    parse_env_u64("ALARM_RECONCILE_INTERVAL_SECS", 30)
+}
+
+/// Server-side auto-clear TTL sent as `timeoutSeconds` on every raise/heartbeat
+/// (REQ-ALARM-050/052/053).
+///
+/// Env var: `ALARM_TTL_SECS`. Default: `ceil(2.5 * alarm_reconcile_interval_secs())`
+/// (≈75 s at the 30 s default interval), sized to exceed the reconcile interval by a
+/// safety margin so a single slow/missed sweep cannot let an active alarm's deadline lapse.
+pub fn alarm_ttl_secs() -> u64 {
+    std::env::var("ALARM_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            let interval = alarm_reconcile_interval_secs();
+            // ceil(2.5 * interval) computed in integer arithmetic: (5 * interval + 1) / 2.
+            (5 * interval).div_ceil(2)
+        })
+}
+
+/// Sustained-outage threshold before a single unreachable provider's Warning alarm activates
+/// (REQ-ALARM-020/051).
+///
+/// Env var: `ALARM_PROVIDER_UNREACHABLE_SECS`. Default: 300 s.
+pub fn alarm_provider_unreachable_secs() -> u64 {
+    parse_env_u64("ALARM_PROVIDER_UNREACHABLE_SECS", 300)
+}
+
+/// Sustained readiness-ping failure threshold before the DB-unreachable Critical alarm
+/// activates (REQ-ALARM-030/051).
+///
+/// Env var: `ALARM_DB_UNREACHABLE_SECS`. Default: 60 s.
+pub fn alarm_db_unreachable_secs() -> u64 {
+    parse_env_u64("ALARM_DB_UNREACHABLE_SECS", 60)
+}
+
+/// Windowed collection-queue failure count threshold (REQ-ALARM-032/051).
+///
+/// Env var: `ALARM_QUEUE_FAILED_THRESHOLD`. Default: 10.
+pub fn alarm_queue_failed_threshold() -> u32 {
+    parse_env_u32("ALARM_QUEUE_FAILED_THRESHOLD", 10)
+}
+
+/// Window (in seconds) bounding the collection-queue failure-rate signal so the terminal
+/// `'failed'` status does not latch the alarm permanently (REQ-ALARM-032/051, B1).
+///
+/// Env var: `ALARM_QUEUE_FAILED_WINDOW_SECS`. Default: 3600 s (1 h).
+pub fn alarm_queue_failed_window_secs() -> u64 {
+    parse_env_u64("ALARM_QUEUE_FAILED_WINDOW_SECS", 3_600)
+}
+
+/// Windowed backfill-chunk failure count threshold (REQ-ALARM-033/051).
+///
+/// Env var: `ALARM_BACKFILL_FAILED_THRESHOLD`. Default: 10.
+pub fn alarm_backfill_failed_threshold() -> u32 {
+    parse_env_u32("ALARM_BACKFILL_FAILED_THRESHOLD", 10)
+}
+
+/// Window (in seconds) bounding the backfill-chunk failure-rate signal, for the same
+/// terminal-state reason as `alarm_queue_failed_window_secs` (REQ-ALARM-033/051, B1).
+///
+/// Env var: `ALARM_BACKFILL_FAILED_WINDOW_SECS`. Default: 3600 s (1 h).
+pub fn alarm_backfill_failed_window_secs() -> u64 {
+    parse_env_u64("ALARM_BACKFILL_FAILED_WINDOW_SECS", 3_600)
+}
+
+/// Duration (in seconds) pending backfill chunks may sit without progress before the
+/// `backfill-stalled` Warning alarm activates (REQ-ALARM-033/051).
+///
+/// Env var: `ALARM_BACKFILL_STALL_SECS`. Default: 3600 s (1 h).
+pub fn alarm_backfill_stall_secs() -> u64 {
+    parse_env_u64("ALARM_BACKFILL_STALL_SECS", 3_600)
+}
+
+/// Restart-event count threshold within the crash-loop window before the
+/// `worker-crash-looping` Error alarm activates (REQ-ALARM-034/051).
+///
+/// Env var: `ALARM_WORKER_CRASHLOOP_THRESHOLD`. Default: 3.
+pub fn alarm_worker_crashloop_threshold() -> u32 {
+    parse_env_u32("ALARM_WORKER_CRASHLOOP_THRESHOLD", 3)
+}
+
+/// Sliding window (in seconds) over which worker restart events are counted for the
+/// crash-loop signal (REQ-ALARM-034/051, M2).
+///
+/// Env var: `ALARM_WORKER_CRASHLOOP_WINDOW_SECS`. Default: 300 s.
+pub fn alarm_worker_crashloop_window_secs() -> u64 {
+    parse_env_u64("ALARM_WORKER_CRASHLOOP_WINDOW_SECS", 300)
+}
+
+/// Staleness threshold (in seconds) beyond which a tracked coin counts toward the
+/// aggregated `coins-stalled` alarm (REQ-ALARM-040/051, OR-ALARM-3).
+///
+/// Env var: `ALARM_COIN_STALENESS_SECS`. Default: 900 s.
+pub fn alarm_coin_staleness_secs() -> u64 {
+    parse_env_u64("ALARM_COIN_STALENESS_SECS", 900)
+}
+
+/// Number of stale coins required before the aggregated `coins-stalled` Warning alarm
+/// activates (REQ-ALARM-040/051, OR-ALARM-3).
+///
+/// Env var: `ALARM_COINS_STALLED_THRESHOLD`. Default: 5.
+pub fn alarm_coins_stalled_threshold() -> u32 {
+    parse_env_u32("ALARM_COINS_STALLED_THRESHOLD", 5)
+}
+
+/// Sustained pool-saturation duration (in seconds) before the `db-pool-exhausted` Error
+/// alarm activates (REQ-ALARM-041/051).
+///
+/// Env var: `ALARM_DB_POOL_SATURATION_SECS`. Default: 60 s.
+pub fn alarm_db_pool_saturation_secs() -> u64 {
+    parse_env_u64("ALARM_DB_POOL_SATURATION_SECS", 60)
+}
+
+/// Consecutive upsert-failure count before the `db-upsert-failures` Error alarm activates
+/// (REQ-ALARM-042/051).
+///
+/// Env var: `ALARM_UPSERT_FAILURE_STREAK`. Default: 20.
+pub fn alarm_upsert_failure_streak() -> u32 {
+    parse_env_u32("ALARM_UPSERT_FAILURE_STREAK", 20)
+}
+
 // ── Internal env-var helpers ──────────────────────────────────────────────────
 
 fn parse_env_u16(name: &str, default: u16) -> u16 {
@@ -684,5 +847,120 @@ mod tests {
     fn effective_interval_falls_back_on_parse_error() {
         // Unparseable value → fall back to global
         assert_eq!(effective_candle_interval_secs(Some("garbage"), 60), 60);
+    }
+
+    // ── SPEC-ALARM-001 alarm-center configuration (Milestone 1) ───────────────
+
+    #[test]
+    fn alarm_center_url_none_when_unset_or_empty() {
+        if std::env::var("ALARM_CENTER_URL").is_err() {
+            assert!(alarm_center_url().is_none());
+        }
+    }
+
+    #[test]
+    fn alarm_center_url_some_when_set() {
+        // Guard: does not mutate global env state; only asserts when explicitly present.
+        if let Ok(v) = std::env::var("ALARM_CENTER_URL") {
+            if !v.is_empty() {
+                assert_eq!(alarm_center_url(), Some(v));
+            }
+        }
+    }
+
+    #[test]
+    fn alarm_center_timeout_ms_default_is_5000() {
+        if std::env::var("ALARM_CENTER_TIMEOUT_MS").is_err() {
+            assert_eq!(alarm_center_timeout_ms(), 5_000);
+        }
+    }
+
+    #[test]
+    fn alarm_center_max_retries_default_is_3() {
+        if std::env::var("ALARM_CENTER_MAX_RETRIES").is_err() {
+            assert_eq!(alarm_center_max_retries(), 3);
+        }
+    }
+
+    #[test]
+    fn alarm_reconcile_interval_secs_default_is_30() {
+        if std::env::var("ALARM_RECONCILE_INTERVAL_SECS").is_err() {
+            assert_eq!(alarm_reconcile_interval_secs(), 30);
+        }
+    }
+
+    #[test]
+    fn alarm_ttl_secs_default_is_ceil_2_5x_interval_and_exceeds_it() {
+        // REQ-ALARM-052: default = ceil(2.5 * interval); must strictly exceed the interval.
+        if std::env::var("ALARM_TTL_SECS").is_err()
+            && std::env::var("ALARM_RECONCILE_INTERVAL_SECS").is_err()
+        {
+            let interval = alarm_reconcile_interval_secs();
+            let ttl = alarm_ttl_secs();
+            assert_eq!(ttl, 75); // ceil(2.5 * 30) = 75
+            assert!(ttl > interval);
+        }
+    }
+
+    #[test]
+    fn alarm_ttl_secs_ceil_computation_matches_2_5x_for_arbitrary_interval() {
+        // Pure arithmetic check independent of env: ceil(2.5 * interval) via (5*i).div_ceil(2).
+        for interval in [1u64, 2, 3, 7, 29, 30, 33, 100] {
+            let expected = ((interval as f64) * 2.5).ceil() as u64;
+            let computed = (5 * interval).div_ceil(2);
+            assert_eq!(computed, expected, "interval={interval}");
+            assert!(computed > interval);
+        }
+    }
+
+    #[test]
+    fn alarm_queue_failed_window_secs_default_is_3600() {
+        if std::env::var("ALARM_QUEUE_FAILED_WINDOW_SECS").is_err() {
+            assert_eq!(alarm_queue_failed_window_secs(), 3_600);
+        }
+    }
+
+    #[test]
+    fn alarm_backfill_failed_window_secs_default_is_3600() {
+        if std::env::var("ALARM_BACKFILL_FAILED_WINDOW_SECS").is_err() {
+            assert_eq!(alarm_backfill_failed_window_secs(), 3_600);
+        }
+    }
+
+    #[test]
+    fn alarm_threshold_defaults() {
+        if std::env::var("ALARM_PROVIDER_UNREACHABLE_SECS").is_err() {
+            assert_eq!(alarm_provider_unreachable_secs(), 300);
+        }
+        if std::env::var("ALARM_DB_UNREACHABLE_SECS").is_err() {
+            assert_eq!(alarm_db_unreachable_secs(), 60);
+        }
+        if std::env::var("ALARM_QUEUE_FAILED_THRESHOLD").is_err() {
+            assert_eq!(alarm_queue_failed_threshold(), 10);
+        }
+        if std::env::var("ALARM_BACKFILL_FAILED_THRESHOLD").is_err() {
+            assert_eq!(alarm_backfill_failed_threshold(), 10);
+        }
+        if std::env::var("ALARM_BACKFILL_STALL_SECS").is_err() {
+            assert_eq!(alarm_backfill_stall_secs(), 3_600);
+        }
+        if std::env::var("ALARM_WORKER_CRASHLOOP_THRESHOLD").is_err() {
+            assert_eq!(alarm_worker_crashloop_threshold(), 3);
+        }
+        if std::env::var("ALARM_WORKER_CRASHLOOP_WINDOW_SECS").is_err() {
+            assert_eq!(alarm_worker_crashloop_window_secs(), 300);
+        }
+        if std::env::var("ALARM_COIN_STALENESS_SECS").is_err() {
+            assert_eq!(alarm_coin_staleness_secs(), 900);
+        }
+        if std::env::var("ALARM_COINS_STALLED_THRESHOLD").is_err() {
+            assert_eq!(alarm_coins_stalled_threshold(), 5);
+        }
+        if std::env::var("ALARM_DB_POOL_SATURATION_SECS").is_err() {
+            assert_eq!(alarm_db_pool_saturation_secs(), 60);
+        }
+        if std::env::var("ALARM_UPSERT_FAILURE_STREAK").is_err() {
+            assert_eq!(alarm_upsert_failure_streak(), 20);
+        }
     }
 }
