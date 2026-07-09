@@ -180,3 +180,33 @@ otel:
   endpoint: ""         # e.g. "http://opentelemetry-collector.monitoring.svc.cluster.local:4317"
   protocol: grpc       # grpc or http
   environment: ""      # DEPLOYMENT_ENVIRONMENT resource attribute (e.g. "production", "staging")
+
+# ── Alarm Center integration (SPEC-ALARM-001) ────────────────────────────────
+# DISABLED BY DEFAULT. The whole feature is gated on ALARM_CENTER_URL: leave
+# `url` empty (or `enabled: false`) and no AlarmClient is built, no reconciler
+# is spawned, and no request is ever sent — a complete no-op, identical to a
+# build without this feature.
+#
+# Only the primary client/reconciler knobs are exposed here, mirroring the
+# in-app defaults. The per-condition alarm thresholds/windows (e.g.
+# ALARM_PROVIDER_UNREACHABLE_SECS, ALARM_COIN_STALENESS_SECS, ...) keep their
+# in-app defaults and are not surfaced in the chart yet — see docs/alarms.md
+# for the full tunable list if they need to be exposed later.
+alarm:
+  enabled: false
+  url: "http://alarm-center"  # ALARM_CENTER_URL — empty/disabled = feature fully off
+  timeoutMs: "5000"     # ALARM_CENTER_TIMEOUT_MS — per-attempt HTTP timeout
+  maxRetries: "3"       # ALARM_CENTER_MAX_RETRIES — bounded retry count before swallow-and-log
+  reconcileIntervalSecs: "30"  # ALARM_RECONCILE_INTERVAL_SECS — reconciler sweep cadence
+  # ALARM_TTL_SECS — server-side auto-clear TTL sent as timeoutSeconds on every
+  # raise. Leave empty to let the app derive ceil(2.5 * reconcileIntervalSecs).
+  ttlSecs: ""
+  # Windowed failure-rate thresholds shared by collection-queue and backfill alarms.
+  queueFailedWindowSecs: "3600"     # ALARM_QUEUE_FAILED_WINDOW_SECS
+  backfillFailedWindowSecs: "3600"  # ALARM_BACKFILL_FAILED_WINDOW_SECS
+  # Alarm Center API key — best-effort Authorization: Bearer header.
+  # Injected via secretKeyRef; never stored in the ConfigMap. Leave
+  # secretName empty to omit the header entirely.
+  apiKey:
+    secretName: ""
+    secretKey: "ALARM_CENTER_API_KEY"

@@ -93,7 +93,7 @@ spec:
           # @MX:WARN: [AUTO] Credentials must arrive exclusively via secretKeyRef.
           # @MX:REASON: Credentials in ConfigMap or image violate REQ-CFG-007 and create
           #             a security boundary breach. Add no credential values here directly.
-          {{- $hasSecrets := or .Values.database.credentials.username.secretName (or .Values.database.credentials.password.secretName .Values.coingecko.apiKey.secretName) }}
+          {{- $hasSecrets := or .Values.database.credentials.username.secretName (or .Values.database.credentials.password.secretName (or .Values.coingecko.apiKey.secretName .Values.alarm.apiKey.secretName)) }}
           {{- if $hasSecrets }}
           env:
             {{- if .Values.database.credentials.username.secretName }}
@@ -116,6 +116,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.coingecko.apiKey.secretName }}
                   key: {{ .Values.coingecko.apiKey.secretKey }}
+            {{- end }}
+            {{- if .Values.alarm.apiKey.secretName }}
+            - name: ALARM_CENTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.alarm.apiKey.secretName }}
+                  key: {{ .Values.alarm.apiKey.secretKey }}
             {{- end }}
           {{- end }}
           # Liveness probe: /healthz/live on health port (REQ-DEPLOY-024)

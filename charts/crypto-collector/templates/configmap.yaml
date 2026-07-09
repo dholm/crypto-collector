@@ -59,3 +59,18 @@ data:
   DEPLOYMENT_ENVIRONMENT: {{ .Values.otel.environment | quote }}
   {{- end }}
   {{- end }}
+
+  # ── Alarm Center (SPEC-ALARM-001) ────────────────────────────────────────────
+  # Fully gated: rendered only when alarm.enabled and alarm.url are both set.
+  # ALARM_CENTER_API_KEY is injected via secretKeyRef — never here (REQ-CFG-007).
+  {{- if and .Values.alarm.enabled .Values.alarm.url }}
+  ALARM_CENTER_URL: {{ .Values.alarm.url | quote }}
+  ALARM_CENTER_TIMEOUT_MS: {{ .Values.alarm.timeoutMs | quote }}
+  ALARM_CENTER_MAX_RETRIES: {{ .Values.alarm.maxRetries | quote }}
+  ALARM_RECONCILE_INTERVAL_SECS: {{ .Values.alarm.reconcileIntervalSecs | quote }}
+  {{- if .Values.alarm.ttlSecs }}
+  ALARM_TTL_SECS: {{ .Values.alarm.ttlSecs | quote }}
+  {{- end }}
+  ALARM_QUEUE_FAILED_WINDOW_SECS: {{ .Values.alarm.queueFailedWindowSecs | quote }}
+  ALARM_BACKFILL_FAILED_WINDOW_SECS: {{ .Values.alarm.backfillFailedWindowSecs | quote }}
+  {{- end }}
