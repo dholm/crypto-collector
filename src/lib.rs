@@ -7,6 +7,8 @@
 /// SPEC-API-001: api (REST API server, /v1 router, OpenAPI v3.1 deliverable).
 /// SPEC-API-002: listener (PG LISTEN/NOTIFY relay for WebSocket broadcast channels).
 /// SPEC-OBS-001: health (liveness/readiness), metrics (Prometheus), telemetry (OTel + JSON logs).
+/// SPEC-ALARM-001: alarm (AlarmClient + fingerprint/condition catalogue; Batch 1 scope).
+pub mod alarm;
 pub mod api;
 pub mod collectors;
 pub mod config;
