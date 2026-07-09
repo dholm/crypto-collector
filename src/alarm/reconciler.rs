@@ -1122,6 +1122,15 @@ mod tests {
     #[ignore]
     async fn db_backfill_failed_windowed_count_recovers_outside_window() {
         let pool = setup_db().await;
+        // backfill_jobs.coin_id has a FK to tracked_coins — seed the parent row first.
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, last_polled_at) \
+             VALUES ('alarm-test-coin', 'ATC', 'Alarm Test Coin', 'active', now()) \
+             ON CONFLICT (coin_id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed parent coin");
         let job_id: i64 = sqlx::query_scalar(
             "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
              VALUES ('alarm-test-coin', 'candles', 'pending', now(), now()) \
@@ -1171,6 +1180,10 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = 'alarm-test-coin'")
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     /// Scenario 17b (REQ-ALARM-033 row 8b): a pending chunk whose `updated_at` is older
@@ -1180,6 +1193,15 @@ mod tests {
     #[ignore]
     async fn db_backfill_stalled_active_on_stale_pending_chunk() {
         let pool = setup_db().await;
+        // backfill_jobs.coin_id has a FK to tracked_coins — seed the parent row first.
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, last_polled_at) \
+             VALUES ('alarm-test-stall', 'ATS', 'Alarm Test Stall', 'active', now()) \
+             ON CONFLICT (coin_id) DO NOTHING",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed parent coin");
         let job_id: i64 = sqlx::query_scalar(
             "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
              VALUES ('alarm-test-stall', 'candles', 'pending', now(), now()) \
@@ -1230,6 +1252,10 @@ mod tests {
             .await
             .ok();
         sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = 'alarm-test-stall'")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = 'alarm-test-stall'")
             .execute(&pool)
             .await
             .ok();
