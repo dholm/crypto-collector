@@ -473,9 +473,21 @@ async fn dispatch_item(
                     volume: c.volume,
                     source: c.source.clone(),
                 };
-                upsert_coin_candle(pool, &candle)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                match upsert_coin_candle(pool, &candle).await {
+                    Ok(()) => {
+                        if let Some(reg) = registry {
+                            reg.record_upsert_success();
+                        }
+                    }
+                    Err(e) => {
+                        // REQ-ALARM-042: O(1) in-memory registry poke only, never a
+                        // network call — the reconciler derives db-upsert-failures.
+                        if let Some(reg) = registry {
+                            reg.record_upsert_failure();
+                        }
+                        return Err(e.to_string());
+                    }
+                }
             }
 
             // SPEC-CANDLE-001 REQ-CANDLE-020: enqueue a network-free rollup recompute after
@@ -544,9 +556,19 @@ async fn dispatch_item(
             .record(fetch_dur);
             let quote = quote_result.map_err(|e| e.to_string())?;
 
-            upsert_coin_quote(pool, coin_id, &quote)
-                .await
-                .map_err(|e| e.to_string())?;
+            match upsert_coin_quote(pool, coin_id, &quote).await {
+                Ok(()) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_success();
+                    }
+                }
+                Err(e) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_failure();
+                    }
+                    return Err(e.to_string());
+                }
+            }
 
             Ok(true)
         }
@@ -594,9 +616,19 @@ async fn dispatch_item(
             let meta = meta_result.map_err(|e| e.to_string())?;
 
             // Revision upsert (REQ-SCHED-042): new revision only if values changed.
-            upsert_coin_metadata(pool, &meta)
-                .await
-                .map_err(|e| e.to_string())?;
+            match upsert_coin_metadata(pool, &meta).await {
+                Ok(()) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_success();
+                    }
+                }
+                Err(e) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_failure();
+                    }
+                    return Err(e.to_string());
+                }
+            }
 
             Ok(true)
         }
@@ -643,9 +675,19 @@ async fn dispatch_item(
             .record(fetch_dur);
             let snapshot = snapshot_result.map_err(|e| e.to_string())?;
 
-            upsert_coin_market_snapshot(pool, &snapshot)
-                .await
-                .map_err(|e| e.to_string())?;
+            match upsert_coin_market_snapshot(pool, &snapshot).await {
+                Ok(()) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_success();
+                    }
+                }
+                Err(e) => {
+                    if let Some(reg) = registry {
+                        reg.record_upsert_failure();
+                    }
+                    return Err(e.to_string());
+                }
+            }
 
             Ok(true)
         }

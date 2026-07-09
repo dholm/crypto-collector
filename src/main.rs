@@ -204,8 +204,25 @@ async fn main() -> Result<()> {
     let provider_names = config::provider_names();
     let coingecko_cfg = crypto_collector::providers::CoinGeckoConfig::from_env();
     let chain = Arc::new(
-        crypto_collector::providers::build_chain(&provider_names, coingecko_cfg, pool.clone())
-            .context("failed to build provider chain")?,
+        match crypto_collector::providers::build_chain(&provider_names, coingecko_cfg, pool.clone())
+        {
+            Ok(chain) => chain,
+            Err(e) => {
+                // REQ-ALARM-035/OR-ALARM-1: `build_chain` fails fast BEFORE the
+                // reconciler exists. When ALARM_CENTER_URL is set, make a single
+                // best-effort blocking raise — one attempt, zero retries, bounded by
+                // ALARM_CENTER_TIMEOUT_MS, still carrying `timeoutSeconds` — so a
+                // crash-looping pod is never delayed by alarm delivery, then exit
+                // non-zero exactly as before.
+                if let Some(client) = crypto_collector::alarm::AlarmClient::from_config() {
+                    let spec = crypto_collector::alarm::catalog::to_alarm_spec(
+                        &crypto_collector::alarm::Condition::StartupConfigError,
+                    );
+                    client.raise_once(&spec).await;
+                }
+                return Err(e).context("failed to build provider chain");
+            }
+        },
     );
     info!("crypto-collector: provider chain = {:?}", provider_names);
 

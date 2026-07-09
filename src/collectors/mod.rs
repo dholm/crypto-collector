@@ -243,6 +243,9 @@ async fn run_supervised_live_poller(
                     break;
                 }
                 error!("live_poller crashed with error: {e}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("live_poller");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(join_err) => {
@@ -250,6 +253,9 @@ async fn run_supervised_live_poller(
                     break;
                 }
                 warn!("live_poller panicked: {join_err}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("live_poller");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -297,6 +303,9 @@ async fn run_supervised_queue_worker(
                     break;
                 }
                 error!("collection_queue_worker crashed with error: {e}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("collection_queue");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(join_err) => {
@@ -304,6 +313,9 @@ async fn run_supervised_queue_worker(
                     break;
                 }
                 warn!("collection_queue_worker panicked: {join_err}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("collection_queue");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -351,6 +363,9 @@ async fn run_supervised_backfill_worker(
                     break;
                 }
                 error!("backfill_worker crashed with error: {e}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("backfill");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             Err(join_err) => {
@@ -358,6 +373,9 @@ async fn run_supervised_backfill_worker(
                     break;
                 }
                 warn!("backfill_worker panicked: {join_err}; restarting in 5s");
+                if let Some(reg) = &registry {
+                    reg.record_worker_restart("backfill");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }

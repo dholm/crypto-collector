@@ -12,6 +12,12 @@ use tracing::{info, warn};
 /// Pool size shared by every connection path (eager, lazy).
 const MAX_CONNECTIONS: u32 = 10;
 
+/// The configured pool ceiling (SPEC-ALARM-001 REQ-ALARM-041): the reconciler compares
+/// `pool.size()` against this to detect saturation (`num_idle()==0 && size()==MAX_CONNECTIONS`).
+pub fn max_connections() -> u32 {
+    MAX_CONNECTIONS
+}
+
 /// Retry backoff bounds for `migrate_with_retry` (REQ-OBS-041).
 const RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);

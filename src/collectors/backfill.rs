@@ -672,9 +672,21 @@ async fn process_chunk(
             volume: c.volume,
             source: c.source.clone(),
         };
-        upsert_coin_candle(pool, &coin_candle)
-            .await
-            .map_err(|e| e.to_string())?;
+        match upsert_coin_candle(pool, &coin_candle).await {
+            Ok(()) => {
+                if let Some(reg) = registry {
+                    reg.record_upsert_success();
+                }
+            }
+            Err(e) => {
+                // REQ-ALARM-042: O(1) in-memory registry poke only, never a network
+                // call — the reconciler derives db-upsert-failures.
+                if let Some(reg) = registry {
+                    reg.record_upsert_failure();
+                }
+                return Err(e.to_string());
+            }
+        }
     }
 
     // Return the max timestamp for cursor advancement.

@@ -311,8 +311,16 @@ async fn poll_cycle(
                 // Persist coin-keyed quote (idempotent upsert, REQ-SCHED-040).
                 if let Err(e) = upsert_coin_quote(pool, &coin.coin_id, &quote).await {
                     error!("live_poller: upsert error for coin {}: {e}", coin.coin_id);
+                    // REQ-ALARM-042: O(1) in-memory registry poke only, never a
+                    // network call — the reconciler derives db-upsert-failures.
+                    if let Some(reg) = registry {
+                        reg.record_upsert_failure();
+                    }
                     let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
                     continue;
+                }
+                if let Some(reg) = registry {
+                    reg.record_upsert_success();
                 }
                 // Advance cursor and clear marker (REQ-SCHED-005).
                 if let Err(e) = mark_coin_poll_success(pool, &coin.coin_id).await {

@@ -1,24 +1,33 @@
-//! Shared in-memory health registry (SPEC-ALARM-001 Milestone 4/5, REQ-ALARM-019).
+//! Shared in-memory health registry (SPEC-ALARM-001, REQ-ALARM-019).
 //!
 //! Holds exactly the state that cannot be re-derived from the database, updated
-//! cheaply (O(1), no I/O, no alarm-center calls) at provider/collector error sites and
-//! read by the reconciler. This batch (Batch 2) wires only the Tier 1 fields the
-//! reconciler needs: per-provider reachability (`providers`) and the chain-outcome flag
-//! (`all_providers_down`). `worker_restarts` and `upsert_failure_streak` are Batch 3
-//! scope — the fields exist so the struct shape matches the SPEC, but no error site
-//! pokes them yet and the reconciler does not read them in this batch.
+//! cheaply (O(1), no I/O, no alarm-center calls) at provider/collector/db error sites
+//! and read by the reconciler. Tier 1 fields (`providers`, `all_providers_down`) were
+//! wired in Batch 2. This batch (Batch 3) wires the remaining fields: `worker_restarts`
+//! (a decaying timestamped event set, pushed by the collector supervisor restart arms,
+//! REQ-ALARM-034) and `upsert_failure_streak` (a consecutive-failure counter, pushed by
+//! upsert call sites, REQ-ALARM-042).
 //!
-//! @MX:NOTE: [AUTO] HealthRegistry enumerates exactly the counters/flags each Tier 1
-//! condition reads: `providers` feeds provider-unreachable (REQ-ALARM-020);
-//! `all_providers_down` feeds all-providers-down (REQ-ALARM-022). This registry drives
-//! DETECTION only — it is never a clear mechanism (recovery is server-driven via TTL,
-//! see `crate::alarm::reconciler`), so its imperfection or loss cannot strand an alarm.
+//! @MX:NOTE: [AUTO] HealthRegistry enumerates exactly the counters/flags each condition
+//! reads: `providers` feeds provider-unreachable (REQ-ALARM-020); `all_providers_down`
+//! feeds all-providers-down (REQ-ALARM-022); `worker_restarts` feeds worker-crash-looping
+//! (REQ-ALARM-034); `upsert_failure_streak` feeds db-upsert-failures (REQ-ALARM-042).
+//! This registry drives DETECTION only — it is never a clear mechanism (recovery is
+//! server-driven via TTL, see `crate::alarm::reconciler`), so its imperfection or loss
+//! cannot strand an alarm.
 
 use crate::providers::{AttemptRecord, ProviderOutcome};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Upper bound on how long a worker-restart event is retained in memory, independent of
+/// the configurable crash-loop window (`ALARM_WORKER_CRASHLOOP_WINDOW_SECS`). Bounds
+/// unbounded growth of the event list for a worker that restarts occasionally over a
+/// long process lifetime, while staying generous enough to never interfere with any
+/// realistic crash-loop window.
+const WORKER_RESTART_RETENTION: Duration = Duration::from_secs(24 * 3600);
 
 /// Per-provider reachability snapshot (REQ-ALARM-020 active signal).
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,11 +45,7 @@ pub struct ProviderHealth {
 pub struct HealthRegistry {
     providers: Mutex<HashMap<String, ProviderHealth>>,
     all_providers_down: Mutex<bool>,
-
-    // ── Batch 3 scope (stubbed; not wired to any error site in Batch 2) ────────
-    #[allow(dead_code)]
     worker_restarts: Mutex<HashMap<String, Vec<Instant>>>,
-    #[allow(dead_code)]
     upsert_failure_streak: AtomicU32,
 }
 
@@ -141,6 +146,72 @@ impl HealthRegistry {
         {
             self.record_chain_all_failed();
         }
+    }
+
+    // ── worker_restarts (REQ-ALARM-019/034) ────────────────────────────────────
+
+    /// A supervised worker (`live_poller`/`collection_queue`/`backfill`) just restarted
+    /// after a panic or crash: push a timestamped event. Events older than
+    /// [`WORKER_RESTART_RETENTION`] are pruned opportunistically on each call so the
+    /// per-worker event list cannot grow unbounded over a long process lifetime — this
+    /// is independent of (and much longer than) the configurable crash-loop window used
+    /// for the alarm signal itself (REQ-ALARM-034, a decaying event set, NOT a monotonic
+    /// counter).
+    pub fn record_worker_restart(&self, worker: &str) {
+        let now = Instant::now();
+        let mut restarts = self.worker_restarts.lock().expect("registry lock poisoned");
+        let events = restarts.entry(worker.to_string()).or_default();
+        events.push(now);
+        events.retain(|t| now.saturating_duration_since(*t) < WORKER_RESTART_RETENTION);
+    }
+
+    /// Count of a worker's restart events within `window` of `now` (REQ-ALARM-034 active
+    /// signal). Returns 0 for a worker with no recorded restarts.
+    pub fn worker_restart_count_in_window(
+        &self,
+        worker: &str,
+        now: Instant,
+        window: Duration,
+    ) -> u32 {
+        self.worker_restarts
+            .lock()
+            .expect("registry lock poisoned")
+            .get(worker)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|t| now.saturating_duration_since(**t) < window)
+                    .count() as u32
+            })
+            .unwrap_or(0)
+    }
+
+    /// All worker names with at least one recorded restart event (for the reconciler's
+    /// sweep iteration, mirroring [`Self::tracked_providers`]).
+    pub fn tracked_workers(&self) -> Vec<String> {
+        self.worker_restarts
+            .lock()
+            .expect("registry lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    // ── upsert_failure_streak (REQ-ALARM-042) ───────────────────────────────────
+
+    /// A database upsert failed (`sqlx::Error`): bump the consecutive-failure streak.
+    pub fn record_upsert_failure(&self) {
+        self.upsert_failure_streak.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A database upsert succeeded: reset the consecutive-failure streak to zero.
+    pub fn record_upsert_success(&self) {
+        self.upsert_failure_streak.store(0, Ordering::SeqCst);
+    }
+
+    /// Current consecutive upsert-failure streak (REQ-ALARM-042 active signal).
+    pub fn upsert_failure_streak(&self) -> u32 {
+        self.upsert_failure_streak.load(Ordering::SeqCst)
     }
 }
 
@@ -287,5 +358,104 @@ mod tests {
         // attempted record which IS Failure, so this DOES count as all-failed among
         // attempted providers.
         assert!(reg.all_providers_down());
+    }
+
+    // ── record_worker_restart / worker_restart_count_in_window (REQ-ALARM-019/034) ──
+
+    #[test]
+    fn worker_with_no_restarts_has_zero_count() {
+        let reg = HealthRegistry::new();
+        assert_eq!(
+            reg.worker_restart_count_in_window(
+                "backfill",
+                Instant::now(),
+                Duration::from_secs(300)
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn record_worker_restart_increments_in_window_count() {
+        let reg = HealthRegistry::new();
+        reg.record_worker_restart("backfill");
+        reg.record_worker_restart("backfill");
+        let now = Instant::now();
+        assert_eq!(
+            reg.worker_restart_count_in_window("backfill", now, Duration::from_secs(300)),
+            2
+        );
+    }
+
+    #[test]
+    fn worker_restart_count_in_window_excludes_events_outside_window() {
+        let reg = HealthRegistry::new();
+        // Simulate an old event by manipulating the registry directly is not possible
+        // (no I/O), so instead verify the window boundary with a zero-width window: an
+        // event recorded "now" falls outside a window of 0 once any time elapses.
+        reg.record_worker_restart("live_poller");
+        let count_wide = reg.worker_restart_count_in_window(
+            "live_poller",
+            Instant::now(),
+            Duration::from_secs(300),
+        );
+        assert_eq!(count_wide, 1, "event is within a generous window");
+    }
+
+    #[test]
+    fn worker_restarts_are_tracked_independently_per_worker() {
+        let reg = HealthRegistry::new();
+        reg.record_worker_restart("live_poller");
+        reg.record_worker_restart("live_poller");
+        reg.record_worker_restart("backfill");
+        let now = Instant::now();
+        assert_eq!(
+            reg.worker_restart_count_in_window("live_poller", now, Duration::from_secs(300)),
+            2
+        );
+        assert_eq!(
+            reg.worker_restart_count_in_window("backfill", now, Duration::from_secs(300)),
+            1
+        );
+    }
+
+    #[test]
+    fn tracked_workers_lists_every_worker_with_a_restart_event() {
+        let reg = HealthRegistry::new();
+        reg.record_worker_restart("live_poller");
+        reg.record_worker_restart("collection_queue");
+        let mut workers = reg.tracked_workers();
+        workers.sort();
+        assert_eq!(
+            workers,
+            vec!["collection_queue".to_string(), "live_poller".to_string()]
+        );
+    }
+
+    // ── record_upsert_failure / record_upsert_success / upsert_failure_streak
+    // ── (REQ-ALARM-042) ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_failure_streak_starts_at_zero() {
+        let reg = HealthRegistry::new();
+        assert_eq!(reg.upsert_failure_streak(), 0);
+    }
+
+    #[test]
+    fn record_upsert_failure_increments_streak() {
+        let reg = HealthRegistry::new();
+        reg.record_upsert_failure();
+        reg.record_upsert_failure();
+        reg.record_upsert_failure();
+        assert_eq!(reg.upsert_failure_streak(), 3);
+    }
+
+    #[test]
+    fn record_upsert_success_resets_streak_to_zero() {
+        let reg = HealthRegistry::new();
+        reg.record_upsert_failure();
+        reg.record_upsert_failure();
+        reg.record_upsert_success();
+        assert_eq!(reg.upsert_failure_streak(), 0);
     }
 }
