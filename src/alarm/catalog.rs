@@ -250,6 +250,51 @@ fn title_and_description(condition: &Condition) -> (String, String) {
     }
 }
 
+/// The 14 fixed fingerprint slugs in the Condition Catalogue (13 conditions; `backfill`
+/// contributes 2 — `backfill-failed` and `backfill-stalled`). Used by the OPTIONAL
+/// docs-parity check (OR-ALARM-7, REQ-ALARM-070) to assert `docs/alarms.md` carries an
+/// entry for every fingerprint the code can raise, without needing a live provider/worker
+/// name to instantiate a templated [`Condition`] variant.
+pub fn all_condition_slugs() -> &'static [&'static str] {
+    &[
+        "provider-unreachable",
+        "provider-rate-limited",
+        "all-providers-down",
+        "provider-credit-exhausted",
+        "db-unreachable",
+        "missing-pacer-row",
+        "collection-queue-failures",
+        "backfill-failed",
+        "backfill-stalled",
+        "worker-crash-looping",
+        "startup-config-error",
+        "coins-stalled",
+        "db-pool-exhausted",
+        "db-upsert-failures",
+    ]
+}
+
+/// The `code` value for every fixed condition slug (same 14 entries, same order as
+/// [`all_condition_slugs`]). Used by the OPTIONAL docs-parity check (OR-ALARM-7).
+pub fn all_condition_codes() -> &'static [&'static str] {
+    &[
+        "PROVIDER_UNREACHABLE",
+        "PROVIDER_RATE_LIMITED",
+        "ALL_PROVIDERS_DOWN",
+        "PROVIDER_CREDIT_EXHAUSTED",
+        "DB_UNREACHABLE",
+        "MISSING_PACER_ROW",
+        "COLLECTION_QUEUE_FAILURES",
+        "BACKFILL_FAILED",
+        "BACKFILL_STALLED",
+        "WORKER_CRASH_LOOPING",
+        "STARTUP_CONFIG_ERROR",
+        "COINS_STALLED",
+        "DB_POOL_EXHAUSTED",
+        "DB_UPSERT_FAILURES",
+    ]
+}
+
 /// Build the full [`AlarmSpec`] for a condition: fingerprint, component, severity, code,
 /// title, description. `labels`/`details` start empty — callers (reconciler, Batch 2/3)
 /// populate condition-specific context (e.g. stalled-coin count, capability name).
@@ -459,6 +504,30 @@ mod tests {
         assert!(!spec.description.is_empty());
         assert!(spec.labels.is_empty());
         assert!(spec.details.is_empty());
+    }
+
+    // ── OR-ALARM-7: docs-parity source lists (structural, no I/O) ───────────────
+
+    #[test]
+    fn all_condition_slugs_and_codes_have_matching_length_and_no_duplicates() {
+        let slugs = all_condition_slugs();
+        let codes = all_condition_codes();
+        assert_eq!(
+            slugs.len(),
+            14,
+            "14 fingerprints total (13 conditions + backfill x2)"
+        );
+        assert_eq!(codes.len(), slugs.len());
+
+        let mut sorted_slugs = slugs.to_vec();
+        sorted_slugs.sort();
+        sorted_slugs.dedup();
+        assert_eq!(sorted_slugs.len(), slugs.len(), "no duplicate slugs");
+
+        let mut sorted_codes = codes.to_vec();
+        sorted_codes.sort();
+        sorted_codes.dedup();
+        assert_eq!(sorted_codes.len(), codes.len(), "no duplicate codes");
     }
 
     #[test]

@@ -6,11 +6,11 @@ raise in the Alarm Center. This document and the code condition→spec mapping
 fingerprint, code, severity, component, or governing threshold/window is reflected in
 both places in the same change.
 
-> **Note:** Batch 1 (this document) ships the pure fingerprint/mapping catalogue and the
-> `AlarmClient` HTTP contract only. The reconciler that actually evaluates these
-> conditions against live state, and the `main`/`collectors` wiring that spawns it, are
-> delivered in Batches 2–3 of SPEC-ALARM-001. Every fingerprint, threshold, and env var
-> below is already final per the SPEC's Condition Catalogue.
+> **Note:** SPEC-ALARM-001 is fully implemented (Batches 1–3): the fingerprint/mapping
+> catalogue, the `AlarmClient` HTTP contract, the health registry, the reconciler sweep
+> (Tier 1 + Tier 2 + Tier 3 desired-state derivation), and the fatal startup-config raise
+> are all wired and spawned from `main`/`collectors`. Every fingerprint, threshold, and
+> env var below is live in the running service.
 
 ## Overview
 
@@ -295,5 +295,6 @@ provider's/component's alarm raises and clears independently. `sourceService` is
 
 ---
 
-Version: 1.0.0 (Batch 1 — config + `AlarmClient` + fingerprint catalogue)
+Version: 1.3.0 (Batches 1–3 — full implementation: config, `AlarmClient`, fingerprint
+catalogue, health registry, reconciler Tier 1/2/3, fatal startup-config raise)
 Source: SPEC-ALARM-001
