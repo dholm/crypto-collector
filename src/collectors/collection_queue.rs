@@ -245,28 +245,54 @@ async fn fetch_coin_context(
 // ── Chain dispatch helpers ────────────────────────────────────────────────────
 
 /// Try providers in order for `fetch_ohlc`; return first success.
+///
+/// `registry`, when present, feeds SPEC-ALARM-001's Tier 1 desired-state derivation
+/// (provider-unreachable/all-providers-down, REQ-ALARM-020/022); `None` is a no-op.
 async fn chain_fetch_ohlc_local(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     days: u32,
     interval_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<Vec<OhlcCandle>, ProviderError> {
-    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs).await;
+    let (result, _) =
+        crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs, registry).await;
     result
 }
 
 async fn chain_fetch_spot_local(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<SpotQuote, ProviderError> {
     let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
+    let mut attempted = false;
     for p in chain {
         if !p.supports(Capability::Spot) {
             continue;
         }
+        attempted = true;
         match p.fetch_spot(market).await {
-            Ok(q) => return Ok(q),
-            Err(e) => last_err = e,
+            Ok(q) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(p.name());
+                    reg.record_chain_success();
+                }
+                return Ok(q);
+            }
+            Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(p.name());
+                    }
+                }
+                last_err = e;
+            }
+        }
+    }
+    if attempted {
+        if let Some(reg) = registry {
+            reg.record_chain_all_failed();
         }
     }
     Err(last_err)
@@ -275,15 +301,36 @@ async fn chain_fetch_spot_local(
 async fn chain_fetch_coin_metadata(
     chain: &[Arc<dyn Provider>],
     coin_id: &str,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<CoinMeta, ProviderError> {
     let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
+    let mut attempted = false;
     for p in chain {
         if !p.supports(Capability::CoinMetadata) {
             continue;
         }
+        attempted = true;
         match p.fetch_coin_metadata(coin_id).await {
-            Ok(m) => return Ok(m),
-            Err(e) => last_err = e,
+            Ok(m) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(p.name());
+                    reg.record_chain_success();
+                }
+                return Ok(m);
+            }
+            Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(p.name());
+                    }
+                }
+                last_err = e;
+            }
+        }
+    }
+    if attempted {
+        if let Some(reg) = registry {
+            reg.record_chain_all_failed();
         }
     }
     Err(last_err)
@@ -293,15 +340,36 @@ async fn chain_fetch_coin_market(
     chain: &[Arc<dyn Provider>],
     coin_id: &str,
     vs_currency: &str,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<CoinMarket, ProviderError> {
     let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
+    let mut attempted = false;
     for p in chain {
         if !p.supports(Capability::CoinMarket) {
             continue;
         }
+        attempted = true;
         match p.fetch_coin_market(coin_id, vs_currency).await {
-            Ok(m) => return Ok(m),
-            Err(e) => last_err = e,
+            Ok(m) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(p.name());
+                    reg.record_chain_success();
+                }
+                return Ok(m);
+            }
+            Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(p.name());
+                    }
+                }
+                last_err = e;
+            }
+        }
+    }
+    if attempted {
+        if let Some(reg) = registry {
+            reg.record_chain_all_failed();
         }
     }
     Err(last_err)
@@ -325,6 +393,7 @@ async fn dispatch_item(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     item: &ClaimedQueueItem,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<bool, String> {
     match (item.target_kind.as_str(), item.kind.as_str()) {
         ("coin", "candles") => {
@@ -368,7 +437,8 @@ async fn dispatch_item(
 
             // REQ-OBS-012/015: instrument provider call with counter + duration histogram.
             let fetch_start = std::time::Instant::now();
-            let candles_result = chain_fetch_ohlc_local(chain, &mq, 7, interval_secs).await;
+            let candles_result =
+                chain_fetch_ohlc_local(chain, &mq, 7, interval_secs, registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if candles_result.is_ok() {
                 "success"
@@ -452,7 +522,7 @@ async fn dispatch_item(
 
             // REQ-OBS-012/015: instrument provider call.
             let fetch_start = std::time::Instant::now();
-            let quote_result = chain_fetch_spot_local(chain, &mq).await;
+            let quote_result = chain_fetch_spot_local(chain, &mq, registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if quote_result.is_ok() {
                 "success"
@@ -501,7 +571,7 @@ async fn dispatch_item(
 
             // REQ-OBS-012/015: instrument provider call.
             let fetch_start = std::time::Instant::now();
-            let meta_result = chain_fetch_coin_metadata(chain, coin_id).await;
+            let meta_result = chain_fetch_coin_metadata(chain, coin_id, registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if meta_result.is_ok() {
                 "success"
@@ -551,7 +621,7 @@ async fn dispatch_item(
 
             // REQ-OBS-012/015: instrument provider call.
             let fetch_start = std::time::Instant::now();
-            let snapshot_result = chain_fetch_coin_market(chain, coin_id, "usd").await;
+            let snapshot_result = chain_fetch_coin_market(chain, coin_id, "usd", registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if snapshot_result.is_ok() {
                 "success"
@@ -626,6 +696,7 @@ pub async fn run_collection_queue_worker(
     max_attempts: i32,
     idle_sleep: StdDuration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
     info!("collection_queue_worker: started (replica={claimed_by})");
 
@@ -679,7 +750,7 @@ pub async fn run_collection_queue_worker(
         });
 
         // Dispatch the work (REQ-SCHED-041: all upstream calls acquire pacer OUTSIDE tx).
-        let dispatch_result = dispatch_item(&pool, &chain, &item).await;
+        let dispatch_result = dispatch_item(&pool, &chain, &item, registry.as_deref()).await;
 
         hb_handle.abort();
 

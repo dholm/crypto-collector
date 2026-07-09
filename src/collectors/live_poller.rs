@@ -218,6 +218,7 @@ pub async fn run_live_poller(
     claim_ttl_secs: i64,
     tick_interval: StdDuration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
     info!(
         "live_poller: started (interval={}s, claim_ttl={}s)",
@@ -236,7 +237,7 @@ pub async fn run_live_poller(
                 }
             }
             _ = ticker.tick() => {
-                if let Err(e) = poll_cycle(&pool, &chain, global_interval_secs, claim_ttl_secs).await {
+                if let Err(e) = poll_cycle(&pool, &chain, global_interval_secs, claim_ttl_secs, registry.as_deref()).await {
                     error!("live_poller: cycle error: {e}");
                 }
             }
@@ -253,6 +254,7 @@ async fn poll_cycle(
     chain: &[Arc<dyn Provider>],
     global_interval_secs: i64,
     claim_ttl_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<()> {
     let coins = match claim_due_coins(pool, global_interval_secs, claim_ttl_secs).await {
         Ok(cs) => cs,
@@ -302,7 +304,7 @@ async fn poll_cycle(
         }
 
         // Fetch via chain (outside any transaction, REQ-SCHED-004).
-        let fetch_result = chain_fetch_spot(chain, &mq).await;
+        let fetch_result = chain_fetch_spot(chain, &mq, registry).await;
 
         match fetch_result {
             Ok(quote) => {
@@ -345,15 +347,36 @@ async fn poll_cycle(
 async fn chain_fetch_spot(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<crate::providers::SpotQuote, ProviderError> {
     let mut last_err = ProviderError::Other(anyhow::anyhow!("empty provider chain"));
+    let mut attempted = false;
     for provider in chain {
         if !provider.supports(Capability::Spot) {
             continue;
         }
+        attempted = true;
         match provider.fetch_spot(market).await {
-            Ok(q) => return Ok(q),
-            Err(e) => last_err = e,
+            Ok(q) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(provider.name());
+                    reg.record_chain_success();
+                }
+                return Ok(q);
+            }
+            Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(provider.name());
+                    }
+                }
+                last_err = e;
+            }
+        }
+    }
+    if attempted {
+        if let Some(reg) = registry {
+            reg.record_chain_all_failed();
         }
     }
     Err(last_err)

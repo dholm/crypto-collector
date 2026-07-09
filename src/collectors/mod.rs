@@ -28,6 +28,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+use crate::alarm::reconciler::{run_reconciler, Reconciler};
+use crate::alarm::{AlarmClient, HealthRegistry};
 use crate::providers::Provider;
 
 /// Configuration passed to all workers at startup (REQ-SCHED-001, OR-SCHED-1).
@@ -91,11 +93,24 @@ impl WorkerConfig {
     }
 }
 
-/// Spawn all three workers with supervision, returning a handle that awaits them.
+/// Optional Alarm Center integration components (SPEC-ALARM-001). `None` (the default
+/// when `ALARM_CENTER_URL` is unset) is a full no-op — the reconciler is never
+/// spawned and `None` is threaded through to every worker's chain-fetch call sites,
+/// so their registry pokes are simply skipped (REQ-ALARM-001/002).
+#[derive(Clone)]
+pub struct AlarmComponents {
+    pub client: Arc<AlarmClient>,
+    pub registry: Arc<HealthRegistry>,
+    pub reconcile_interval: Duration,
+}
+
+/// Spawn all workers with supervision, returning a handle that awaits them.
 ///
 /// Each worker runs in its own `tokio::spawn()` for panic isolation (REQ-SCHED-050).
 /// The supervisor restarts a worker if it panics or returns an error, continuing
-/// until the shutdown signal is broadcast.
+/// until the shutdown signal is broadcast. When `alarm` is `Some`, a fourth worker —
+/// the SPEC-ALARM-001 reconciler — is spawned and supervised identically
+/// (REQ-ALARM-001/010); when `None`, no reconciler task is created at all.
 ///
 /// `shutdown_tx`: the sender side; callers broadcast `true` to stop all workers.
 /// Returns a `JoinHandle` that resolves when all workers have exited.
@@ -104,27 +119,38 @@ impl WorkerConfig {
 // @MX:REASON: fan_in >= 3: main.rs startup, integration tests, future health-check hooks.
 //             REQ-SCHED-050: each worker in its own tokio::spawn for panic isolation.
 //             REQ-SCHED-051: supervisor restarts workers on error until shutdown.
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-050 REQ-SCHED-051
+//             REQ-ALARM-001/010: the reconciler is a fourth supervised worker, gated on
+//             `alarm.is_some()` (i.e. `ALARM_CENTER_URL` configured).
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-050 REQ-SCHED-051 SPEC-ALARM-001 REQ-ALARM-001 REQ-ALARM-010
 pub async fn spawn_workers(
     pool: PgPool,
     chain: Arc<Vec<Arc<dyn Provider>>>,
     cfg: WorkerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
+    alarm: Option<AlarmComponents>,
 ) -> tokio::task::JoinHandle<()> {
+    let registry = alarm.as_ref().map(|a| a.registry.clone());
+
     let pool_lp = pool.clone();
     let chain_lp = chain.clone();
     let cfg_lp = cfg.clone();
     let shutdown_lp = shutdown_rx.clone();
+    let registry_lp = registry.clone();
 
     let pool_cq = pool.clone();
     let chain_cq = chain.clone();
     let cfg_cq = cfg.clone();
     let shutdown_cq = shutdown_rx.clone();
+    let registry_cq = registry.clone();
 
     let pool_bf = pool.clone();
     let chain_bf = chain.clone();
     let cfg_bf = cfg.clone();
     let shutdown_bf = shutdown_rx.clone();
+    let registry_bf = registry.clone();
+
+    let pool_rc = pool.clone();
+    let shutdown_rc = shutdown_rx.clone();
 
     tokio::spawn(async move {
         let live_poller = tokio::spawn(run_supervised_live_poller(
@@ -132,25 +158,43 @@ pub async fn spawn_workers(
             chain_lp,
             cfg_lp,
             shutdown_lp,
+            registry_lp,
         ));
         let queue_worker = tokio::spawn(run_supervised_queue_worker(
             pool_cq,
             chain_cq,
             cfg_cq,
             shutdown_cq,
+            registry_cq,
         ));
         let backfill_worker = tokio::spawn(run_supervised_backfill_worker(
             pool_bf,
             chain_bf,
             cfg_bf,
             shutdown_bf,
+            registry_bf,
         ));
+
+        // Fourth supervised worker: the reconciler, ONLY when the alarm feature is
+        // configured (REQ-ALARM-001/002/010).
+        let reconciler_task = alarm.map(|components| {
+            let reconciler = Arc::new(Reconciler::new(
+                components.client,
+                components.registry,
+                pool_rc,
+                components.reconcile_interval,
+            ));
+            tokio::spawn(run_supervised_reconciler(reconciler, shutdown_rc))
+        });
 
         // Wait for shutdown signal, then wait for all workers.
         shutdown_rx.changed().await.ok();
 
         info!("supervisor: shutdown signal received; waiting for workers");
         let _ = tokio::join!(live_poller, queue_worker, backfill_worker);
+        if let Some(task) = reconciler_task {
+            let _ = task.await;
+        }
         info!("supervisor: all workers stopped");
     })
 }
@@ -165,6 +209,7 @@ async fn run_supervised_live_poller(
     chain: Arc<Vec<Arc<dyn Provider>>>,
     cfg: WorkerConfig,
     shutdown: watch::Receiver<bool>,
+    registry: Option<Arc<HealthRegistry>>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -175,6 +220,7 @@ async fn run_supervised_live_poller(
         let chain_inner = chain.clone();
         let shutdown_inner = shutdown.clone();
         let cfg_inner = cfg.clone();
+        let registry_inner = registry.clone();
 
         let result = tokio::spawn(async move {
             live_poller::run_live_poller(
@@ -184,6 +230,7 @@ async fn run_supervised_live_poller(
                 cfg_inner.live_poll_claim_ttl_secs,
                 cfg_inner.live_poller_tick,
                 shutdown_inner,
+                registry_inner,
             )
             .await
         })
@@ -214,6 +261,7 @@ async fn run_supervised_queue_worker(
     chain: Arc<Vec<Arc<dyn Provider>>>,
     cfg: WorkerConfig,
     shutdown: watch::Receiver<bool>,
+    registry: Option<Arc<HealthRegistry>>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -224,6 +272,7 @@ async fn run_supervised_queue_worker(
         let chain_inner = chain.clone();
         let shutdown_inner = shutdown.clone();
         let cfg_inner = cfg.clone();
+        let registry_inner = registry.clone();
 
         let result = tokio::spawn(async move {
             collection_queue::run_collection_queue_worker(
@@ -235,6 +284,7 @@ async fn run_supervised_queue_worker(
                 cfg_inner.collection_max_attempts,
                 cfg_inner.collection_idle_sleep,
                 shutdown_inner,
+                registry_inner,
             )
             .await
         })
@@ -265,6 +315,7 @@ async fn run_supervised_backfill_worker(
     chain: Arc<Vec<Arc<dyn Provider>>>,
     cfg: WorkerConfig,
     shutdown: watch::Receiver<bool>,
+    registry: Option<Arc<HealthRegistry>>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -275,6 +326,7 @@ async fn run_supervised_backfill_worker(
         let chain_inner = chain.clone();
         let shutdown_inner = shutdown.clone();
         let cfg_inner = cfg.clone();
+        let registry_inner = registry.clone();
 
         let result = tokio::spawn(async move {
             backfill::run_backfill_worker(
@@ -286,6 +338,7 @@ async fn run_supervised_backfill_worker(
                 cfg_inner.backfill_max_attempts,
                 cfg_inner.backfill_idle_sleep,
                 shutdown_inner,
+                registry_inner,
             )
             .await
         })
@@ -305,6 +358,36 @@ async fn run_supervised_backfill_worker(
                     break;
                 }
                 warn!("backfill_worker panicked: {join_err}; restarting in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+/// Supervised runner for the SPEC-ALARM-001 reconciler (REQ-ALARM-010): restarted on
+/// panic identically to the other three workers. `run_reconciler` itself only returns
+/// on a clean shutdown (`Ok(())`), so a panic is the only restart trigger here.
+async fn run_supervised_reconciler(reconciler: Arc<Reconciler>, shutdown: watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let reconciler_inner = reconciler.clone();
+        let shutdown_inner = shutdown.clone();
+
+        let result = tokio::spawn(async move {
+            run_reconciler(reconciler_inner, shutdown_inner).await;
+        })
+        .await;
+
+        match result {
+            Ok(()) => break, // clean shutdown (REQ-ALARM-018: no mass-clear, just stop)
+            Err(join_err) => {
+                if *shutdown.borrow() {
+                    break;
+                }
+                warn!("reconciler panicked: {join_err}; restarting in 5s");
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         }
@@ -369,7 +452,7 @@ mod tests {
         let chain: Arc<Vec<Arc<dyn Provider>>> = Arc::new(vec![]);
         let cfg = WorkerConfig::from_env();
 
-        let handle = spawn_workers(pool, chain, cfg, rx).await;
+        let handle = spawn_workers(pool, chain, cfg, rx, None).await;
 
         // Should resolve quickly since we sent shutdown=true before spawning.
         tokio::time::timeout(Duration::from_secs(5), handle)

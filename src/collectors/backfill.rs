@@ -507,8 +507,10 @@ async fn chain_fetch_ohlc_for_chunk(
     market: &MarketQuery,
     days: u32,
     interval_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<Vec<OhlcCandle>, ProviderError> {
-    let (result, _) = crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs).await;
+    let (result, _) =
+        crate::providers::chain_fetch_ohlc(chain, market, days, interval_secs, registry).await;
     result
 }
 
@@ -522,9 +524,17 @@ async fn chain_fetch_ohlc_range_for_chunk(
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     interval_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<Vec<OhlcCandle>, ProviderError> {
-    let (result, _) =
-        crate::providers::chain_fetch_ohlc_range(chain, market, start, end, interval_secs).await;
+    let (result, _) = crate::providers::chain_fetch_ohlc_range(
+        chain,
+        market,
+        start,
+        end,
+        interval_secs,
+        registry,
+    )
+    .await;
     result
 }
 
@@ -557,6 +567,7 @@ async fn process_chunk(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     chunk: &ClaimedChunk,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<(Option<DateTime<Utc>>, i64), String> {
     // Look up coin's trading symbol and per-coin poll interval from tracked_coins.
     let row: Option<(String, Option<String>)> = sqlx::query_as(
@@ -615,12 +626,19 @@ async fn process_chunk(
     let candles = if use_range_path {
         let range_start = start.expect("checked by use_range_path");
         let range_end = chunk.range_end.expect("checked by use_range_path");
-        chain_fetch_ohlc_range_for_chunk(chain, &mq, range_start, range_end, interval_secs)
-            .await
-            .map_err(|e| e.to_string())?
+        chain_fetch_ohlc_range_for_chunk(
+            chain,
+            &mq,
+            range_start,
+            range_end,
+            interval_secs,
+            registry,
+        )
+        .await
+        .map_err(|e| e.to_string())?
     } else {
         let days = range_to_days(start, chunk.range_end, 90); // fallback: recent-window path
-        chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs)
+        chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs, registry)
             .await
             .map_err(|e| e.to_string())?
     };
@@ -675,6 +693,7 @@ pub async fn run_backfill_worker(
     max_attempts: i32,
     idle_sleep: StdDuration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
     info!("backfill_worker: started (replica={claimed_by})");
 
@@ -725,7 +744,7 @@ pub async fn run_backfill_worker(
             }
         });
 
-        let result = process_chunk(&pool, &chain, &chunk).await;
+        let result = process_chunk(&pool, &chain, &chunk, registry.as_deref()).await;
         hb_handle.abort();
 
         match result {

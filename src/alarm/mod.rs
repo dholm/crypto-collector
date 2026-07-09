@@ -1,13 +1,19 @@
 //! Alarm Center integration (SPEC-ALARM-001).
 //!
-//! This module contains the pieces implemented in Batch 1: the pure fingerprint/mapping
-//! catalogue ([`catalog`]) and the [`AlarmClient`] HTTP contract. The reconciler,
-//! `HealthRegistry`, and `main`/`collectors` wiring are out of scope for this batch
-//! (Batches 2–3).
+//! Batch 1 contributed the pure fingerprint/mapping catalogue ([`catalog`]) and the
+//! [`AlarmClient`] HTTP contract. Batch 2 (this batch) adds the [`registry`]
+//! (`HealthRegistry`) and [`reconciler`] (the near-stateless sweep loop) plus the
+//! `collectors`/`main` wiring that spawns it as a fourth supervised worker, and wires
+//! the Tier 1 conditions (provider-unreachable, all-providers-down, provider
+//! rate-limited/cooldown, provider-credit-exhausted). Tier 2/3 conditions and the
+//! fatal startup-config raise remain Batch 3 scope.
 
 pub mod catalog;
+pub mod reconciler;
+pub mod registry;
 
 pub use catalog::{AlarmSpec, Condition, Severity};
+pub use registry::HealthRegistry;
 
 use serde::Serialize;
 use std::collections::BTreeMap;

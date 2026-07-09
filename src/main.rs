@@ -286,6 +286,22 @@ async fn main() -> Result<()> {
         }
     }
 
+    // ── Step 8d: Alarm Center integration (SPEC-ALARM-001) ────────────────────
+    // Full no-op when `ALARM_CENTER_URL` is unset (REQ-ALARM-001/002): no client, no
+    // registry, no reconciler — identical behaviour to a build without this feature.
+    let alarm_components = crypto_collector::alarm::AlarmClient::from_config().map(|client| {
+        crypto_collector::collectors::AlarmComponents {
+            client: Arc::new(client),
+            registry: Arc::new(crypto_collector::alarm::HealthRegistry::new()),
+            reconcile_interval: Duration::from_secs(
+                crypto_collector::config::alarm_reconcile_interval_secs(),
+            ),
+        }
+    });
+    if alarm_components.is_some() {
+        info!("crypto-collector: alarm center integration enabled");
+    }
+
     // ── Step 9: Spawn workers (SPEC-SCHED-001) + gauge-refresh task ───────────
     let worker_cfg = crypto_collector::collectors::WorkerConfig::from_env();
     let supervisor = crypto_collector::collectors::spawn_workers(
@@ -293,6 +309,7 @@ async fn main() -> Result<()> {
         chain.clone(),
         worker_cfg,
         shutdown_rx.clone(),
+        alarm_components,
     )
     .await;
     info!("crypto-collector: workers started");

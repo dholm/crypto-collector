@@ -389,11 +389,19 @@ pub fn build_chain(
 ///
 /// `interval_secs` is the desired candle granularity; each provider snaps it to the
 /// nearest supported interval (see `Provider::fetch_ohlc`).
+///
+/// `registry`, when present, is poked cheaply (O(1), no I/O) at each attempt so the
+/// SPEC-ALARM-001 reconciler can derive `provider-unreachable`/`all-providers-down`
+/// desired state: a provider success resets its failure streak, a
+/// `ProviderError::Network` bumps it (REQ-ALARM-020), and the chain outcome (all
+/// attempted providers failed vs. any success) updates the chain-down flag
+/// (REQ-ALARM-022). `None` (the feature-gate default) makes this a pure no-op.
 pub async fn chain_fetch_ohlc(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     days: u32,
     interval_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
     let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
@@ -410,14 +418,25 @@ pub async fn chain_fetch_ohlc(
 
         match provider.fetch_ohlc(market, days, interval_secs).await {
             Ok(candles) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(provider.name());
+                }
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
                     capability: Capability::Ohlc,
                     outcome: ProviderOutcome::Success,
                 });
+                if let Some(reg) = registry {
+                    reg.observe_chain_records(&records);
+                }
                 return (Ok(candles), records);
             }
             Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(provider.name());
+                    }
+                }
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
                     capability: Capability::Ohlc,
@@ -428,6 +447,9 @@ pub async fn chain_fetch_ohlc(
         }
     }
 
+    if let Some(reg) = registry {
+        reg.observe_chain_records(&records);
+    }
     (Err(last_err), records)
 }
 
@@ -464,12 +486,16 @@ pub async fn chain_fetch_ohlc(
 //             NOT short-circuit as in the live path. Error-surfacing invariant: ANY provider
 //             error yields Err (retry) — never masked by an earlier Ok(empty) (REQ-PROV-003/004).
 // @MX:SPEC: SPEC-PROV-001 SPEC-SCHED-001
+///
+/// `registry` follows the same optional, no-op-when-`None` contract as
+/// [`chain_fetch_ohlc`] (REQ-ALARM-020/022).
 pub async fn chain_fetch_ohlc_range(
     chain: &[Arc<dyn Provider>],
     market: &MarketQuery,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
     interval_secs: i64,
+    registry: Option<&crate::alarm::HealthRegistry>,
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
     let mut last_err: Option<ProviderError> = None;
@@ -489,17 +515,28 @@ pub async fn chain_fetch_ohlc_range(
             .await
         {
             Ok(candles) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(provider.name());
+                }
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
                     capability: Capability::OhlcRange,
                     outcome: ProviderOutcome::Success,
                 });
                 if !candles.is_empty() {
+                    if let Some(reg) = registry {
+                        reg.observe_chain_records(&records);
+                    }
                     return (Ok(candles), records);
                 }
                 // Empty: this provider has no data for the window — try the next.
             }
             Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(provider.name());
+                    }
+                }
                 records.push(AttemptRecord {
                     provider: provider.name().to_string(),
                     capability: Capability::OhlcRange,
@@ -508,6 +545,10 @@ pub async fn chain_fetch_ohlc_range(
                 last_err = Some(e);
             }
         }
+    }
+
+    if let Some(reg) = registry {
+        reg.observe_chain_records(&records);
     }
 
     // Any error along the way must surface (retry) rather than be masked as "no data".
@@ -759,7 +800,7 @@ mod tests {
 
         let market = stub_market();
         // Use the global default interval (60 s) for stub tests.
-        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
 
         // Result: secondary's candles
         let candles = result.expect("should return secondary's candles");
@@ -780,7 +821,7 @@ mod tests {
         let chain: Vec<Arc<dyn Provider>> =
             vec![Arc::new(AlwaysFailProvider), Arc::new(AlwaysFailProvider)];
         let market = stub_market();
-        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
 
         assert!(result.is_err(), "must return error when all providers fail");
         assert_eq!(records.len(), 2);
@@ -847,7 +888,7 @@ mod tests {
 
         let chain: Vec<Arc<dyn Provider>> = vec![Arc::new(UnsupportedProvider)];
         let market = stub_market();
-        let (_result, records) = chain_fetch_ohlc(&chain, &market, 7, 60).await;
+        let (_result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
@@ -991,7 +1032,8 @@ mod tests {
         let market = stub_market();
         let start = Utc::now() - chrono::Duration::days(30);
         let end = Utc::now();
-        let (result, records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        let (result, records) =
+            chain_fetch_ohlc_range(&chain, &market, start, end, 86_400, None).await;
 
         let candles = result.expect("should fall through to range-capable provider");
         assert_eq!(candles.len(), 1);
@@ -1096,7 +1138,8 @@ mod tests {
         let market = stub_market();
         let start = Utc::now() - chrono::Duration::days(3000);
         let end = start + chrono::Duration::days(30);
-        let (result, records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        let (result, records) =
+            chain_fetch_ohlc_range(&chain, &market, start, end, 86_400, None).await;
 
         let candles = result.expect("empty binance must fall through to the data source");
         assert_eq!(candles.len(), 1, "must return the second provider's candle");
@@ -1120,7 +1163,8 @@ mod tests {
         let market = stub_market();
         let start = Utc::now() - chrono::Duration::days(6000);
         let end = start + chrono::Duration::days(30);
-        let (result, _records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        let (result, _records) =
+            chain_fetch_ohlc_range(&chain, &market, start, end, 86_400, None).await;
         // No provider had data for the window → Ok(empty), so the worker's
         // empty-page-forward-skip advances the cursor rather than failing the chunk.
         assert!(
@@ -1149,7 +1193,8 @@ mod tests {
         let market = stub_market();
         let start = Utc::now() - chrono::Duration::days(4000);
         let end = start + chrono::Duration::days(30);
-        let (result, _records) = chain_fetch_ohlc_range(&chain, &market, start, end, 86_400).await;
+        let (result, _records) =
+            chain_fetch_ohlc_range(&chain, &market, start, end, 86_400, None).await;
         assert!(
             result.is_err(),
             "a provider error after an earlier Ok(empty) must surface as Err, not Ok(empty)"
