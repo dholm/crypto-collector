@@ -115,6 +115,12 @@ crypto-collector/
 - **`backfill.rs`**: Spawned background task; fills gaps in historical candle data. Queries the gaps table, requests missing intervals from providers, and backfills the quotes table.
 - **`rollup.rs`**: Network-free materializer that computes and maintains native 1d/1w OHLCV rollups from finer candles; driven by the `collection_queue` `kind='rollup'` dispatch, with chunked full-history backfill and forward-only incremental maintenance via window-reconcile.
 
+**`alarm/`** (SPEC-ALARM-001)
+- **`mod.rs`**: AlarmClient shared wrapper around reqwest::Client for raising/clearing alarms with the external Alarm Center. Implements raise-with-TTL and optional fast-clear, with per-request timeout and bounded retries; swallow-error contract.
+- **`catalog.rs`**: Condition catalogue (14 fingerprint mappings) encapsulating `Condition`, `Severity`, and `AlarmSpec` with pure fingerprint/severity/code derivation.
+- **`registry.rs`**: Cheap in-memory HealthRegistry tracking per-provider reachability, chain-outcome flags, worker restart events, and DB upsert-failure streaks; updated at error sites, read by the reconciler.
+- **`reconciler.rs`**: Periodic reconciler worker (spawned as a 4th collector) that sweeps the active-alarm set every `ALARM_RECONCILE_INTERVAL_SECS`, raises/heartbeats every active condition with `timeoutSeconds = ALARM_TTL_SECS`, and stops refreshing recovered conditions so the Alarm Center auto-clears them via TTL.
+
 **`api/v1/`**
 - **`quotes.rs`**: `GET /api/v1/quotes` (list recent snapshots), `GET /api/v1/quotes/:pair` (latest quote for a pair).
 - **`candles.rs`**: `GET /api/v1/candles/:pair?interval=1h&cursor=<cursor>&limit=100` (paginated historical OHLCV).

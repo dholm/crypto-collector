@@ -42,6 +42,13 @@ Enable real-time and historical cryptocurrency market data consumption across th
 - **Bitcoin halving-cycle overlay**: Materialised daily price points normalized against Bitcoin halving cycles. Each point stores the raw daily price and two normalization baselines — one anchored to the halving day (halving day = 1.0) and one anchored to the cycle low (cycle low = 1.0). Both series are plotted against `days_since_halving` to reproduce the shape of Bitbo's "Cycle Repeat" chart entirely from local persisted candles, with no external data source or scraping.
 - Recomputed on the periodic collector tick from the persisted `1d` (daily) OHLCV history in `coin_candles`. Keyset-paginated read route at `GET /v1/coins/{coin_id}/cycle-overlay` with optional `?cycle=N` and `?vs_currency` filters. Known halving dates treated as block-derived constants; future halvings extend the model via code updates.
 
+### 5. Operational Alarms
+- **Alarm Center integration** (SPEC-ALARM-001): Raises and auto-clears alarms to an external Alarm Center for abnormal operational conditions — provider outages, rate-limiting, database unreachability/pool saturation, collection-queue/backfill failures, worker crash-loops, coin staleness, and upsert-failure streaks.
+- Periodic reconciler worker maintains desired-state sweep with server-side TTL auto-clear; every active condition is re-raised with `timeoutSeconds = ALARM_TTL_SECS`, and recovered conditions simply stop being refreshed so the Alarm Center auto-expires them once the TTL lapses.
+- Best-effort delivery with bounded retry; alarm center outages do not degrade collector performance.
+- Feature gated on `ALARM_CENTER_URL` (unset = fully disabled, no requests to alarm center).
+- Operator-facing documentation at `docs/alarms.md` enumerates all 14 alarm types with fingerprint, severity, component, active-signal, clear trigger, thresholds, and remediation guidance.
+
 ## Out of Scope (Explicit Non-Goals)
 
 The following are explicitly **not** in scope and are reserved for future work or external systems:

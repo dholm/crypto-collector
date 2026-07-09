@@ -19,8 +19,8 @@ Crypto Collector is built on a proven async Rust stack inherited and adapted fro
 
 **HTTP Client: reqwest**
 - Async HTTP client with connection pooling.
-- Used for all external provider API calls (CoinGecko, CoinMarketCap, Binance, etc.).
-- Rationale: Standard choice for async HTTP in Rust; integrates seamlessly with Tokio.
+- Used for all external provider API calls (CoinGecko, CoinMarketCap, Binance, etc.) and Alarm Center integration (SPEC-ALARM-001).
+- Rationale: Standard choice for async HTTP in Rust; integrates seamlessly with Tokio; single shared client reused across provider and alarm-center requests.
 
 ## Data Serialization and Types
 
@@ -113,6 +113,16 @@ Crypto Collector is built on a proven async Rust stack inherited and adapted fro
 - Background worker job duration and work-queue claim rates.
 - Database connection pool stats.
 - Rationale: Enable visibility into performance bottlenecks and provider reliability.
+
+### Operational Alarms
+
+**Alarm Center Integration: external Alarm Center microservice (SPEC-ALARM-001)**
+- Raises/clears alarms for operational conditions (provider outages, rate-limiting, DB failures, worker crash-loops, coin staleness, DB pool saturation, upsert failures).
+- Reconciler worker runs a periodic desired-state sweep every `ALARM_RECONCILE_INTERVAL_SECS`, re-raising active conditions with server-side TTL auto-clear (`timeoutSeconds = ALARM_TTL_SECS`) and stopping refresh on recovered conditions.
+- Reuses existing `reqwest` stack for HTTP calls; single `AlarmClient` shared across all alarm operations.
+- Best-effort delivery with bounded retry; swallow-error contract ensures alarm delivery never blocks or degrades a collector.
+- Feature gated on `ALARM_CENTER_URL` (unset = no-op, no requests to alarm center).
+- Rationale: Centralizes alarm lifecycle (raise → heartbeat → auto-clear) in a periodic worker; avoids "raised but never cleared" via server-side TTL; enables Alarm Center to be the authoritative alarm state store across multi-replica deployments.
 
 ## Concurrency and Coordination
 

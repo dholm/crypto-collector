@@ -1,9 +1,9 @@
 ---
 id: ALARM-001
 version: 1.3.0
-status: planned
+status: completed
 created: 2026-07-08
-updated: 2026-07-08
+updated: 2026-07-09
 author: dholm
 priority: high
 issue_number: null
@@ -587,3 +587,22 @@ failures stop landing. Condition 8b (`backfill-stalled`) is already level-based
   volume is acceptable or whether a single-writer refinement is wanted later purely for load.
 - **OR-ALARM-6:** exact auth header name/format for `ALARM_CENTER_API_KEY` (the OpenAPI
   does not mandate a scheme). Confirm at run.
+
+---
+
+## Implementation Notes
+
+**Status:** Completed 2026-07-09
+
+**Commits:** `90c2b9f..c66c734`
+
+**Summary:**
+- Implementation matched the plan with zero scope divergence.
+- New module `src/alarm/` with four submodules: `mod.rs` (AlarmClient), `catalog.rs` (condition catalogue), `registry.rs` (health registry), `reconciler.rs` (periodic sweep worker).
+- Wiring: reconciler spawned as 4th supervised worker in `spawn_workers` (gated on `ALARM_CENTER_URL`); registry poke sites in `src/providers/mod.rs`, `src/collectors/{live_poller,collection_queue,backfill}.rs`, and upsert error paths; fatal startup-config raise in `src/main.rs`; `src/db/{pool.rs,mod.rs}` expose `max_connections()` for pool-saturation detection.
+- Operator catalogue at `docs/alarms.md` with all 14 fingerprints and remediation guidance.
+- Helm chart config: `charts/crypto-collector/values.yaml` alarm section, gated configmap block, deployment secret injection.
+- New env vars: `ALARM_CENTER_URL`, `ALARM_CENTER_API_KEY`, `ALARM_CENTER_TIMEOUT_MS`, `ALARM_CENTER_MAX_RETRIES`, `ALARM_RECONCILE_INTERVAL_SECS`, `ALARM_TTL_SECS`, `ALARM_QUEUE_FAILED_WINDOW_SECS`, `ALARM_BACKFILL_FAILED_WINDOW_SECS`, plus 12 per-condition threshold vars (all in `src/config.rs` with free-function pattern).
+- No new runtime dependencies: `reqwest` already present; `wiremock` already a dev-dependency (alarm client contract tests).
+- Test coverage: 550 lib tests passing + ~40 alarm-specific unit/integration tests + docs-parity test; DB-integration tests marked `#[ignore]`.
+- Feature is a complete no-op until `ALARM_CENTER_URL` is set.

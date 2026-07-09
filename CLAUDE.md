@@ -22,6 +22,7 @@ api (axum 0.8, /v1 REST routes) + health (8081) + metrics (9000)
 |--------|------|---------|
 | providers | `src/providers/` | `Provider` trait + CoinGecko/Binance/Coinbase/Kraken impls + `build_chain` |
 | collectors | `src/collectors/` | `live_poller`, `collection_queue`, `backfill` workers |
+| alarm | `src/alarm/` | Alarm Center integration: AlarmClient + periodic reconciler + health registry (SPEC-ALARM-001) |
 | db | `src/db/` | `PgPool`, migration runner, upsert helpers |
 | api | `src/api/` | axum REST API (/v1 router, DTOs, cursor pagination) |
 | health | `src/health/` | `/healthz/live` + `/healthz/ready` |
@@ -57,6 +58,7 @@ api (axum 0.8, /v1 REST routes) + health (8081) + metrics (9000)
 | SPEC-API-001 | REST API server, /v1 router, OpenAPI v3.1 |
 | SPEC-OBS-001 | Observability: health, Prometheus, OTel, graceful shutdown |
 | SPEC-CYCLE-001 | Derived analytics: Bitcoin halving-cycle overlay |
+| SPEC-ALARM-001 | Alarm Center integration (operational alarms) |
 
 ### Build & Test Commands
 
