@@ -67,7 +67,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 # ws: WebSocket upgrade support for /v1/coins/stream/* (SPEC-API-002 T-006).
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 # Base64url encoding for opaque keyset cursors (REQ-API-070).
 base64 = "0.22"
 
@@ -77,4 +77,4 @@ uuid = { version = "1", features = ["v4"] }
 # HTTP mock server for provider tests (tokio-native, no real network required).
 wiremock = "0.6"
 # In-process axum router testing (SPEC-API-001 handler tests).
-axum-test = "20"
+axum-test = "21"
