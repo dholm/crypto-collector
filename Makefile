@@ -45,6 +45,11 @@ fmt: ## Format source code
 fmt-check: ## Check formatting (CI)
 	cargo fmt --all -- --check
 
+upgrade: ## Upgrade crates
+	cargo upgrade --incompatible
+	cargo update
+	$(MAKE) check lint test
+
 # ── Unit tests ───────────────────────────────────────────────────────────────
 
 test: ## Run unit tests
