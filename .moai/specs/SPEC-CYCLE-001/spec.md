@@ -1,9 +1,9 @@
 ---
 id: SPEC-CYCLE-001
-version: 0.1.0
+version: 0.5.0
 status: completed
 created: 2026-07-04
-updated: 2026-07-04
+updated: 2026-07-13
 author: dholm
 priority: medium
 issue_number: 0
@@ -32,6 +32,27 @@ recomputation is [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (collection-queue w
 
 ## HISTORY
 
+- 2026-07-13 (v0.5.0): Added an optional **point-in-time (`as_of`) read capability** to both
+  cycle read endpoints — `GET /v1/coins/{coin_id}/cycle-overlay` and
+  `GET /v1/coins/{coin_id}/cycle-projection` (REQ-CYCLE-070..084). When a client supplies
+  `?as_of=<RFC3339 timestamp>` (`Option<DateTime<Utc>>`, matching the `/coins/{coin_id}/metadata`
+  convention — `src/api/metadata.rs`), the endpoint returns the overlay/projection **as it would
+  have been produced at instant `as_of`**: the source daily-close series is truncated to candles
+  with `ts <= as_of`, then the existing pure functions are re-run per request — `compute_overlay`
+  + `project_cycle_repeat` for `cycle-overlay`, `compute_overlay` + `project_composite` for
+  `cycle-projection` — and the existing pagination / `cycle` filter / `vs_currency` default are
+  applied over the in-memory result. This is the "as-of view only" half of a **two-call
+  comparison model**: a client fetches once WITH `as_of=T` (the historical prediction) and once
+  WITHOUT (the actuals up to now) and overlays them to see how well the past prediction matched
+  reality. Computed on the fly — **no schema change, no cache, no stored snapshot**; deterministic
+  for a given `(coin_id, vs_currency, as_of)`. When `as_of` is **absent**, behaviour is
+  byte-for-byte unchanged (still served from the precomputed `cycle_overlay_points` table). All
+  REQ-CYCLE-050..064 contracts (keyset pagination, empty-page-not-404, `Decimal`-only, composite
+  BTC/USD calibration anchors, insufficient-history → zero projected points) are preserved under
+  `as_of`. The OOM-safe SQL-side daily aggregation (`DISTINCT ON`, one row per day — never
+  materialise the full finer series in the 256Mi pod) is carried into the request-time loader with
+  an added `ts <= as_of` predicate. These two endpoints consult **only daily candle closes** — not
+  quotes — so `as_of` filters candle `ts` alone. No REQ-CYCLE-001..064 requirement is superseded.
 - 2026-07-07 (v0.4.0): Replaced the v0.3.0 cycle-repeat replay with a **composite projection
   model** (`src/collectors/cycle_projection.rs`; research + validation in
   `docs/prediction-research.md`): power-law spine (log-log OLS over the full daily history,
@@ -204,6 +225,29 @@ current cycle — this is expected (REQ-CYCLE-034), not a regression.
 the raw daily price. Pagination, limit validation, `DecimalString` serialisation, and the error
 model are exactly those of SPEC-API-001; the endpoint is added to the published OpenAPI document.
 
+### Point-in-time (`as_of`) reads (v0.5.0)
+
+Both read endpoints — `.../cycle-overlay` (replay model) and `.../cycle-projection` (composite
+model), which today share `list_overlay_for_model(...)` and read the precomputed
+`cycle_overlay_points` table — accept an **optional** `as_of` query parameter (RFC3339 date-time,
+`Option<DateTime<Utc>>`), the same shape already used by `/coins/{coin_id}/metadata`
+(`src/api/metadata.rs`). Its purpose is a **two-call comparison**: the client fetches once WITH
+`as_of=T` to obtain the historical prediction the service *would* have produced at time `T`, and
+once WITHOUT `as_of` to obtain the actuals up to now, then overlays them on a chart.
+
+The precomputed table only ever holds the projection computed from the **current** latest data, so
+an arbitrary past cutoff cannot be served from it. When `as_of` is present the endpoint therefore
+**re-runs the existing pure functions per request** over the daily-close series truncated to
+`ts <= as_of` (day 0 = the halving date is unchanged; `today` becomes the latest candle at or
+before `as_of`), then applies the same in-memory pagination / `cycle` filter / `vs_currency`
+default as the table-backed path. "As-of view only" means the response shows **just the world at
+`T`** — real points truncated to `<= T` plus the projection anchored at `T` — never real points
+after `T`; the actuals for the comparison come from the client's separate no-`as_of` call. When
+`as_of` is absent the behaviour is identical to before this amendment (the precomputed-table read
+path is untouched). Nothing is persisted or cached: the as-of result is a deterministic function of
+`(coin_id, vs_currency, as_of)` and the stored candles. These two endpoints consume **only daily
+candle closes** — spot quotes never factor in — so the `as_of` cutoff applies to candle `ts` only.
+
 ---
 
 ## Requirements (EARS)
@@ -365,6 +409,75 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   any change to its constants shall be re-validated against the walk-forward backtest
   (`tests/backtest_projection.rs`).
 
+### Point-in-time (`as_of`) reads on both cycle endpoints (v0.5.0)
+
+- **REQ-CYCLE-070** (Optional): Where a client supplies an optional `as_of` query parameter — an
+  RFC3339 date-time deserialised as `Option<DateTime<Utc>>`, matching the
+  `GET /v1/coins/{coin_id}/metadata` convention (SPEC-API-001 REQ-API-050) — on either
+  `GET /v1/coins/{coin_id}/cycle-overlay` or `GET /v1/coins/{coin_id}/cycle-projection`, the system
+  shall return the overlay/projection computed **as if no candle data existed after the instant
+  `as_of`**, i.e. exactly as that endpoint would have produced it at time `as_of`.
+- **REQ-CYCLE-071** (Event-Driven): When `as_of` is present, the system shall build the source
+  daily-close series from **only** those candles whose `ts <= as_of` before computing, so that no
+  candle recorded after `as_of` can influence the per-point `price`, the halving-day anchor, the
+  cycle low, or any projected point.
+- **REQ-CYCLE-072** (Event-Driven): When `as_of` is present, the system shall compute the response
+  **per request** from the truncated daily series by reusing the existing pure functions —
+  `compute_overlay` plus `project_cycle_repeat` for `cycle-overlay`, and `compute_overlay` plus
+  `project_composite` for `cycle-projection` — and shall NOT read the precomputed
+  `cycle_overlay_points` table, NOT write any table, NOT create or read any cache or stored
+  snapshot, and NOT require any schema change; the computation shall be deterministic for a given
+  `(coin_id, vs_currency, as_of)`.
+- **REQ-CYCLE-073** (State-Driven): While `as_of` is present, the response shall contain only the
+  world as it looked at `as_of` — the real (observed) points whose `ts <= as_of`, plus the
+  projection anchored at the latest candle at or before `as_of` (projecting forward from that
+  candle) — and shall NOT include any real point dated after `as_of`. The actuals for the two-call
+  comparison come from the client's separate request issued without `as_of`.
+- **REQ-CYCLE-074** (Ubiquitous): When `as_of` is absent, the system shall serve the request from
+  the precomputed `cycle_overlay_points` table exactly as before this amendment (the
+  REQ-CYCLE-050..064 read path is unchanged), preserving full backward compatibility.
+- **REQ-CYCLE-075** (If): If `as_of` is at or after the latest stored candle for
+  `(coin_id, vs_currency)`, then the system shall anchor the projection at that latest candle and
+  return a result equal to the current (no-`as_of`) computation; this at-or-after-latest / future
+  case shall be graceful and never an error (mirrors the empty-page-not-404 tolerance of
+  REQ-CYCLE-052).
+- **REQ-CYCLE-076** (Unwanted): If `as_of` precedes the earliest stored candle for
+  `(coin_id, vs_currency)` (no candle satisfies `ts <= as_of`), then the system shall respond
+  HTTP 200 with an empty page (`{"items": [], "next_cursor": null}`), not 404 and not an error.
+- **REQ-CYCLE-077** (Unwanted): If, at the `as_of` cutoff, fewer than `CYCLE_DAYS` (= 1458) days of
+  daily history are available at or before `as_of`, then the system shall return the real
+  (observed) points only with an **empty projection set**, reusing the existing insufficient-history
+  semantics (REQ-CYCLE-062), and shall not treat this as an error.
+- **REQ-CYCLE-078** (Ubiquitous): Under `as_of`, the system shall apply — over the in-memory
+  computed points — the same read semantics as the non-`as_of` path: keyset pagination ordered
+  `(cycle_number ASC, days_since_halving ASC)` with the opaque `(cycle_number, days_since_halving)`
+  cursor (REQ-CYCLE-050/051), the optional `cycle` filter, the `vs_currency` default of `usd`, and
+  the empty-page-not-404 behaviour for unknown/non-target coins (REQ-CYCLE-052).
+- **REQ-CYCLE-079** (Unwanted): If `as_of` is supplied but is not a valid RFC3339 date-time, then
+  the system shall respond HTTP 400 without computing or querying (query-parameter deserialisation
+  failure), consistent with the bad-cursor/limit handling of REQ-CYCLE-053.
+- **REQ-CYCLE-080** (State-Driven): While the `as_of` daily series is derived from a finer stored
+  interval (no native `1d` rows), the system shall keep the OOM-safe SQL-side aggregation — one row
+  per UTC day via `DISTINCT ON`, as in `aggregate_daily_from_finer` — and add a `ts <= as_of`
+  predicate to that aggregation query, and shall never materialise the full finer-interval candle
+  history in the application (the 256Mi-pod OOM invariant, REQ-CYCLE-041 / OR-CYCLE-4 carried
+  forward).
+- **REQ-CYCLE-081** (Ubiquitous): The system shall compute and serialise every as-of `price`,
+  `norm_halving`, `norm_cycle_low`, and (composite) `price_low`/`price_high` as
+  `rust_decimal::Decimal` (`DecimalString` on the wire), with no `f64` round-trip at any stage
+  (REQ-PROV-012 / REQ-CYCLE-024).
+- **REQ-CYCLE-082** (State-Driven): While computing the composite (`cycle-projection`) result under
+  `as_of`, the system shall preserve the `use_btc_anchors = (coin_id == "bitcoin" && vs_currency ==
+  "usd")` rule, so the compiled-in BTC/USD calibration anchors are applied for that exact pair and
+  no other (REQ-CYCLE-064).
+- **REQ-CYCLE-083** (Ubiquitous): The system shall derive both cycle endpoints solely from daily
+  candle closes and shall not consult spot quotes for either endpoint, with or without `as_of`;
+  the `as_of` cutoff therefore applies to candle `ts` only.
+- **REQ-CYCLE-084** (Optional): Where the OpenAPI document `api/crypto-collector.yaml` is published
+  (REQ-CYCLE-054), the system shall add the optional `as_of` query parameter (`type: string`,
+  `format: date-time`) to both the `listCycleOverlay` and `listCycleProjection` operations and keep
+  it in parity via the doc-parity test.
+
 ## Exclusions (What NOT to Build)
 
 - **No Bitbo scraping / no Turnstile bypass** — the "Cycle Repeat" data is derived locally from
@@ -389,6 +502,16 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   new DTO are added; the existing candle/quote/market reads and their cursors are unchanged.
 - **No secrets or config files** — coin, currency, and cadence come from environment variables only
   (REQ-CYCLE-043).
+- **No stored/cached as-of snapshots and no as-of schema change** — `as_of` results are computed on
+  the fly per request from the daily series truncated to `ts <= as_of`; nothing is persisted, the
+  `cycle_overlay_points` table is neither read nor written for an as-of request, and no new column,
+  table, or cache is added (REQ-CYCLE-072).
+- **No blended as-of view** — an `as_of` response shows only the world at `as_of` (real points
+  `<= as_of` plus the projection anchored at `as_of`); it does not splice in later actuals or emit
+  real points after `as_of`. The historical-vs-actual overlay is a client-side, two-call concern
+  (REQ-CYCLE-073).
+- **No quotes in the cycle endpoints** — even though the collector stores spot quotes, these two
+  endpoints ignore them entirely; `as_of` filters candle `ts` only (REQ-CYCLE-083).
 
 ## @MX Annotation Targets (high fan_in)
 
@@ -404,6 +527,11 @@ model are exactly those of SPEC-API-001; the endpoint is added to the published 
   that in-progress-cycle points are provisional and may change between ticks (REQ-CYCLE-041/034).
 - The new `(cycle_number, days_since_halving)` keyset key encode/decode — `@MX:ANCHOR` (the
   route's pagination contract; reuses the SPEC-API-001 opaque-cursor helpers, REQ-CYCLE-051).
+- The request-time as-of daily-series loader (native `1d` with `ts <= as_of`, falling back to the
+  `DISTINCT ON` finer-interval aggregation with `ts <= as_of`) — `@MX:WARN`/`@MX:REASON`: it MUST
+  keep the SQL-side one-row-per-day aggregation and MUST NOT `fetch_all` the finer series (deep
+  backfill OOM-kills the 256Mi pod); the `ts <= as_of` predicate is the point-in-time truncation
+  that every as-of point depends on (REQ-CYCLE-071/080).
 
 ## Open Items (do not guess)
 

@@ -408,11 +408,45 @@ mod tests {
             "streamCoinQuotes",
             "streamCoinCandles",
             "listCycleOverlay",
+            "listCycleProjection",
         ];
         for op_id in &operation_ids {
             assert!(
                 yaml.contains(op_id),
                 "OpenAPI spec must contain operationId '{op_id}'"
+            );
+        }
+    }
+
+    // REQ-CYCLE-084 (SPEC-CYCLE-001 v0.5.0): the optional `as_of` query parameter must be
+    // documented on both cycle-overlay read operations.
+    #[test]
+    fn openapi_yaml_documents_as_of_on_both_cycle_endpoints() {
+        let yaml = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("api/crypto-collector.yaml"),
+        )
+        .expect("api/crypto-collector.yaml must exist");
+
+        let overlay_start = yaml
+            .find("/coins/{coin_id}/cycle-overlay:")
+            .expect("cycle-overlay path must exist");
+        let projection_start = yaml
+            .find("/coins/{coin_id}/cycle-projection:")
+            .expect("cycle-projection path must exist");
+        let components_start = yaml
+            .find("\ncomponents:")
+            .expect("components section must exist");
+
+        let overlay_block = &yaml[overlay_start..projection_start];
+        let projection_block = &yaml[projection_start..components_start];
+
+        for (name, block) in [
+            ("listCycleOverlay", overlay_block),
+            ("listCycleProjection", projection_block),
+        ] {
+            assert!(
+                block.contains("cycle_as_of") || block.contains("as_of"),
+                "{name} operation must document the optional as_of query parameter"
             );
         }
     }

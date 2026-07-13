@@ -470,6 +470,7 @@ paths:
           description: Optional filter to a single cycle ordinal (1 = 2012-11-28 halving, etc.).
         - $ref: '#/components/parameters/cursor'
         - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cycle_as_of'
       responses:
         '200':
           description: Paginated halving-cycle overlay points (replay projection)
@@ -513,6 +514,7 @@ paths:
           description: Optional filter to a single cycle ordinal (1 = 2012-11-28 halving, etc.).
         - $ref: '#/components/parameters/cursor'
         - $ref: '#/components/parameters/limit'
+        - $ref: '#/components/parameters/cycle_as_of'
       responses:
         '200':
           description: Paginated halving-cycle overlay points (composite projection)
@@ -539,6 +541,19 @@ components:
       schema:
         type: string
       description: Opaque keyset cursor from `next_cursor` of a previous page
+
+    cycle_as_of:
+      name: as_of
+      in: query
+      schema:
+        type: string
+        format: date-time
+      description: >
+        Optional point-in-time cutoff (RFC3339; SPEC-CYCLE-001 v0.5.0). When present, the
+        response is computed on the fly from candle history truncated to `ts <= as_of` instead
+        of the precomputed table, reproducing exactly what this endpoint would have returned
+        at that instant. Intended for a two-call comparison: fetch once WITH `as_of` for the
+        historical prediction and once WITHOUT for the actuals, then overlay both client-side.
 
     limit:
       name: limit

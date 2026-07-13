@@ -1,7 +1,7 @@
 ---
 id: SPEC-CYCLE-001
 type: plan
-updated: 2026-07-04
+updated: 2026-07-13
 ---
 
 # SPEC-CYCLE-001 — Implementation Plan
@@ -85,6 +85,55 @@ Quality gate after each phase: `cargo fmt --check`, `cargo clippy --all-targets 
 - Full `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo test`; DB-backed overlay scenarios opt-in via `DATABASE_URL=... cargo test -- --ignored`.
 
+### Phase 7 — Point-in-time (`as_of`) reads on both endpoints (v0.5.0, Priority High)
+
+Additive amendment: **no migration, no schema change, no cache, no new stored rows**. All new work
+is request-time wiring around the three already-unit-tested pure functions. The methodology is
+DDD/TDD-friendly because the projection math is untouched — only the request-time source-series
+truncation and in-memory paginate/filter are new.
+
+- **Param.** Add `as_of: Option<DateTime<Utc>>` to `ListCycleOverlayParams` in
+  `src/api/cycle_overlay.rs`, deserialised exactly like `GetMetadataParams::as_of` in
+  `src/api/metadata.rs` (RFC3339; an unparseable value is a `Query` rejection → HTTP 400 for free,
+  REQ-CYCLE-079). Both `list_cycle_overlay` and `list_cycle_projection` already share
+  `list_overlay_for_model`, so the branch is added once there. (REQ-CYCLE-070)
+- **Branch in `list_overlay_for_model`.** When `params.as_of` is `None`, keep the existing SELECT
+  against `cycle_overlay_points` unchanged (REQ-CYCLE-074). When `Some(as_of)`, take the on-the-fly
+  path below instead of the table read. (REQ-CYCLE-072/074)
+- **Request-time daily-series loader.** A new async helper mirroring `recompute_cycle_overlay`'s
+  source logic (`src/collectors/cycle_overlay.rs`): read native `1d` `coin_candles` filtered by
+  `ts <= as_of`; when none exist, fall back to the finer-interval aggregation — the SAME
+  `DISTINCT ON ((ts AT TIME ZONE 'UTC')::date) … ORDER BY day, ts DESC` shape as
+  `aggregate_daily_from_finer`, but with an added `AND ts <= $as_of` predicate. This MUST stay
+  SQL-side one-row-per-day — never `fetch_all` the finer series (256Mi-pod OOM invariant,
+  REQ-CYCLE-080). Recommend factoring the existing `recompute_cycle_overlay` source-building block
+  into a shared `load_daily_series(pool, coin, vs, as_of: Option<..>)` so the tick path and the
+  as-of path cannot drift. (REQ-CYCLE-071/080)
+- **Compute.** Run `compute_overlay(daily)` for the real points, then `project_cycle_repeat(&daily,
+  &points)` for `cycle-overlay` or `project_composite(&daily, &points, use_btc_anchors)` for
+  `cycle-projection`, with `use_btc_anchors = (coin_id == "bitcoin" && vs_currency == "usd")`.
+  These functions already anchor `today` at the latest series date and already emit zero projected
+  points under `< CYCLE_DAYS` history, so the "as-of view only", at-or-after-latest, and
+  insufficient-history behaviours (REQ-CYCLE-073/075/077) fall out for free — no new math.
+  (REQ-CYCLE-072/077/081/082)
+- **In-memory paginate + filter.** Apply the optional `cycle` filter, the
+  `(cycle_number ASC, days_since_halving ASC)` ordering, the keyset cursor
+  (`decode_keyset_cursor::<CycleOverlayKey>` for the start bound + `paginate_cycle_overlay` for the
+  page/`next_cursor`), and the `limit` over the computed `Vec<OverlayPoint>` — the same contract as
+  the SQL path, just applied to the in-memory vector. `vs_currency` still defaults to `usd`; an
+  unknown/non-target coin computes an empty vec → 200 empty page (no `ensure_coin_exists`).
+  (REQ-CYCLE-078)
+- **OpenAPI.** Add the `as_of` query parameter (`type: string`, `format: date-time`) to both the
+  `listCycleOverlay` and `listCycleProjection` operations in `api/crypto-collector.yaml`; extend the
+  doc-parity test. (REQ-CYCLE-084)
+- **@MX.** Mark the request-time as-of daily-series loader `@MX:WARN`/`@MX:REASON` (keep SQL-side
+  aggregation; `ts <= as_of` is the point-in-time truncation).
+- Gate: `cargo test` — pure/handler tests for the as-of branch (mid-history truncation and
+  re-anchoring, before-all-data empty page, at-or-after-latest equals no-`as_of`,
+  `< CYCLE_DAYS` → empty projection, pagination round-trip under fixed `as_of`, `cycle`+`as_of`
+  compose, invalid `as_of` → 400); DB-backed as-of scenarios opt-in via
+  `DATABASE_URL=... cargo test -- --ignored`.
+
 ## Technical Approach Notes
 
 - **Pure transform, read-only source.** The overlay is a deterministic function of `coin_candles`
@@ -107,6 +156,14 @@ Quality gate after each phase: `cargo fmt --check`, `cargo clippy --all-targets 
 - **Pagination over a 2D dataset.** The overlay is naturally cycle × day; a flat total order
   `(cycle_number, days_since_halving)` gives a stable keyset. The composite key reuses the existing
   opaque-cursor helpers unchanged.
+- **As-of reuses the precompute source logic, not the precompute table (v0.5.0).** The precomputed
+  `cycle_overlay_points` table only ever holds the projection from the *current* latest data, so an
+  arbitrary past cutoff cannot be served from it — the as-of path re-runs the pure functions over a
+  daily series truncated to `ts <= as_of`. The only genuinely new code is (a) one extra SQL
+  predicate on the daily-series query and (b) an in-memory version of the paginate/filter that the
+  SQL path does in the database; the projection math and the cursor/DTO contract are unchanged. The
+  same-series truncation means `today` inside the pure functions becomes "latest candle `<= as_of`",
+  which is precisely the point-in-time anchor REQ-CYCLE-073 requires, with no special-casing.
 
 ## Risk Analysis
 
@@ -124,6 +181,21 @@ Quality gate after each phase: `cargo fmt --check`, `cargo clippy --all-targets 
 - **Multi-replica double-rebuild.** Two replicas rebuilding concurrently must converge; idempotent
   replacement plus single-owner claiming via the existing lease/`SKIP LOCKED` discipline
   (REQ-CYCLE-042) avoids torn writes.
+- **As-of OOM regression (v0.5.0).** The greatest as-of risk is loading the finer-interval history
+  into the app to truncate it in Rust — a deep 5m backfill is ~1M rows and OOM-kills the 256Mi pod.
+  The `ts <= as_of` filter MUST live inside the `DISTINCT ON` daily aggregation SQL (one row per
+  day), never applied post-`fetch_all`. Guarded by an `@MX:WARN` on the shared loader and mirrored
+  from the existing `aggregate_daily_from_finer` invariant (REQ-CYCLE-080).
+- **As-of compute cost per request.** Unlike the no-`as_of` path (a single indexed SELECT), an
+  as-of request recomputes the overlay/projection on the fly. Daily granularity keeps this modest
+  (a decade ≈ 3–4k rows; the pure functions are O(n)), and there is no cache by design
+  (REQ-CYCLE-072). If as-of traffic ever dominates, caching is a later optimisation, explicitly out
+  of scope here.
+- **As-of / no-as-of divergence.** The tick-time precompute and the as-of path must build the daily
+  series identically (native `1d` first, else widest-coverage finer aggregation) or an
+  `as_of >= latest` request would not equal the no-`as_of` result (REQ-CYCLE-075). Mitigation:
+  factor the source-building into one shared `load_daily_series(...)` used by both, and cover the
+  equality with Scenario 21.
 
 ## Dependencies / Sequencing
 
@@ -132,7 +204,11 @@ Quality gate after each phase: `cargo fmt --check`, `cargo clippy --all-targets 
 - Phase 4 (recompute) and Phase 5 (route) both depend on Phase 1's table + model; they are
   otherwise independent and can proceed in parallel after Phase 3.
 - Phase 6 (OpenAPI + full suite) closes the loop.
+- Phase 7 (v0.5.0 as-of reads) depends only on the Phase 2/3 pure functions and the Phase 5 route +
+  cursor/DTO already being in place; it adds no migration and reuses the Phase 4 recompute's
+  source-building logic (native `1d` → widest-coverage finer aggregation, now with a `ts <= as_of`
+  predicate). It is otherwise independent and lands after the base feature is complete.
 - No dependency on other SPECs beyond the existing `coin_candles` schema (SPEC-DB-001 / SPEC-API-002),
   the periodic tick (SPEC-SCHED-001), and the `/v1` cursor/DTO/error conventions (SPEC-API-001).
   Optional reuse of SPEC-API-003 read-time `1d` aggregation is an Open Item (OR-CYCLE-4), not a
-  dependency.
+  dependency. The as-of daily loader (Phase 7) reuses the same SPEC-API-003 aggregation path.

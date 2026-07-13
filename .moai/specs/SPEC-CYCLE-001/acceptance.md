@@ -1,7 +1,7 @@
 ---
 id: SPEC-CYCLE-001
 type: acceptance
-updated: 2026-07-04
+updated: 2026-07-13
 ---
 
 # SPEC-CYCLE-001 — Acceptance Criteria
@@ -158,6 +158,90 @@ persisted daily (`1d`) `coin_candles`, and route requests target
 - Then the document contains the overlay endpoint, its operationId (e.g. `listCycleOverlay`), and a
   response schema exposing both `norm_halving` and `norm_cycle_low`.
 
+## Point-in-time (`as_of`) reads (v0.5.0)
+
+Scenarios 19–27 cover the optional `as_of` parameter on **both**
+`GET /v1/coins/{coin_id}/cycle-overlay` (replay model) and
+`GET /v1/coins/{coin_id}/cycle-projection` (composite model). Unless a scenario says otherwise the
+target is `bitcoin`/`usd` and `T` denotes an RFC3339 instant.
+
+## Scenario 19 — `as_of` mid-history truncates real points and re-anchors the projection at T (REQ-CYCLE-070, 071, 072, 073)
+
+- Given daily `1d` `bitcoin`/`usd` candles spanning several years past a chosen instant `T`, with
+  `T` at least `CYCLE_DAYS` days after the earliest candle,
+- When the client requests `GET /v1/coins/bitcoin/cycle-overlay?as_of=<T>`,
+- Then the response is computed on the fly from only the candles with `ts <= T` (the precomputed
+  `cycle_overlay_points` table is not read),
+- And no real (`projected == false`) point has a `ts` after `T` (the newest real point is the
+  latest candle at or before `T`),
+- And the projected (`projected == true`) points are anchored at that latest `<= T` candle
+  (their first `ts` is one day after it), reproducing exactly what the endpoint would have emitted
+  at time `T`.
+
+## Scenario 20 — `as_of` before any data returns a 200 empty page (REQ-CYCLE-076)
+
+- Given the persisted `bitcoin`/`usd` daily history begins in 2019,
+- When the client requests `?as_of=2015-01-01T00:00:00Z` (no candle satisfies `ts <= as_of`),
+- Then the response is HTTP 200 with body `{"items": [], "next_cursor": null}` (not 404, not an
+  error).
+
+## Scenario 21 — `as_of` at or after the latest candle equals the no-`as_of` result (REQ-CYCLE-074, 075)
+
+- Given a fixed set of stored candles whose latest day is `L`,
+- When the client requests `?as_of=<T>` with `T >= L` (e.g. a far-future instant),
+- Then the returned items are identical to the same request issued WITHOUT `as_of` (which is served
+  from the precomputed table) — same ordering, same `price`/`norm_halving`/`norm_cycle_low`, same
+  projected points — because the projection anchors at the latest candle either way,
+- And this at-or-after-latest / future case is never an error.
+
+## Scenario 22 — `as_of` with fewer than CYCLE_DAYS of history before it yields real points, empty projection (REQ-CYCLE-077)
+
+- Given `T` falls fewer than `CYCLE_DAYS` (= 1458) days after the earliest stored candle,
+- When the client requests `?as_of=<T>` on either endpoint,
+- Then the response contains the real (`projected == false`) points with `ts <= T`,
+- And it contains zero projected points (empty projection set), and this is HTTP 200, not an error.
+
+## Scenario 23 — Pagination round-trip is stable under a fixed `as_of` (REQ-CYCLE-078)
+
+- Given a fixed `as_of=<T>` that yields more than 2 computed points,
+- When the client requests `?as_of=<T>&limit=2` and then `?as_of=<T>&limit=2&cursor=<next_cursor>`,
+- Then the two pages are ordered by `(cycle_number ASC, days_since_halving ASC)`, page 2's first
+  item sorts strictly after page 1's last item, `next_cursor` becomes null once exhausted, and the
+  concatenation of pages equals a single unpaginated `?as_of=<T>` request over the same `T` (the
+  keyset is applied over the in-memory computed result).
+
+## Scenario 24 — `cycle` filter composes with `as_of` (REQ-CYCLE-078)
+
+- Given `as_of=<T>` and `cycle=3`,
+- When the client requests `?as_of=<T>&cycle=3&vs_currency=usd`,
+- Then every returned item has `cycle_number == 3`, all computed from candles with `ts <= T`,
+- And omitting `vs_currency` still defaults the effective currency to `usd`.
+
+## Scenario 25 — Invalid `as_of` returns 400 without computing (REQ-CYCLE-079)
+
+- Given any request to either cycle endpoint,
+- When the client supplies an unparseable `as_of` (e.g. `?as_of=not-a-timestamp` or
+  `?as_of=2026-13-99`),
+- Then the response is HTTP 400 (query-parameter deserialisation failure) without querying or
+  computing.
+
+## Scenario 26 — No-`as_of` request is still served from the precomputed table (regression guard) (REQ-CYCLE-074)
+
+- Given the precomputed `cycle_overlay_points` table holds the current overlay for `bitcoin`/`usd`,
+- When the client requests `GET /v1/coins/bitcoin/cycle-overlay` (no `as_of`),
+- Then the response is served from the precomputed table exactly as before this amendment — the
+  existing Scenarios 14–17 continue to pass unchanged, and no on-the-fly recomputation occurs.
+
+## Scenario 27 — Composite endpoint keeps BTC/USD calibration anchors under `as_of` (REQ-CYCLE-081, 082)
+
+- Given `GET /v1/coins/bitcoin/cycle-projection?as_of=<T>` for the `bitcoin`/`usd` pair,
+- When the composite projection is computed on the fly from candles with `ts <= T`,
+- Then `use_btc_anchors` is `true` (the compiled-in BTC/USD calibration anchors are applied), each
+  projected point carries `price_low <= price <= price_high`, and all values serialise as
+  `DecimalString` with no `f64` round-trip,
+- And Given the same request for a non-BTC/USD pair (e.g. `?vs_currency=eur`), `use_btc_anchors` is
+  `false` (calibration anchors are not applied).
+
 ## Edge Cases
 
 - A cycle whose only stored candle is the halving day itself ⇒ one point with `days_since_halving
@@ -172,6 +256,13 @@ persisted daily (`1d`) `coin_candles`, and route requests target
   (REQ-CYCLE-024/051).
 - The halving dates are treated as approximate/block-derived constants; a candle exactly on a
   next-halving date belongs to the next cycle (half-open boundary, REQ-CYCLE-010).
+- `as_of` exactly equal to a stored candle's `ts` includes that candle (the `<= as_of` predicate is
+  inclusive), so that day is the projection anchor (REQ-CYCLE-071).
+- An `as_of` request whose derived daily series comes from a finer interval (no native `1d`) still
+  aggregates one-row-per-day in SQL with the `ts <= as_of` predicate — the full finer series is
+  never materialised in the pod (REQ-CYCLE-080).
+- An unknown/non-target coin with `as_of` present ⇒ HTTP 200 empty page, same as without `as_of`
+  (REQ-CYCLE-078/052).
 
 ## Definition of Done
 
@@ -201,6 +292,30 @@ persisted daily (`1d`) `coin_candles`, and route requests target
 - [ ] The endpoint and its schema (both baselines) are in `api/crypto-collector.yaml` and verified
       by the doc-parity test — REQ-CYCLE-054.
 - [ ] No `f64` used for any price or normalized value — REQ-PROV-012 / REQ-CYCLE-024.
+- [ ] Both cycle endpoints accept an optional `as_of` (RFC3339 `Option<DateTime<Utc>>`, matching the
+      `/metadata` convention); when present, the result is computed on the fly from the daily series
+      truncated to `ts <= as_of` using the existing pure functions, with no schema change, no cache,
+      and no read/write of the precomputed table — REQ-CYCLE-070/071/072.
+- [ ] An `as_of` response is "as-of view only": real points `<= as_of` plus the projection anchored
+      at `as_of`, and no real point after `as_of` — REQ-CYCLE-073.
+- [ ] When `as_of` is absent, the request is served from the precomputed `cycle_overlay_points`
+      table exactly as before (backward compatible; Scenarios 14–17 unchanged) — REQ-CYCLE-074.
+- [ ] `as_of` at or after the latest candle equals the no-`as_of` result; `as_of` before all data
+      returns a 200 empty page; both are graceful, never errors — REQ-CYCLE-075/076.
+- [ ] `as_of` with fewer than `CYCLE_DAYS` of history before it returns real points with an empty
+      projection set (reusing REQ-CYCLE-062), not an error — REQ-CYCLE-077.
+- [ ] Pagination `(cycle_number, days_since_halving)`, the `cycle` filter, the `vs_currency` default,
+      and empty-page-not-404 all compose with `as_of` over the in-memory result — REQ-CYCLE-078.
+- [ ] Invalid (unparseable) `as_of` returns HTTP 400 without computing — REQ-CYCLE-079.
+- [ ] The request-time daily loader keeps the OOM-safe SQL `DISTINCT ON` aggregation and adds a
+      `ts <= as_of` predicate; the full finer series is never materialised in the pod — REQ-CYCLE-080.
+- [ ] Under `as_of`, the composite endpoint preserves `use_btc_anchors = (bitcoin && usd)` and every
+      value stays `Decimal`/`DecimalString` — REQ-CYCLE-081/082.
+- [ ] Both cycle endpoints consult only daily candle closes; quotes are not consulted with or without
+      `as_of` — REQ-CYCLE-083.
+- [ ] The `as_of` query parameter (`type: string`, `format: date-time`) is added to both
+      `listCycleOverlay` and `listCycleProjection` in `api/crypto-collector.yaml` and verified by the
+      doc-parity test — REQ-CYCLE-084.
 - [ ] Quality gate green: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D
       warnings`, `cargo test`; DB-backed scenarios verified via `DATABASE_URL=... cargo test --
       --ignored`.

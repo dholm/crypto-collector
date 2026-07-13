@@ -382,20 +382,7 @@ pub async fn recompute_cycle_overlay(
     coin_id: &str,
     vs_currency: &str,
 ) -> Result<()> {
-    let native_rows: Vec<(NaiveDate, Decimal)> = sqlx::query_as(
-        "SELECT ts::date, close FROM coin_candles \
-         WHERE coin_id = $1 AND vs_currency = $2 AND interval = '1d'",
-    )
-    .bind(coin_id)
-    .bind(vs_currency)
-    .fetch_all(pool)
-    .await?;
-
-    let daily = if native_rows.is_empty() {
-        aggregate_daily_from_finer(pool, coin_id, vs_currency).await?
-    } else {
-        native_rows
-    };
+    let daily = load_daily_series(pool, coin_id, vs_currency, None).await?;
 
     let points = compute_overlay(daily.clone());
     // Two forward-projection models are materialised concurrently (SPEC-CYCLE-001): the
@@ -452,6 +439,59 @@ pub async fn recompute_cycle_overlay(
     Ok(())
 }
 
+/// Load the daily `(date, close)` series for `(coin_id, vs_currency)`, optionally truncated to
+/// candles at or before `as_of` (REQ-CYCLE-071/080, v0.5.0).
+///
+/// Shared by both the periodic recompute (`recompute_cycle_overlay`, `as_of = None`) and the
+/// request-time as-of read path (`src/api/cycle_overlay.rs`, `as_of = Some(t)`), so the two
+/// paths cannot drift (REQ-CYCLE-075/Scenario 21): reads native `1d` `coin_candles` first, and
+/// when none exist, falls back to the widest-coverage finer-interval SQL-side aggregation. When
+/// `as_of` is `None`, this is byte-for-byte the same SQL previously inlined in
+/// `recompute_cycle_overlay` (REQ-CYCLE-074).
+///
+// @MX:WARN: [AUTO] load_daily_series — request-time as-of daily-series loader.
+// @MX:REASON: MUST keep the SQL-side one-row-per-day `DISTINCT ON` aggregation and MUST NOT
+//             `fetch_all` the full finer-interval series — a deep backfill (~1M rows) OOM-kills
+//             the 256Mi pod. The `ts <= as_of` predicate is the point-in-time truncation every
+//             as-of point depends on (REQ-CYCLE-071/080).
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-071 REQ-CYCLE-074 REQ-CYCLE-075 REQ-CYCLE-080
+pub async fn load_daily_series(
+    pool: &PgPool,
+    coin_id: &str,
+    vs_currency: &str,
+    as_of: Option<DateTime<Utc>>,
+) -> Result<Vec<(NaiveDate, Decimal)>> {
+    let native_rows: Vec<(NaiveDate, Decimal)> = match as_of {
+        None => {
+            sqlx::query_as(
+                "SELECT ts::date, close FROM coin_candles \
+                 WHERE coin_id = $1 AND vs_currency = $2 AND interval = '1d'",
+            )
+            .bind(coin_id)
+            .bind(vs_currency)
+            .fetch_all(pool)
+            .await?
+        }
+        Some(cutoff) => {
+            sqlx::query_as(
+                "SELECT ts::date, close FROM coin_candles \
+                 WHERE coin_id = $1 AND vs_currency = $2 AND interval = '1d' AND ts <= $3",
+            )
+            .bind(coin_id)
+            .bind(vs_currency)
+            .bind(cutoff)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    if native_rows.is_empty() {
+        aggregate_daily_from_finer(pool, coin_id, vs_currency, as_of).await
+    } else {
+        Ok(native_rows)
+    }
+}
+
 /// Select the 1d-divisor interval with the widest historical coverage as the daily source.
 ///
 /// Unlike SPEC-API-003's `select_source_interval` (which picks the *coarsest* divisor to
@@ -491,10 +531,14 @@ fn select_widest_source_interval<'a>(
 
 /// Derive a `1d` `(date, close)` series from the widest-coverage stored divisor interval,
 /// reusing the SPEC-API-003 read-time aggregation (OR-CYCLE-4).
+///
+/// `as_of`, when present, adds a `ts <= as_of` predicate to the daily aggregation query only
+/// (REQ-CYCLE-080); the interval-coverage selection query is unaffected.
 async fn aggregate_daily_from_finer(
     pool: &PgPool,
     coin_id: &str,
     vs_currency: &str,
+    as_of: Option<DateTime<Utc>>,
 ) -> Result<Vec<(NaiveDate, Decimal)>> {
     use crate::api::candles_agg::interval_to_seconds;
 
@@ -532,18 +576,37 @@ async fn aggregate_daily_from_finer(
     // @MX:REASON: aggregate_daily_from_finer previously loaded every source candle; with the
     //             widest-coverage interval that is the full multi-year 5m history.
     // @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-041 OR-CYCLE-4
-    let daily: Vec<(NaiveDate, Decimal)> = sqlx::query_as(
-        "SELECT DISTINCT ON ((ts AT TIME ZONE 'UTC')::date) \
-                (ts AT TIME ZONE 'UTC')::date, close \
-         FROM coin_candles \
-         WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 \
-         ORDER BY (ts AT TIME ZONE 'UTC')::date, ts DESC",
-    )
-    .bind(coin_id)
-    .bind(vs_currency)
-    .bind(&source_interval)
-    .fetch_all(pool)
-    .await?;
+    let daily: Vec<(NaiveDate, Decimal)> = match as_of {
+        None => {
+            sqlx::query_as(
+                "SELECT DISTINCT ON ((ts AT TIME ZONE 'UTC')::date) \
+                        (ts AT TIME ZONE 'UTC')::date, close \
+                 FROM coin_candles \
+                 WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 \
+                 ORDER BY (ts AT TIME ZONE 'UTC')::date, ts DESC",
+            )
+            .bind(coin_id)
+            .bind(vs_currency)
+            .bind(&source_interval)
+            .fetch_all(pool)
+            .await?
+        }
+        Some(cutoff) => {
+            sqlx::query_as(
+                "SELECT DISTINCT ON ((ts AT TIME ZONE 'UTC')::date) \
+                        (ts AT TIME ZONE 'UTC')::date, close \
+                 FROM coin_candles \
+                 WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND ts <= $4 \
+                 ORDER BY (ts AT TIME ZONE 'UTC')::date, ts DESC",
+            )
+            .bind(coin_id)
+            .bind(vs_currency)
+            .bind(&source_interval)
+            .bind(cutoff)
+            .fetch_all(pool)
+            .await?
+        }
+    };
 
     Ok(daily)
 }
@@ -989,5 +1052,131 @@ mod tests {
             None,
             "no candidates → no source"
         );
+    }
+
+    // ── as-of truncation (v0.5.0, REQ-CYCLE-070..073) — pure-function-level coverage ──
+    //
+    // `load_daily_series` itself is a thin SQL wrapper and is covered by the DB-gated tests
+    // below; these tests exercise the pure consequence of truncating the source series to
+    // `ts <= as_of` BEFORE calling the existing pure functions — the same thing the API
+    // as-of branch does after calling `load_daily_series(.., Some(as_of))`.
+
+    // Scenario 19 (REQ-CYCLE-071/072/073): projecting from a series truncated to `<= T`
+    // anchors `today` at the latest date `<= T`, not at the true latest date — i.e. later
+    // (post-T) real data must have zero influence on the projection.
+    #[test]
+    fn truncated_series_anchors_projection_at_cutoff_not_at_true_latest() {
+        let start = d(2020, 1, 1);
+        let total_days = CYCLE_DAYS + 60;
+        let full = synthetic_daily_series(start, total_days, |i| dec!(100) + Decimal::from(i));
+
+        // Cut 30 days before the true end.
+        let cutoff = start + chrono::Duration::days(total_days - 1 - 30);
+        let truncated: Vec<(NaiveDate, Decimal)> =
+            full.iter().copied().filter(|(d, _)| *d <= cutoff).collect();
+
+        let real = compute_overlay(truncated.clone());
+        let projected = project_cycle_repeat(&truncated, &real);
+
+        assert!(
+            !projected.is_empty(),
+            "sufficient history remains after truncation"
+        );
+        // The projection's first point must be exactly one day after the cutoff, not after
+        // the true (untruncated) latest date.
+        let first = projected.iter().min_by_key(|p| p.ts).unwrap();
+        assert_eq!(first.ts, cutoff + chrono::Duration::days(1));
+        // No real point exists after the cutoff.
+        assert!(real.iter().all(|p| p.ts <= cutoff));
+        // No real point in the (correct, untruncated) full series is missed by the cutoff —
+        // real points are exactly the truncated set.
+        assert_eq!(real.len(), truncated.len());
+    }
+
+    // Scenario 22 (REQ-CYCLE-077): truncating below CYCLE_DAYS of history before the cutoff
+    // yields real points but an empty projection set — not an error.
+    #[test]
+    fn truncated_series_below_cycle_days_yields_empty_projection() {
+        let start = d(2024, 1, 1);
+        let short = synthetic_daily_series(start, CYCLE_DAYS - 5, |i| dec!(100) + Decimal::from(i));
+        let real = compute_overlay(short.clone());
+        let projected = project_cycle_repeat(&short, &real);
+        assert!(!real.is_empty());
+        assert!(projected.is_empty());
+    }
+
+    // ── load_daily_series: DB-gated integration tests (require live DATABASE_URL) ──
+
+    async fn seed_bitcoin_usd_candle(
+        pool: &PgPool,
+        ts: DateTime<Utc>,
+        close: Decimal,
+        interval: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+             VALUES ('bitcoin', 'BTC', 'Bitcoin', 'active', now()) \
+             ON CONFLICT DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("seed tracked_coins");
+
+        sqlx::query(
+            "INSERT INTO coin_candles (coin_id, vs_currency, interval, ts, open, high, low, close) \
+             VALUES ('bitcoin', 'usd', $1, $2, $3, $3, $3, $3) \
+             ON CONFLICT (coin_id, vs_currency, interval, ts) DO UPDATE SET close = $3",
+        )
+        .bind(interval)
+        .bind(ts)
+        .bind(close)
+        .execute(pool)
+        .await
+        .expect("seed coin_candles");
+    }
+
+    // REQ-CYCLE-071: `load_daily_series(.., Some(as_of))` excludes native `1d` candles after
+    // `as_of` and includes the one exactly at `as_of` (inclusive cutoff).
+    #[tokio::test]
+    #[ignore]
+    async fn db_load_daily_series_as_of_filters_native_1d_candles() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        let coin_id = "bitcoin";
+        let vs_currency = "usd";
+        let day0 = Utc::now() - chrono::Duration::days(3);
+        let day1 = Utc::now() - chrono::Duration::days(2);
+        let day2 = Utc::now() - chrono::Duration::days(1);
+
+        seed_bitcoin_usd_candle(&pool, day0, dec!(10000), "1d").await;
+        seed_bitcoin_usd_candle(&pool, day1, dec!(11000), "1d").await;
+        seed_bitcoin_usd_candle(&pool, day2, dec!(12000), "1d").await;
+
+        // as_of exactly at day1 must include day1 but exclude day2 (inclusive cutoff).
+        let series = load_daily_series(&pool, coin_id, vs_currency, Some(day1))
+            .await
+            .expect("load_daily_series");
+        let dates: Vec<NaiveDate> = series.iter().map(|(d, _)| *d).collect();
+        assert!(dates.contains(&day1.date_naive()));
+        assert!(!dates.contains(&day2.date_naive()));
+
+        // No as_of → all three candles present.
+        let all = load_daily_series(&pool, coin_id, vs_currency, None)
+            .await
+            .expect("load_daily_series");
+        let all_dates: Vec<NaiveDate> = all.iter().map(|(d, _)| *d).collect();
+        assert!(all_dates.contains(&day2.date_naive()));
+
+        // Cleanup.
+        sqlx::query(
+            "DELETE FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2 AND ts >= $3",
+        )
+        .bind(coin_id)
+        .bind(vs_currency)
+        .bind(day0 - chrono::Duration::hours(1))
+        .execute(&pool)
+        .await
+        .ok();
     }
 }
