@@ -180,22 +180,11 @@ async fn compute_as_of_page(
     limit: i64,
     projected_model: &str,
 ) -> ApiResult<Vec<CycleOverlayPoint>> {
-    use crate::collectors::cycle_overlay::{
-        compute_overlay, load_daily_series, project_cycle_repeat,
-    };
-    use crate::collectors::cycle_projection::project_composite;
+    use crate::collectors::cycle_overlay::{compute_overlay, load_daily_series};
 
     let daily = load_daily_series(pool, coin_id, vs_currency, Some(as_of)).await?;
     let real = compute_overlay(daily.clone());
-    let projected = match projected_model {
-        "replay" => project_cycle_repeat(&daily, &real),
-        "composite" => {
-            // REQ-CYCLE-082: preserve the BTC/USD-only calibration-anchor rule under as_of.
-            let use_btc_anchors = coin_id == "bitcoin" && vs_currency == "usd";
-            project_composite(&daily, &real, use_btc_anchors)
-        }
-        other => unreachable!("unsupported projection model '{other}'"),
-    };
+    let projected = project_as_of_for_model(projected_model, &daily, &real, coin_id, vs_currency);
 
     Ok(build_as_of_page(
         real,
@@ -206,6 +195,31 @@ async fn compute_as_of_page(
         cursor,
         limit,
     ))
+}
+
+/// Pure model-dispatch step of the as-of path (REQ-CYCLE-081/082): selects and invokes the
+/// projection function matching `projected_model`, preserving the BTC/USD-only
+/// calibration-anchor rule for the composite model. Extracted from `compute_as_of_page` so the
+/// dispatch/anchor-selection logic is unit-testable without a database (Scenario 27).
+fn project_as_of_for_model(
+    projected_model: &str,
+    daily: &[(chrono::NaiveDate, rust_decimal::Decimal)],
+    real: &[OverlayPoint],
+    coin_id: &str,
+    vs_currency: &str,
+) -> Vec<OverlayPoint> {
+    use crate::collectors::cycle_overlay::project_cycle_repeat;
+    use crate::collectors::cycle_projection::project_composite;
+
+    match projected_model {
+        "replay" => project_cycle_repeat(daily, real),
+        "composite" => {
+            // REQ-CYCLE-082: preserve the BTC/USD-only calibration-anchor rule under as_of.
+            let use_btc_anchors = coin_id == "bitcoin" && vs_currency == "usd";
+            project_composite(daily, real, use_btc_anchors)
+        }
+        other => unreachable!("unsupported projection model '{other}'"),
+    }
 }
 
 /// Pure in-memory paginate/filter/order step of the as-of path (REQ-CYCLE-078): applies the
@@ -690,6 +704,100 @@ mod tests {
         assert!(page.iter().all(|p| !p.projected));
     }
 
+    // ── project_as_of_for_model dispatch (Scenario 27, REQ-CYCLE-081/082) ─────────────────
+
+    use crate::collectors::cycle_overlay::CYCLE_DAYS;
+    use crate::collectors::cycle_projection::project_composite;
+
+    /// Build a dense `(date, price)` series of `days` consecutive dates starting at `start`,
+    /// mirroring `cycle_overlay::tests::synthetic_daily_series` (private to that module, so this
+    /// is a local equivalent for this file's route-dispatch tests).
+    fn synthetic_daily_series(
+        start: chrono::NaiveDate,
+        days: i64,
+        price_fn: impl Fn(i64) -> rust_decimal::Decimal,
+    ) -> Vec<(chrono::NaiveDate, rust_decimal::Decimal)> {
+        (0..days)
+            .map(|i| (start + chrono::Duration::days(i), price_fn(i)))
+            .collect()
+    }
+
+    /// A `CYCLE_DAYS`-length synthetic daily series (non-empty composite projection) plus the
+    /// `real` overlay points it produces — shared setup for the dispatch tests below.
+    fn cycle_length_daily_and_real() -> (
+        Vec<(chrono::NaiveDate, rust_decimal::Decimal)>,
+        Vec<OverlayPoint>,
+    ) {
+        use crate::collectors::cycle_overlay::compute_overlay;
+        let start = chrono::NaiveDate::from_ymd_opt(2020, 5, 11).unwrap();
+        let daily = synthetic_daily_series(start, CYCLE_DAYS + 1, |i| {
+            dec!(20000) + rust_decimal::Decimal::from(i)
+        });
+        let real = compute_overlay(daily.clone());
+        (daily, real)
+    }
+
+    // Scenario 27 (REQ-CYCLE-082): composite dispatch for bitcoin/usd enables BTC calibration
+    // anchors — must match calling `project_composite` directly with `use_btc_anchors = true`.
+    #[test]
+    fn project_as_of_for_model_composite_bitcoin_usd_uses_btc_anchors() {
+        let (daily, real) = cycle_length_daily_and_real();
+        let dispatched = project_as_of_for_model("composite", &daily, &real, "bitcoin", "usd");
+        let direct = project_composite(&daily, &real, true);
+        assert_eq!(dispatched, direct);
+    }
+
+    // Scenario 27 (REQ-CYCLE-082): composite dispatch for any non-BTC/USD pair disables the
+    // calibration anchors — must match calling `project_composite` directly with `false`.
+    #[test]
+    fn project_as_of_for_model_composite_non_btc_usd_disables_anchors() {
+        let (daily, real) = cycle_length_daily_and_real();
+        let dispatched = project_as_of_for_model("composite", &daily, &real, "ethereum", "usd");
+        let direct = project_composite(&daily, &real, false);
+        assert_eq!(dispatched, direct);
+
+        // Same coin, different vs_currency also disables anchors.
+        let dispatched2 = project_as_of_for_model("composite", &daily, &real, "bitcoin", "eur");
+        let direct2 = project_composite(&daily, &real, false);
+        assert_eq!(dispatched2, direct2);
+    }
+
+    // Scenario 27 (REQ-CYCLE-081): "replay" dispatch must match `project_cycle_repeat` directly,
+    // regardless of coin/vs_currency (the replay model has no anchor-selection branch).
+    #[test]
+    fn project_as_of_for_model_replay_matches_project_cycle_repeat() {
+        let (daily, real) = cycle_length_daily_and_real();
+        let dispatched = project_as_of_for_model("replay", &daily, &real, "ethereum", "usd");
+        let direct = crate::collectors::cycle_overlay::project_cycle_repeat(&daily, &real);
+        assert_eq!(dispatched, direct);
+    }
+
+    // Scenario 27 (REQ-CYCLE-081/082): composite band ordering holds under this dispatch path —
+    // regression guard for the BTC-anchor wiring / model-dispatch extraction, not the model math
+    // itself (band ordering is already backtest-locked in tests/backtest_projection.rs).
+    #[test]
+    fn project_as_of_for_model_composite_bands_are_ordered() {
+        let (daily, real) = cycle_length_daily_and_real();
+        let projected = project_as_of_for_model("composite", &daily, &real, "bitcoin", "usd");
+        assert!(
+            !projected.is_empty(),
+            "composite projection must be non-empty for a CYCLE_DAYS-length series"
+        );
+        for p in &projected {
+            let low = p
+                .price_low
+                .expect("composite projected point must carry price_low");
+            let high = p
+                .price_high
+                .expect("composite projected point must carry price_high");
+            assert!(
+                low <= p.price && p.price <= high,
+                "expected price_low <= price <= price_high, got low={low} price={} high={high}",
+                p.price
+            );
+        }
+    }
+
     // ── DB-gated as-of scenarios (require live DATABASE_URL) ──────────────────
 
     async fn seed_bitcoin_candle(
@@ -840,6 +948,89 @@ mod tests {
                 );
             }
         }
+
+        // Cleanup.
+        sqlx::query("DELETE FROM coin_candles WHERE coin_id = 'bitcoin' AND vs_currency = 'usd' AND ts >= $1")
+            .bind(start - chrono::Duration::hours(1))
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    // Scenario 27 (REQ-CYCLE-081/082), route level: `/cycle-projection` (composite model) under
+    // `as_of` returns ordered confidence bands for the BTC/USD-anchored path, and still returns
+    // 200 (not an error) for a non-BTC/USD pair where anchors are disabled — this is the route
+    // this amendment closes the coverage gap for; `/cycle-overlay` (replay model) is already
+    // exercised end-to-end by db_scenario_19/20/21/26 above.
+    #[tokio::test]
+    #[ignore]
+    async fn db_scenario_27_projection_as_of_composite_bands_and_anchors() {
+        let server = db_test_server();
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        // Seed enough daily history (> CYCLE_DAYS) ending at a known mid-history cutoff, so the
+        // composite model is non-empty (REQ-CYCLE-062: fewer than CYCLE_DAYS days → zero points).
+        let cutoff = Utc::now() - chrono::Duration::days(5);
+        let start = cutoff - chrono::Duration::days(CYCLE_DAYS + 30);
+
+        let mut ts = start;
+        let mut price = rust_decimal::Decimal::from(20000);
+        while ts <= cutoff {
+            seed_bitcoin_candle(&pool, ts, price).await;
+            ts += chrono::Duration::days(1);
+            price += rust_decimal::Decimal::from(1);
+        }
+
+        // BTC/USD: composite dispatch enables calibration anchors (REQ-CYCLE-082) — every
+        // projected item must carry ordered price_low <= price <= price_high (REQ-CYCLE-081).
+        let resp = server
+            .get("/v1/coins/bitcoin/cycle-projection")
+            .add_query_param("as_of", cutoff.to_rfc3339())
+            .add_query_param("limit", "100")
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        let items = body["items"].as_array().expect("items array");
+        for item in items {
+            if item["projected"] == true {
+                let price: rust_decimal::Decimal = item["price"]
+                    .as_str()
+                    .expect("price string")
+                    .parse()
+                    .unwrap();
+                let low: rust_decimal::Decimal = item["price_low"]
+                    .as_str()
+                    .expect("projected point must carry price_low")
+                    .parse()
+                    .unwrap();
+                let high: rust_decimal::Decimal = item["price_high"]
+                    .as_str()
+                    .expect("projected point must carry price_high")
+                    .parse()
+                    .unwrap();
+                assert!(
+                    low <= price && price <= high,
+                    "expected price_low <= price <= price_high, got low={low} price={price} high={high}"
+                );
+            }
+        }
+
+        // Non-BTC/USD pair: composite dispatch disables calibration anchors, but the route must
+        // still return 200 without error (empty or non-anchored), never a panic/500.
+        let resp_non_btc = server
+            .get("/v1/coins/ethereum/cycle-projection")
+            .add_query_param("as_of", cutoff.to_rfc3339())
+            .add_query_param("vs_currency", "usd")
+            .await;
+        assert_eq!(resp_non_btc.status_code(), 200);
+
+        let resp_non_usd = server
+            .get("/v1/coins/bitcoin/cycle-projection")
+            .add_query_param("as_of", cutoff.to_rfc3339())
+            .add_query_param("vs_currency", "eur")
+            .await;
+        assert_eq!(resp_non_usd.status_code(), 200);
 
         // Cleanup.
         sqlx::query("DELETE FROM coin_candles WHERE coin_id = 'bitcoin' AND vs_currency = 'usd' AND ts >= $1")
