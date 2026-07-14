@@ -6,27 +6,15 @@
 # Run `make build-aarch64` before `make image-aarch64`.
 # Zero RUN commands in the runtime stage — QEMU not required.
 
-# ── Stage 1: setup (amd64) — install packages and create the non-root user ───
-FROM debian:bookworm-slim AS setup
-
-RUN groupadd --system --gid 10001 crypto-collector \
-    && useradd --system --uid 10001 --gid crypto-collector crypto-collector \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── Stage 2: runtime (arm64) — zero RUN commands ─────────────────────────────
-FROM --platform=linux/arm64 debian:bookworm-slim AS runtime
-
-COPY --from=setup /etc/passwd /etc/passwd
-COPY --from=setup /etc/group  /etc/group
-COPY --from=setup /etc/ssl/certs /etc/ssl/certs
+# ── Runtime (arm64) — zero RUN commands ──────────────────────────────────────
+# distroless cc ships glibc, libssl/openssl, and ca-certificates; the :nonroot
+# tag runs as uid/gid 65532, so no setup stage or /etc/passwd copy is needed.
+FROM --platform=linux/arm64 gcr.io/distroless/cc-debian13:nonroot AS runtime
 
 COPY target/aarch64-unknown-linux-gnu/release/crypto-collector /usr/local/bin/crypto-collector
 COPY migrations /migrations
 
-WORKDIR /app
-USER crypto-collector
+USER nonroot
 
 # API port / health port / Prometheus metrics port
 EXPOSE 8080 8081 9000

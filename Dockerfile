@@ -22,18 +22,14 @@ COPY migrations ./migrations
 RUN cargo build --release
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd --gid 10001 app && \
-    useradd --uid 10001 --gid 10001 --no-create-home app
+# distroless cc ships glibc, libssl/openssl, and ca-certificates; the :nonroot
+# tag runs as uid/gid 65532 with no shell or package manager.
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 
 COPY --from=builder /build/target/release/crypto-collector /usr/local/bin/crypto-collector
 COPY --from=builder /build/migrations /migrations
 
-USER app
+USER nonroot
 
 # API port / health port / Prometheus metrics port
 EXPOSE 8080 8081 9000
