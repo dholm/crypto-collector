@@ -201,14 +201,20 @@ pub fn build_api_router(state: AppState) -> Router {
         .route("/v1/coins/{coin_id}/quotes", get(quotes::list_quotes))
         // ── Coin OHLCV candle endpoints (SPEC-API-002 REQ-API-141/142) ───────
         .route("/v1/coins/{coin_id}/candles", get(candles::list_candles))
-        // ── Bitcoin halving-cycle overlay (SPEC-CYCLE-001 REQ-CYCLE-050) ─────
-        .route(
-            "/v1/coins/{coin_id}/cycle-overlay",
-            get(cycle_overlay::list_cycle_overlay),
-        )
+        // ── Bitcoin halving-cycle overlay (SPEC-CYCLE-001 REQ-CYCLE-090..099, v0.6.0) ────
+        // NOTE: the base path (discovery) MUST be registered before the parameterised
+        // `/cycle-projection/{model}` data path is READ here for documentation purposes only —
+        // Axum resolves these unambiguously since they differ by path segment count, so
+        // registration order between the two does not matter (unlike the literal-vs-param
+        // ordering rule above). The former `/cycle-overlay` route is removed entirely
+        // (REQ-CYCLE-098): no route registration for it means Axum returns 404.
         .route(
             "/v1/coins/{coin_id}/cycle-projection",
-            get(cycle_overlay::list_cycle_projection),
+            get(cycle_overlay::list_cycle_projection_models),
+        )
+        .route(
+            "/v1/coins/{coin_id}/cycle-projection/{model}",
+            get(cycle_overlay::list_cycle_projection_data),
         )
         .with_state(state)
 }
@@ -267,8 +273,8 @@ mod tests {
             "/v1/coins/{coin_id}/quotes/latest",
             "/v1/coins/{coin_id}/quotes",
             "/v1/coins/{coin_id}/candles",
-            "/v1/coins/{coin_id}/cycle-overlay",
             "/v1/coins/{coin_id}/cycle-projection",
+            "/v1/coins/{coin_id}/cycle-projection/{model}",
         ];
         for route in &routes {
             assert!(
@@ -407,8 +413,8 @@ mod tests {
             "listCoinCandles",
             "streamCoinQuotes",
             "streamCoinCandles",
-            "listCycleOverlay",
             "listCycleProjection",
+            "listCycleProjectionModels",
         ];
         for op_id in &operation_ids {
             assert!(
@@ -418,37 +424,62 @@ mod tests {
         }
     }
 
-    // REQ-CYCLE-084 (SPEC-CYCLE-001 v0.5.0): the optional `as_of` query parameter must be
-    // documented on both cycle-overlay read operations.
+    // Scenario 34 (REQ-CYCLE-098/099): the removed listCycleOverlay operationId and the
+    // deleted /cycle-overlay path must be entirely absent from the document.
     #[test]
-    fn openapi_yaml_documents_as_of_on_both_cycle_endpoints() {
+    fn openapi_yaml_does_not_contain_removed_cycle_overlay_route() {
         let yaml = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("api/crypto-collector.yaml"),
         )
         .expect("api/crypto-collector.yaml must exist");
 
-        let overlay_start = yaml
-            .find("/coins/{coin_id}/cycle-overlay:")
-            .expect("cycle-overlay path must exist");
-        let projection_start = yaml
+        assert!(
+            !yaml.contains("listCycleOverlay"),
+            "OpenAPI spec must not contain the removed operationId 'listCycleOverlay'"
+        );
+        // Match the YAML path *key* form specifically (trailing colon) rather than any prose
+        // mention — the migration-guidance description text legitimately references the old
+        // path by name when explaining what replaced it.
+        assert!(
+            !yaml.contains("/coins/{coin_id}/cycle-overlay:"),
+            "OpenAPI spec must not contain the removed path '/coins/{{coin_id}}/cycle-overlay'"
+        );
+    }
+
+    // REQ-CYCLE-084/099 (SPEC-CYCLE-001 v0.6.0): the optional `as_of` query parameter must be
+    // documented on the single parameterized data path, and must NOT appear on the bare
+    // discovery path (which carries no `as_of`-relevant parameters).
+    #[test]
+    fn openapi_yaml_documents_as_of_on_the_model_data_path_only() {
+        let yaml = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("api/crypto-collector.yaml"),
+        )
+        .expect("api/crypto-collector.yaml must exist");
+
+        let discovery_start = yaml
             .find("/coins/{coin_id}/cycle-projection:")
-            .expect("cycle-projection path must exist");
+            .expect("cycle-projection discovery path must exist");
+        let data_start = yaml
+            .find("/coins/{coin_id}/cycle-projection/{model}:")
+            .expect("cycle-projection/{model} data path must exist");
         let components_start = yaml
             .find("\ncomponents:")
             .expect("components section must exist");
 
-        let overlay_block = &yaml[overlay_start..projection_start];
-        let projection_block = &yaml[projection_start..components_start];
+        // The discovery block runs from its own header up to the data path's header (the two
+        // path items are adjacent in the document); the data block runs from its header to
+        // components.
+        let discovery_block = &yaml[discovery_start..data_start];
+        let data_block = &yaml[data_start..components_start];
 
-        for (name, block) in [
-            ("listCycleOverlay", overlay_block),
-            ("listCycleProjection", projection_block),
-        ] {
-            assert!(
-                block.contains("cycle_as_of") || block.contains("as_of"),
-                "{name} operation must document the optional as_of query parameter"
-            );
-        }
+        assert!(
+            data_block.contains("cycle_as_of") || data_block.contains("as_of"),
+            "the parameterized data path must document the optional as_of query parameter"
+        );
+        assert!(
+            !(discovery_block.contains("cycle_as_of") || discovery_block.contains("as_of")),
+            "the bare discovery path must NOT document an as_of query parameter"
+        );
     }
 
     // Scenario 14: key schema names appear in OpenAPI.
@@ -468,6 +499,7 @@ mod tests {
             "ApiError",
             "Page",
             "CycleOverlayPoint",
+            "CycleProjectionModels",
         ];
         for schema in &schemas {
             assert!(

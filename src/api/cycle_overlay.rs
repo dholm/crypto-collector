@@ -1,17 +1,22 @@
-//! Bitcoin halving-cycle overlay read handlers (SPEC-CYCLE-001 REQ-CYCLE-050..054).
+//! Bitcoin halving-cycle overlay read handlers (SPEC-CYCLE-001 REQ-CYCLE-050..099).
 //!
-//! Routes:
-//! - `GET /v1/coins/{coin_id}/cycle-overlay` → list_cycle_overlay (replay model, keyset-paginated)
-//! - `GET /v1/coins/{coin_id}/cycle-projection` → list_cycle_projection (composite model,
-//!   keyset-paginated)
+//! Routes (v0.6.0, REQ-CYCLE-090..099):
+//! - `GET /v1/coins/{coin_id}/cycle-projection/{model}` → `list_cycle_projection_data`
+//!   (`{model} ∈ {replay, composite}`, keyset-paginated data endpoint).
+//! - `GET /v1/coins/{coin_id}/cycle-projection` → `list_cycle_projection_models`
+//!   (base path, model-discovery endpoint).
 //!
-//! Both endpoints share the same real (observed) points and the same SELECT/pagination
-//! logic (`list_overlay_for_model`), differing only in which projected `projection_model`
-//! they additionally include.
+//! The former `GET /v1/coins/{coin_id}/cycle-overlay` and the old data-serving base
+//! `GET /v1/coins/{coin_id}/cycle-projection` are removed — no alias, no redirect
+//! (REQ-CYCLE-098). Both selectable models share the same real (observed) points and the
+//! same SELECT/pagination logic (`list_overlay_for_model`), differing only in which
+//! projected `projection_model` they additionally include.
 //!
-//! Unlike most `/v1/coins/{coin_id}/...` routes, these endpoints never 404 on an unknown
+//! Unlike most `/v1/coins/{coin_id}/...` routes, the data endpoint never 404s on an unknown
 //! or non-target coin (REQ-CYCLE-052): the query is simply scoped to
-//! `(coin_id, vs_currency)` and an unmatched coin naturally yields an empty page.
+//! `(coin_id, vs_currency)` and an unmatched coin naturally yields an empty page. An unknown
+//! `{model}` (including `real`) is validated BEFORE dispatch and returns HTTP 400
+//! (REQ-CYCLE-093/094).
 
 use axum::{
     extract::{Path, Query, State},
@@ -23,15 +28,87 @@ use serde::Deserialize;
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CycleOverlayKey},
-    dto::{CycleOverlayPointDto, Page},
+    dto::{CycleOverlayPointDto, CycleProjectionModelDto, CycleProjectionModelsDto, Page},
     ApiError, ApiResult, AppState,
 };
 use crate::collectors::cycle_overlay::OverlayPoint;
 use crate::models::cycle_overlay::CycleOverlayPoint;
 
+// ── Projection model (v0.6.0, single source of truth, OR-CYCLE-9) ──────────────
+
+/// Selectable `{model}` values for the data endpoint (REQ-CYCLE-090/091).
+///
+/// `real` is never a selectable model — it is the always-included baseline
+/// (REQ-CYCLE-092/093/097).
+// @MX:ANCHOR: [AUTO] ProjectionModel — single source of truth for {model} validation + discovery
+// @MX:REASON: fan_in >= 3: data-handler validation (before dispatch), discovery handler, and the
+//             SQL-bind string consumed by `list_overlay_for_model`/`project_as_of_for_model`.
+//             Keeping the two valid model strings declared once prevents the data-path
+//             validation and the discovery list from drifting (REQ-CYCLE-090/096).
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-094 REQ-CYCLE-096
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionModel {
+    /// Bitbo-style cycle-repeat replay projection (no confidence bands).
+    Replay,
+    /// Power-law + damped-cycle + mean-reversion composite projection (P10/P90 bands).
+    Composite,
+}
+
+impl ProjectionModel {
+    /// The `{model}` path/`projection_model` SQL-bind string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectionModel::Replay => "replay",
+            ProjectionModel::Composite => "composite",
+        }
+    }
+
+    /// Human-readable description for the discovery payload (REQ-CYCLE-096).
+    fn description(self) -> &'static str {
+        match self {
+            ProjectionModel::Replay => {
+                "Bitbo-style cycle-repeat replay: replays the trailing one-halving-cycle's \
+                 actual daily returns forward from today, scaled to today's real price. No \
+                 confidence bands (price_low/price_high are always null)."
+            }
+            ProjectionModel::Composite => {
+                "Composite projection: power-law trend spine + damped halving-cycle phase \
+                 component + mean-reversion continuity term. price is the P50 path; \
+                 price_low/price_high carry P10/P90 confidence bands."
+            }
+        }
+    }
+
+    /// `true` for the composite model, `false` for replay (REQ-CYCLE-096).
+    fn has_confidence_bands(self) -> bool {
+        matches!(self, ProjectionModel::Composite)
+    }
+
+    /// All selectable models, in discovery-list order (REQ-CYCLE-095/096).
+    fn all() -> [ProjectionModel; 2] {
+        [ProjectionModel::Replay, ProjectionModel::Composite]
+    }
+}
+
+impl std::str::FromStr for ProjectionModel {
+    type Err = ApiError;
+
+    /// Case-sensitive, exact match only. Any value other than `"replay"`/`"composite"`
+    /// (including `"real"`) is a 400 (REQ-CYCLE-093/094).
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "replay" => Ok(ProjectionModel::Replay),
+            "composite" => Ok(ProjectionModel::Composite),
+            other => Err(ApiError::BadRequest(format!(
+                "unknown cycle-projection model '{other}'; expected 'replay' or 'composite'"
+            ))),
+        }
+    }
+}
+
 // ── Query parameter types ─────────────────────────────────────────────────────
 
-/// Query parameters for `GET /v1/coins/{coin_id}/cycle-overlay` (SPEC-CYCLE-001).
+/// Query parameters for `GET /v1/coins/{coin_id}/cycle-projection/{model}` (SPEC-CYCLE-001).
 #[derive(Debug, Deserialize)]
 pub struct ListCycleOverlayParams {
     /// Optional: quote currency filter; defaults to `usd` (REQ-CYCLE-052).
@@ -46,41 +123,54 @@ pub struct ListCycleOverlayParams {
     pub as_of: Option<DateTime<Utc>>,
 }
 
-// ── Handler ───────────────────────────────────────────────────────────────────
+// ── Handlers (v0.6.0) ────────────────────────────────────────────────────────
 
-/// `GET /v1/coins/{coin_id}/cycle-overlay` — keyset-paginated cycle-overlay read (REQ-CYCLE-050),
-/// serving the Bitbo-style cycle-repeat REPLAY projection (no confidence bands; `price_low`/
-/// `price_high` are always null on projected points from this endpoint).
+/// `GET /v1/coins/{coin_id}/cycle-projection/{model}` — keyset-paginated cycle-overlay data
+/// read (REQ-CYCLE-090/091), `{model} ∈ {replay, composite}`.
 ///
-/// Ordered `(cycle_number ASC, days_since_halving ASC)`. An unknown/non-target coin, or a
-/// coin with no computed overlay, yields HTTP 200 with an empty page — NOT 404 (REQ-CYCLE-052).
-pub async fn list_cycle_overlay(
-    state: State<AppState>,
-    coin_id: Path<String>,
-    params: Query<ListCycleOverlayParams>,
+/// `{model}` is validated BEFORE dispatch (REQ-CYCLE-094): any value other than `replay`/
+/// `composite` (including `real`) returns HTTP 400 without querying the database or invoking
+/// any projection function, so `project_as_of_for_model`'s `unreachable!()` fallback is never
+/// reached through this path. Ordered `(cycle_number ASC, days_since_halving ASC)`. An
+/// unknown/non-target coin, or a coin with no computed overlay, yields HTTP 200 with an empty
+/// page — NOT 404 (REQ-CYCLE-052/091).
+pub async fn list_cycle_projection_data(
+    State(state): State<AppState>,
+    Path((coin_id, model)): Path<(String, String)>,
+    Query(params): Query<ListCycleOverlayParams>,
 ) -> ApiResult<impl IntoResponse> {
-    list_overlay_for_model(state, coin_id, params, "replay").await
+    let model: ProjectionModel = model.parse()?;
+    list_overlay_for_model(State(state), Path(coin_id), Query(params), model.as_str()).await
 }
 
-/// `GET /v1/coins/{coin_id}/cycle-projection` — keyset-paginated cycle-overlay read serving the
-/// COMPOSITE forward-projection model (power-law spine + damped phase-conditioned cycle
-/// component + mean-reversion continuity term; `price` is the P50 path, `price_low`/`price_high`
-/// carry the P10/P90 confidence bands).
-///
-/// Same ordering, pagination, and empty-page-not-404 semantics as `list_cycle_overlay`
-/// (REQ-CYCLE-050/051/052).
-pub async fn list_cycle_projection(
-    state: State<AppState>,
-    coin_id: Path<String>,
-    params: Query<ListCycleOverlayParams>,
-) -> ApiResult<impl IntoResponse> {
-    list_overlay_for_model(state, coin_id, params, "composite").await
+/// `GET /v1/coins/{coin_id}/cycle-projection` (base path, no `{model}`) — model-discovery
+/// endpoint (REQ-CYCLE-095/096/097). Returns `{ "models": [...] }` listing the two
+/// selectable models; `real` (the always-included baseline) is never listed. The response is
+/// coin-agnostic — the same two-model list is returned for any `coin_id`.
+pub async fn list_cycle_projection_models() -> impl IntoResponse {
+    let models = ProjectionModel::all()
+        .into_iter()
+        .map(|m| CycleProjectionModelDto {
+            id: m.as_str().to_string(),
+            description: m.description().to_string(),
+            has_confidence_bands: m.has_confidence_bands(),
+        })
+        .collect();
+    Json(CycleProjectionModelsDto { models })
 }
 
-/// Shared read implementation for both cycle-overlay endpoints: identical limit validation,
-/// cursor decode, `vs_currency` default, pagination, and DTO mapping — the only difference
-/// between callers is which projected `projection_model` is included alongside the always-real
-/// points ('real' is never itself a query parameter; it is unconditionally included).
+/// Shared read implementation for the cycle-overlay data endpoint: identical limit validation,
+/// cursor decode, `vs_currency` default, pagination, and DTO mapping for both selectable
+/// `{model}` values — the only difference between callers is which projected
+/// `projection_model` is included alongside the always-real points ('real' is never itself a
+/// selectable model; it is unconditionally included, REQ-CYCLE-092).
+// @MX:ANCHOR: [AUTO] list_overlay_for_model — single fan-in point for {model} dispatch (v0.6.0)
+// @MX:REASON: fan_in >= 3: `list_cycle_projection_data` (replay/composite dispatch) plus every
+//             as-of/table-read code path within this module. After v0.6.0 this is the one place
+//             the `Page<CycleOverlayPointDto>` + keyset + `projection_model IN ('real', $model)`
+//             contract lives, which is what makes the endpoint consolidation lossless
+//             (REQ-CYCLE-090/091/092).
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-090 REQ-CYCLE-091 REQ-CYCLE-092
 async fn list_overlay_for_model(
     State(state): State<AppState>,
     Path(coin_id): Path<String>,
@@ -201,6 +291,15 @@ async fn compute_as_of_page(
 /// projection function matching `projected_model`, preserving the BTC/USD-only
 /// calibration-anchor rule for the composite model. Extracted from `compute_as_of_page` so the
 /// dispatch/anchor-selection logic is unit-testable without a database (Scenario 27).
+// @MX:WARN: [AUTO] {model} validation MUST happen before this dispatch match (v0.6.0)
+// @MX:REASON: `projected_model` reaching this match unvalidated (e.g. "real" or any other
+//             string) falls through to `unreachable!()`, which panics -> HTTP 500 instead of
+//             the required HTTP 400 (REQ-CYCLE-093/094). The only caller,
+//             `compute_as_of_page`, is only ever invoked with a `ProjectionModel::as_str()`
+//             value produced after `list_cycle_projection_data` has already validated the
+//             `{model}` path segment via `ProjectionModel::from_str` — never reachable through
+//             an unvalidated path parameter.
+// @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-093 REQ-CYCLE-094
 fn project_as_of_for_model(
     projected_model: &str,
     daily: &[(chrono::NaiveDate, rust_decimal::Decimal)],
@@ -218,7 +317,7 @@ fn project_as_of_for_model(
             let use_btc_anchors = coin_id == "bitcoin" && vs_currency == "usd";
             project_composite(daily, real, use_btc_anchors)
         }
-        other => unreachable!("unsupported projection model '{other}'"),
+        other => unreachable!("unsupported projection model '{other}' reached dispatch — {{model}} validation boundary was bypassed"),
     }
 }
 
@@ -371,7 +470,7 @@ mod tests {
     async fn list_cycle_overlay_invalid_cursor_returns_400() {
         let server = test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("cursor", "NOT_VALID!!!")
             .await;
         assert_eq!(resp.status_code(), 400);
@@ -382,7 +481,7 @@ mod tests {
     async fn list_cycle_overlay_limit_too_large_returns_400() {
         let server = test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("limit", "9999999")
             .await;
         assert_eq!(resp.status_code(), 400);
@@ -392,7 +491,7 @@ mod tests {
     async fn list_cycle_overlay_zero_limit_returns_400() {
         let server = test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("limit", "0")
             .await;
         assert_eq!(resp.status_code(), 400);
@@ -414,6 +513,135 @@ mod tests {
             .unwrap_or("usd")
             .to_lowercase();
         assert_eq!(resolved, "usd");
+    }
+
+    // ── v0.6.0: {model} validation, discovery, and route-fold tests ───────────
+
+    // Scenario 30 (REQ-CYCLE-093/094): ProjectionModel::from_str rejects "real" and any other
+    // unknown value with a BadRequest, never a panic — the pure unit-level guard for the
+    // dispatch boundary this parses ahead of.
+    #[test]
+    fn projection_model_from_str_rejects_real_and_unknown_values() {
+        use std::str::FromStr;
+
+        for bad in ["real", "bogus", "Replay", "COMPOSITE", "", "replay "] {
+            let result = ProjectionModel::from_str(bad);
+            assert!(
+                matches!(result, Err(ApiError::BadRequest(_))),
+                "expected BadRequest for model '{bad}', got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_model_from_str_accepts_replay_and_composite() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            ProjectionModel::from_str("replay").unwrap(),
+            ProjectionModel::Replay
+        );
+        assert_eq!(
+            ProjectionModel::from_str("composite").unwrap(),
+            ProjectionModel::Composite
+        );
+    }
+
+    // REQ-CYCLE-096: has_confidence_bands is false for replay, true for composite.
+    #[test]
+    fn projection_model_has_confidence_bands_matches_spec() {
+        assert!(!ProjectionModel::Replay.has_confidence_bands());
+        assert!(ProjectionModel::Composite.has_confidence_bands());
+    }
+
+    // Scenario 30 (REQ-CYCLE-093/094): unknown {model} and "real" on the data endpoint → 400,
+    // no dispatch (no panic, no 500).
+    #[tokio::test]
+    async fn list_cycle_projection_data_unknown_model_returns_400() {
+        let server = test_server();
+        for model in ["real", "bogus", "Replay", "COMPOSITE"] {
+            let resp = server
+                .get(&format!("/v1/coins/bitcoin/cycle-projection/{model}"))
+                .await;
+            assert_eq!(
+                resp.status_code(),
+                400,
+                "model '{model}' must return 400, not a panic/500"
+            );
+        }
+    }
+
+    // Scenario 28 (REQ-CYCLE-090): the replay data route accepts requests without error and
+    // returns the standard Page shape. Requires a live DB (the no-`as_of` path reads the
+    // `cycle_overlay_points` table); see `db_scenario_28_replay_route_is_wired` below for the
+    // DB-gated version. This one is covered without a DB via
+    // `list_cycle_projection_data_unknown_model_returns_400` and the discovery tests above.
+
+    // Scenario 31 (REQ-CYCLE-095/096/097): discovery returns exactly two models with the
+    // correct has_confidence_bands, and never lists "real".
+    #[tokio::test]
+    async fn list_cycle_projection_models_returns_two_models_no_real() {
+        let server = test_server();
+        let resp = server.get("/v1/coins/bitcoin/cycle-projection").await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        let models = body["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2, "discovery must list exactly two models");
+
+        let replay = models
+            .iter()
+            .find(|m| m["id"] == "replay")
+            .expect("replay entry present");
+        assert_eq!(replay["has_confidence_bands"], false);
+        assert!(!replay["description"].as_str().unwrap_or("").is_empty());
+
+        let composite = models
+            .iter()
+            .find(|m| m["id"] == "composite")
+            .expect("composite entry present");
+        assert_eq!(composite["has_confidence_bands"], true);
+        assert!(!composite["description"].as_str().unwrap_or("").is_empty());
+
+        assert!(
+            models.iter().all(|m| m["id"] != "real"),
+            "discovery must never list 'real' as a selectable model"
+        );
+    }
+
+    // Scenario 31: discovery is coin-agnostic — same two-model list for any coin_id.
+    #[tokio::test]
+    async fn list_cycle_projection_models_is_coin_agnostic() {
+        let server = test_server();
+        let resp_btc = server.get("/v1/coins/bitcoin/cycle-projection").await;
+        let resp_eth = server.get("/v1/coins/ethereum/cycle-projection").await;
+        assert_eq!(resp_btc.status_code(), 200);
+        assert_eq!(resp_eth.status_code(), 200);
+        let body_btc: serde_json::Value = resp_btc.json();
+        let body_eth: serde_json::Value = resp_eth.json();
+        assert_eq!(body_btc, body_eth);
+    }
+
+    // Scenario 32 (REQ-CYCLE-098): the old `/cycle-overlay` route is gone — 404, no alias.
+    #[tokio::test]
+    async fn old_cycle_overlay_route_returns_404() {
+        let server = test_server();
+        let resp = server.get("/v1/coins/bitcoin/cycle-overlay").await;
+        assert_eq!(resp.status_code(), 404);
+    }
+
+    // Scenario 32 (REQ-CYCLE-098): the base `/cycle-projection` path is discovery, not data —
+    // it must NOT return a `Page`-shaped body (no `items`/`next_cursor` keys).
+    #[tokio::test]
+    async fn base_cycle_projection_path_is_discovery_not_data() {
+        let server = test_server();
+        let resp = server.get("/v1/coins/bitcoin/cycle-projection").await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body.get("items").is_none() && body.get("next_cursor").is_none(),
+            "base cycle-projection path must return the discovery object, not a data Page"
+        );
+        assert!(body.get("models").is_some());
     }
 
     // ── DB-gated tests (require live DATABASE_URL) ────────────────────────────
@@ -439,12 +667,41 @@ mod tests {
         TestServer::new(crate::api::build_api_router(state))
     }
 
+    // Scenario 28 (REQ-CYCLE-090): the replay data route is wired end-to-end against a live DB
+    // and returns the standard Page shape.
+    #[tokio::test]
+    #[ignore]
+    async fn db_scenario_28_replay_route_is_wired() {
+        let server = db_test_server();
+        let resp = server
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert!(body["items"].is_array());
+    }
+
+    // Scenario 29 (REQ-CYCLE-090): the composite data route is likewise wired.
+    #[tokio::test]
+    #[ignore]
+    async fn db_scenario_29_composite_route_is_wired() {
+        let server = db_test_server();
+        let resp = server
+            .get("/v1/coins/bitcoin/cycle-projection/composite")
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert!(body["items"].is_array());
+    }
+
     // Scenario 15 (REQ-CYCLE-052): unknown/non-target coin → 200 empty page, not 404.
     #[tokio::test]
     #[ignore]
     async fn db_scenario_15_unknown_coin_returns_200_empty() {
         let server = db_test_server();
-        let resp = server.get("/v1/coins/ethereum/cycle-overlay").await;
+        let resp = server
+            .get("/v1/coins/ethereum/cycle-projection/replay")
+            .await;
         assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value = resp.json();
         assert_eq!(body["items"], serde_json::json!([]));
@@ -457,7 +714,7 @@ mod tests {
     async fn db_scenario_14_keyset_pagination_round_trip() {
         let server = db_test_server();
         let resp1 = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("limit", "2")
             .await;
         assert_eq!(resp1.status_code(), 200);
@@ -471,7 +728,7 @@ mod tests {
             .expect("next_cursor must be non-null for a 2-item page");
 
         let resp2 = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("limit", "2")
             .add_query_param("cursor", cursor)
             .await;
@@ -503,7 +760,7 @@ mod tests {
     async fn db_scenario_17_cycle_filter_scopes_results() {
         let server = db_test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("vs_currency", "usd")
             .add_query_param("cycle", "3")
             .await;
@@ -520,7 +777,9 @@ mod tests {
     #[ignore]
     async fn db_scenario_6_both_baselines_present() {
         let server = db_test_server();
-        let resp = server.get("/v1/coins/bitcoin/cycle-overlay").await;
+        let resp = server
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
+            .await;
         assert_eq!(resp.status_code(), 200);
         let body: serde_json::Value = resp.json();
         let items = body["items"].as_array().expect("items array");
@@ -831,7 +1090,7 @@ mod tests {
     async fn db_scenario_20_as_of_before_any_data_returns_200_empty() {
         let server = db_test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("as_of", "2000-01-01T00:00:00Z")
             .await;
         assert_eq!(resp.status_code(), 200);
@@ -845,13 +1104,15 @@ mod tests {
     #[ignore]
     async fn db_scenario_21_as_of_at_or_after_latest_equals_no_as_of() {
         let server = db_test_server();
-        let resp_plain = server.get("/v1/coins/bitcoin/cycle-overlay").await;
+        let resp_plain = server
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
+            .await;
         assert_eq!(resp_plain.status_code(), 200);
         let body_plain: serde_json::Value = resp_plain.json();
 
         let far_future = "2099-01-01T00:00:00Z";
         let resp_as_of = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("as_of", far_future)
             .await;
         assert_eq!(resp_as_of.status_code(), 200);
@@ -869,13 +1130,13 @@ mod tests {
     async fn list_cycle_overlay_and_projection_invalid_as_of_returns_400() {
         let server = test_server();
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("as_of", "not-a-timestamp")
             .await;
         assert_eq!(resp.status_code(), 400);
 
         let resp2 = server
-            .get("/v1/coins/bitcoin/cycle-projection")
+            .get("/v1/coins/bitcoin/cycle-projection/composite")
             .add_query_param("as_of", "not-a-timestamp")
             .await;
         assert_eq!(resp2.status_code(), 400);
@@ -887,7 +1148,9 @@ mod tests {
     #[ignore]
     async fn db_scenario_26_no_as_of_served_from_table() {
         let server = db_test_server();
-        let resp = server.get("/v1/coins/bitcoin/cycle-overlay").await;
+        let resp = server
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
+            .await;
         assert_eq!(resp.status_code(), 200);
         // No assertion beyond 200 + shape here: Scenarios 14-17 (existing tests in this file)
         // already cover the table-served contract; this test exists to anchor the "unchanged"
@@ -929,7 +1192,7 @@ mod tests {
         }
 
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-overlay")
+            .get("/v1/coins/bitcoin/cycle-projection/replay")
             .add_query_param("as_of", cutoff.to_rfc3339())
             .add_query_param("limit", "100")
             .await;
@@ -985,7 +1248,7 @@ mod tests {
         // BTC/USD: composite dispatch enables calibration anchors (REQ-CYCLE-082) — every
         // projected item must carry ordered price_low <= price <= price_high (REQ-CYCLE-081).
         let resp = server
-            .get("/v1/coins/bitcoin/cycle-projection")
+            .get("/v1/coins/bitcoin/cycle-projection/composite")
             .add_query_param("as_of", cutoff.to_rfc3339())
             .add_query_param("limit", "100")
             .await;
@@ -1019,14 +1282,14 @@ mod tests {
         // Non-BTC/USD pair: composite dispatch disables calibration anchors, but the route must
         // still return 200 without error (empty or non-anchored), never a panic/500.
         let resp_non_btc = server
-            .get("/v1/coins/ethereum/cycle-projection")
+            .get("/v1/coins/ethereum/cycle-projection/composite")
             .add_query_param("as_of", cutoff.to_rfc3339())
             .add_query_param("vs_currency", "usd")
             .await;
         assert_eq!(resp_non_btc.status_code(), 200);
 
         let resp_non_usd = server
-            .get("/v1/coins/bitcoin/cycle-projection")
+            .get("/v1/coins/bitcoin/cycle-projection/composite")
             .add_query_param("as_of", cutoff.to_rfc3339())
             .add_query_param("vs_currency", "eur")
             .await;

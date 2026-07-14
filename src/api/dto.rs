@@ -339,6 +339,28 @@ impl From<CycleOverlayPoint> for CycleOverlayPointDto {
     }
 }
 
+// ── Cycle-projection model discovery DTOs (SPEC-CYCLE-001 v0.6.0, REQ-CYCLE-095/096/097) ──
+
+/// One selectable projection model entry in the discovery response.
+#[derive(Debug, Serialize)]
+pub struct CycleProjectionModelDto {
+    /// The `{model}` path value (`"replay"` or `"composite"`).
+    pub id: String,
+    /// Human-readable description of the model.
+    pub description: String,
+    /// `true` for `composite` (P10/P90 bands), `false` for `replay` (no bands).
+    pub has_confidence_bands: bool,
+}
+
+/// `GET /v1/coins/{coin_id}/cycle-projection` (base path) response body (REQ-CYCLE-095/096).
+///
+/// Lists exactly two selectable models; `real` (the always-included baseline of the data
+/// endpoint) is never listed here (REQ-CYCLE-097).
+#[derive(Debug, Serialize)]
+pub struct CycleProjectionModelsDto {
+    pub models: Vec<CycleProjectionModelDto>,
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -528,5 +550,35 @@ mod tests {
         point.halving_baseline_approximate = true;
         let dto = CycleOverlayPointDto::from(point);
         assert!(dto.halving_baseline_approximate);
+    }
+
+    // ── CycleProjectionModelsDto (SPEC-CYCLE-001 v0.6.0, REQ-CYCLE-095/096/097) ─────────────
+
+    // Scenario 31 (REQ-CYCLE-096/097): discovery DTO serializes both models with the
+    // correct has_confidence_bands and never a "real" entry.
+    #[test]
+    fn cycle_projection_models_dto_serializes_two_models_no_real() {
+        let dto = CycleProjectionModelsDto {
+            models: vec![
+                CycleProjectionModelDto {
+                    id: "replay".to_string(),
+                    description: "replay model".to_string(),
+                    has_confidence_bands: false,
+                },
+                CycleProjectionModelDto {
+                    id: "composite".to_string(),
+                    description: "composite model".to_string(),
+                    has_confidence_bands: true,
+                },
+            ],
+        };
+        let json = serde_json::to_value(&dto).unwrap();
+        let models = json["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "replay");
+        assert_eq!(models[0]["has_confidence_bands"], false);
+        assert_eq!(models[1]["id"], "composite");
+        assert_eq!(models[1]["has_confidence_bands"], true);
+        assert!(models.iter().all(|m| m["id"] != "real"));
     }
 }

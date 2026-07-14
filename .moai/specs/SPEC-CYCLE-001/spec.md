@@ -1,9 +1,9 @@
 ---
 id: SPEC-CYCLE-001
-version: 0.5.0
-status: completed
+version: 0.6.0
+status: in-progress
 created: 2026-07-04
-updated: 2026-07-13
+updated: 2026-07-14
 author: dholm
 priority: medium
 issue_number: 0
@@ -32,6 +32,40 @@ recomputation is [SPEC-SCHED-001](../SPEC-SCHED-001/spec.md) (collection-queue w
 
 ## HISTORY
 
+- 2026-07-14 (v0.6.0): **Folded the two cycle read endpoints into a single parameterized data
+  endpoint plus a base-path discovery endpoint — a deliberate NOT-backwards-compatible route
+  refactor** (REQ-CYCLE-090..099). The former `GET /v1/coins/{coin_id}/cycle-overlay` (replay) and
+  `GET /v1/coins/{coin_id}/cycle-projection` (composite, as a *data* endpoint) are replaced by a
+  single `GET /v1/coins/{coin_id}/cycle-projection/{model}` with `{model} ∈ {replay, composite}`.
+  Both former handlers already delegate to one shared impl —
+  `list_overlay_for_model(state, coin_id, params, projected_model)` (`src/api/cycle_overlay.rs:84`):
+  `list_cycle_overlay` (`:57`) passed `"replay"`, `list_cycle_projection` (`:72`) passed
+  `"composite"` — so lifting that string into the URL leaves the response DTO
+  (`Json<Page<CycleOverlayPointDto>>`, `src/api/dto.rs:294`), the keyset order
+  `(cycle_number ASC, days_since_halving ASC)`, the `vs_currency`/`cycle`/`cursor`/`limit`/`as_of`
+  parameters, the always-included `real` baseline (`projection_model IN ('real', $model)`,
+  `src/api/cycle_overlay.rs:123`), and the composite BTC/USD anchor rule under `as_of` all preserved
+  **verbatim** under the new path. Only the route PATHS and OpenAPI operationIds of REQ-CYCLE-050 /
+  054 / 070 / 084 are superseded; every DTO, pagination, normalization, and `as_of` CONTRACT of
+  REQ-CYCLE-050..084 is preserved. The base path `GET /v1/coins/{coin_id}/cycle-projection` (no
+  `{model}`) is repurposed into a **discovery endpoint** returning per-model metadata — `id`,
+  human-readable `description`, and `has_confidence_bands` (`true` for composite, `false` for replay)
+  — so clients enumerate valid `{model}` values dynamically instead of hardcoding them. `real`
+  remains the always-included historical baseline inside every data response, is **not** a selectable
+  `{model}`, and is **not** listed in discovery: `.../cycle-projection/real` is an unknown model →
+  HTTP 400. Any `{model}` other than `replay`/`composite` returns HTTP 400 with validation performed
+  **before** the model-dispatch match, so the `unreachable!()` in `project_as_of_for_model`
+  (`src/api/cycle_overlay.rs:221`) is never reached through the path parameter (it must become a real
+  400). `GET /v1/coins/{coin_id}/cycle-overlay` is removed entirely — no alias, no redirect → HTTP
+  404. The static OpenAPI YAML `api/crypto-collector.yaml` drops the two former operations
+  (`listCycleOverlay` at ~L431, the old data `listCycleProjection` at ~L484) in favour of the
+  parameterized data operation (`{model}` documented as an enum `[replay, composite]`) plus the
+  discovery operation, and the doc-parity tests in `src/api/mod.rs`
+  (`openapi_yaml_contains_all_operation_ids` `:389`, `openapi_yaml_documents_as_of_on_both_cycle_endpoints`
+  `:424`, `openapi_yaml_contains_key_schemas` `:456`) are updated to the new operationId/path set.
+  No projection math, no DB migration, no `cycle_overlay_points` schema or content change, and no
+  normalization/`as_of` semantic change — v0.6.0 is purely an HTTP-surface reshape over the existing
+  shared implementation. No REQ-CYCLE-001..049 requirement is affected.
 - 2026-07-13 (v0.5.0): Added an optional **point-in-time (`as_of`) read capability** to both
   cycle read endpoints — `GET /v1/coins/{coin_id}/cycle-overlay` and
   `GET /v1/coins/{coin_id}/cycle-projection` (REQ-CYCLE-070..084). When a client supplies
@@ -175,6 +209,17 @@ Confirmed with the user; encoded here verbatim in intent.
   point. Missing intra-cycle days yield no point; the `days_since_halving` sequence is therefore
   **sparse / non-contiguous** where data is missing. Nothing is fabricated or gap-filled
   (consistent with SPEC-API-003 REQ-API-211). (OR-CYCLE-3)
+- **D10 — Discovery lives on the base data path (v0.6.0).** The model-discovery response is served
+  from `GET /v1/coins/{coin_id}/cycle-projection` (the base path, no `{model}`), keeping discovery
+  and data in the same coin-scoped URL subtree. The data endpoint is
+  `GET /v1/coins/{coin_id}/cycle-projection/{model}`. Confirmed with the user.
+- **D11 — `{model}` accepts only `replay` and `composite` (v0.6.0).** `real` is the always-included
+  baseline, never a selectable model; it is absent from discovery and `.../cycle-projection/real`
+  is a 400. Any other `{model}` value is a 400, validated before dispatch. Confirmed with the user.
+- **D12 — Deliberately NOT backwards compatible (v0.6.0).** The two old routes are removed with no
+  alias or redirect: `.../cycle-overlay` → 404, and the base `.../cycle-projection` changes shape
+  from composite data to the discovery list. Clients migrate to the `{model}` sub-paths. Confirmed
+  with the user. (OR-CYCLE-7/8)
 
 ---
 
@@ -247,6 +292,40 @@ after `T`; the actuals for the comparison come from the client's separate no-`as
 path is untouched). Nothing is persisted or cached: the as-of result is a deterministic function of
 `(coin_id, vs_currency, as_of)` and the stored candles. These two endpoints consume **only daily
 candle closes** — spot quotes never factor in — so the `as_of` cutoff applies to candle `ts` only.
+
+### Unified parameterized cycle-projection endpoint + discovery (v0.6.0)
+
+The two cycle read routes are consolidated behind one coin-scoped URL subtree. They already share a
+single implementation — `list_overlay_for_model(state, coin_id, params, projected_model)`
+(`src/api/cycle_overlay.rs:84`) — differing only in the `projected_model` string the two thin
+handlers pass (`list_cycle_overlay` → `"replay"`, `list_cycle_projection` → `"composite"`). v0.6.0
+lifts that string out of the handler and into the URL:
+
+- **Data endpoint** — `GET /v1/coins/{coin_id}/cycle-projection/{model}`, `{model} ∈ {replay,
+  composite}`. Returns the identical `Page<CycleOverlayPointDto>` the corresponding pre-v0.6.0
+  endpoint returned: the always-included `real` baseline plus the selected projection, ordered
+  `(cycle_number ASC, days_since_halving ASC)`, with the same `vs_currency` (default `usd`), `cycle`,
+  `cursor`, `limit`, and `as_of` parameters and the same empty-page-not-404 / 400-on-bad-cursor-or-limit
+  behaviour. `replay` maps to the Bitbo-style replay projection (null `price_low`/`price_high`);
+  `composite` maps to the composite model (P10/P90 bands in `price_low`/`price_high`).
+- **Discovery endpoint** — `GET /v1/coins/{coin_id}/cycle-projection` (the base path, no `{model}`
+  segment). Returns a metadata object listing the two selectable models — each `{ id, description,
+  has_confidence_bands }` — so a client can enumerate valid `{model}` values without hardcoding them.
+  Discovery stays inside the same coin-scoped URL tree as the data endpoint (D10).
+- **`real` is a baseline, never a selectable model.** Every data response still unconditionally
+  includes the stored `real` projection-model points (`projection_model IN ('real', $model)`); `real`
+  is not an accepted `{model}` and is absent from discovery, so `.../cycle-projection/real` is an
+  unknown model → HTTP 400.
+- **Validation before dispatch.** `{model}` is validated against `{replay, composite}` *before* the
+  model-dispatch match (`project_as_of_for_model`, `src/api/cycle_overlay.rs:204`); any other value is
+  a 400, so the existing `unreachable!()` is never reached through the path parameter.
+
+This is intentionally breaking: `.../cycle-overlay` is removed (→ 404) and the base
+`.../cycle-projection` no longer returns composite data (it now returns the model list). Clients
+migrate by calling `.../cycle-projection/replay` (formerly `.../cycle-overlay`) and
+`.../cycle-projection/composite` (formerly the base `.../cycle-projection`). No projection math, no
+DB schema, and no stored-table content change — this is purely an HTTP-surface reshape over the
+existing shared read implementation.
 
 ---
 
@@ -478,6 +557,73 @@ candle closes** — spot quotes never factor in — so the `as_of` cutoff applie
   `format: date-time`) to both the `listCycleOverlay` and `listCycleProjection` operations and keep
   it in parity via the doc-parity test.
 
+### Unified parameterized cycle-projection endpoint + discovery (v0.6.0, supersedes the v0.1.0/v0.4.0 route surface)
+
+- **REQ-CYCLE-090** (Event-Driven): When a client requests
+  `GET /v1/coins/{coin_id}/cycle-projection/{model}` with `{model}` equal to `replay` or `composite`,
+  the system shall return a keyset-paginated `Page<CycleOverlayPointDto>` identical in shape,
+  ordering, and content to what the pre-v0.6.0 endpoint for that model returned — the always-included
+  `real` baseline plus the selected projection — by dispatching to the existing shared
+  `list_overlay_for_model(...)` with the corresponding projection-model string (`replay` → `"replay"`,
+  `composite` → `"composite"`). The DTO, keyset cursor, `next_cursor`, and `(cycle_number ASC,
+  days_since_halving ASC)` ordering contracts of REQ-CYCLE-050/051 are preserved verbatim under the
+  new path.
+- **REQ-CYCLE-091** (Ubiquitous): The data endpoint shall carry the existing query parameters
+  unchanged — `vs_currency` (default `usd`), the optional `cycle` filter, `cursor`, `limit`, and the
+  optional `as_of` point-in-time cutoff — preserving every REQ-CYCLE-050..084 read semantic per
+  selected model: empty-page-not-404 for unknown/non-target coins (REQ-CYCLE-052), HTTP 400 on an
+  undecodable cursor or out-of-range limit (REQ-CYCLE-053), the on-the-fly `as_of` computation with
+  its OOM-safe daily loader (REQ-CYCLE-070..081), and the composite `use_btc_anchors = (bitcoin &&
+  usd)` calibration rule under `as_of` (REQ-CYCLE-082).
+- **REQ-CYCLE-092** (Ubiquitous): The system shall unconditionally include the stored `real`
+  projection-model points as the baseline of every data response (`projection_model IN ('real',
+  $model)`) for both `replay` and `composite`, with or without `as_of`, exactly as before the
+  refactor — the selected `{model}` only adds its projection alongside the unchanged `real` baseline.
+- **REQ-CYCLE-093** (Unwanted): The system shall not accept `real` as a `{model}` path value; if a
+  client requests `GET /v1/coins/{coin_id}/cycle-projection/real`, then the system shall respond HTTP
+  400 (unknown model, per REQ-CYCLE-094), and `real` shall not appear in the discovery response
+  (REQ-CYCLE-097).
+- **REQ-CYCLE-094** (Unwanted): If `{model}` is any value other than `replay` or `composite`, then
+  the system shall respond HTTP 400 with a clear error body consistent with the existing SPEC-API-001
+  error model (the same 400 shape as the invalid-cursor/limit case of REQ-CYCLE-053), and shall not
+  query the database and not invoke any projection function; `{model}` validation shall occur before
+  the model-dispatch match, so the `unreachable!()` in `project_as_of_for_model`
+  (`src/api/cycle_overlay.rs`) is never reached through the path parameter.
+- **REQ-CYCLE-095** (Event-Driven): When a client requests `GET /v1/coins/{coin_id}/cycle-projection`
+  (the base path, no `{model}` segment), the system shall respond HTTP 200 with a model-discovery
+  payload enumerating the selectable projection models, so a client can discover valid `{model}`
+  values dynamically rather than hardcoding them (D10).
+- **REQ-CYCLE-096** (Ubiquitous): The discovery payload shall be a JSON object `{ "models": [ … ] }`
+  whose `models` list contains exactly two entries, one per selectable model, each carrying `id` (the
+  `{model}` path value — `"replay"` or `"composite"`), a human-readable `description`, and
+  `has_confidence_bands` (boolean), with `has_confidence_bands = false` for `replay` and
+  `has_confidence_bands = true` for `composite`.
+- **REQ-CYCLE-097** (Unwanted): The discovery payload shall not list the `real` baseline as a model
+  and shall not list any value that is not an accepted `{model}`; `real` is exposed only as the
+  always-present baseline inside data responses (REQ-CYCLE-092), never as a selectable model (D11).
+- **REQ-CYCLE-098** (Unwanted): The system shall remove the former
+  `GET /v1/coins/{coin_id}/cycle-overlay` route entirely, with no backward-compatible alias or
+  redirect, so a request to that path returns HTTP 404 (route not registered); and the base
+  `GET /v1/coins/{coin_id}/cycle-projection` shall no longer return composite overlay data — it
+  returns the discovery payload (REQ-CYCLE-095). This is a deliberate breaking change (D12): clients
+  migrate to `.../cycle-projection/replay` (formerly `.../cycle-overlay`) and
+  `.../cycle-projection/composite` (formerly the base `.../cycle-projection`). The route paths and
+  operationIds of REQ-CYCLE-050/054/070/084 are superseded for the HTTP surface only; their DTO,
+  pagination, normalization, and `as_of` contracts are preserved verbatim under the new paths.
+- **REQ-CYCLE-099** (Optional): Where the OpenAPI document `api/crypto-collector.yaml` is published
+  (REQ-CYCLE-054/084), the system shall replace the two former operations (`listCycleOverlay`, and
+  the old data `listCycleProjection`) with (a) a parameterized data operation on
+  `/coins/{coin_id}/cycle-projection/{model}` documenting `{model}` as a required path parameter with
+  enum `[replay, composite]`, carrying over the `vs_currency`/`cycle`/`cursor`/`limit`/`as_of`
+  parameters and the `CycleOverlayPointPage` response schema, and (b) a discovery operation on
+  `/coins/{coin_id}/cycle-projection` with a new response schema for the model list; the former
+  `/coins/{coin_id}/cycle-overlay` path shall be deleted from the document. The doc-parity tests in
+  `src/api/mod.rs` — `openapi_yaml_contains_all_operation_ids` (the operationId set),
+  `openapi_yaml_documents_as_of_on_both_cycle_endpoints` (the `as_of` presence check, which shall be
+  updated to check the parameterized data path since `as_of` now applies to one data endpoint, not
+  two), and `openapi_yaml_contains_key_schemas` — shall be updated to the new operationId/path/schema
+  set and kept green (OR-CYCLE-7).
+
 ## Exclusions (What NOT to Build)
 
 - **No Bitbo scraping / no Turnstile bypass** — the "Cycle Repeat" data is derived locally from
@@ -512,6 +658,20 @@ candle closes** — spot quotes never factor in — so the `as_of` cutoff applie
   (REQ-CYCLE-073).
 - **No quotes in the cycle endpoints** — even though the collector stores spot quotes, these two
   endpoints ignore them entirely; `as_of` filters candle `ts` only (REQ-CYCLE-083).
+- **No backward-compatible route or alias (v0.6.0)** — the removed `.../cycle-overlay` and the
+  repurposed base `.../cycle-projection` get no redirect, no deprecation shim, and no legacy alias;
+  the refactor is intentionally breaking and clients migrate to the `{model}` sub-paths
+  (REQ-CYCLE-098).
+- **`real` is never a selectable `{model}` (v0.6.0)** — it stays the always-included baseline; there
+  is no `.../cycle-projection/real` data route and no `real` entry in discovery (REQ-CYCLE-093/097).
+- **No projection-math, schema, or table-content change (v0.6.0)** — v0.6.0 reshapes only the HTTP
+  surface over the existing shared `list_overlay_for_model`; the projection models, the
+  `cycle_overlay_points` table, its contents, the recompute tick, and the normalization/`as_of`
+  semantics are untouched (REQ-CYCLE-090).
+- **No per-`{model}` DTO divergence (v0.6.0)** — both models return the same
+  `CycleOverlayPointDto`/`Page` shape (replay carries null `price_low`/`price_high`; composite carries
+  P10/P90); no new per-model response schema is added for the data endpoint (REQ-CYCLE-090). The only
+  new schema is the discovery model-list object (REQ-CYCLE-096).
 
 ## @MX Annotation Targets (high fan_in)
 
@@ -532,6 +692,16 @@ candle closes** — spot quotes never factor in — so the `as_of` cutoff applie
   keep the SQL-side one-row-per-day aggregation and MUST NOT `fetch_all` the finer series (deep
   backfill OOM-kills the 256Mi pod); the `ts <= as_of` predicate is the point-in-time truncation
   that every as-of point depends on (REQ-CYCLE-071/080).
+- The shared read impl `list_overlay_for_model` (`src/api/cycle_overlay.rs:84`) — `@MX:ANCHOR` +
+  `@MX:REASON`: after v0.6.0 it is the single fan-in point for the `{model}` path dispatch
+  (`replay`/`composite`) as well as the discovery-adjacent data route; its `Page<CycleOverlayPointDto>`
+  + keyset + `projection_model IN ('real', $model)` contract is exactly what makes the endpoint
+  consolidation lossless (REQ-CYCLE-090/091/092).
+- The `{model}` validation + model-dispatch boundary (`project_as_of_for_model` match,
+  `src/api/cycle_overlay.rs:204-223`) — `@MX:WARN` + `@MX:REASON`: `{model}` MUST be validated
+  against `{replay, composite}` BEFORE reaching this match, or an unrecognised path value falls
+  through to `unreachable!()` and panics (HTTP 500) instead of returning the required HTTP 400 — the
+  validation-before-dispatch boundary is the correctness core of REQ-CYCLE-094.
 
 ## Open Items (do not guess)
 
@@ -560,3 +730,18 @@ candle closes** — spot quotes never factor in — so the `as_of` cutoff applie
 - **OR-CYCLE-6 — `cycle` filter shape.** REQ-CYCLE-052 allows an optional `cycle` filter; whether
   it accepts a `cycle_number` (e.g. `?cycle=3`) or a `halving_date` is a minor Run-phase decision.
   Recommend `cycle_number`; confirm at run.
+- **OR-CYCLE-7 — operationId naming (v0.6.0).** Recommend the data operation reuse
+  `listCycleProjection` (repointed to `/coins/{coin_id}/cycle-projection/{model}`) and the discovery
+  operation be `listCycleProjectionModels`, with `listCycleOverlay` removed. The exact strings are
+  confirmable at run provided the `openapi_yaml_contains_all_operation_ids` array (`src/api/mod.rs:395`)
+  is updated to match; the acceptance scenarios assert these recommended names (REQ-CYCLE-099).
+- **OR-CYCLE-8 — discovery payload wrapper (RESOLVED to object, confirm at run).** REQ-CYCLE-096
+  specifies a `{ "models": [ … ] }` object, consistent with this API's object-wrapping convention
+  (`Page<T>` = `{items, next_cursor}`) and forward-extensible. A bare top-level JSON array is the
+  alternative. Confirm the wrapper at run.
+- **OR-CYCLE-9 — where `{model}` validation lives.** REQ-CYCLE-094 requires the 400 to be produced
+  before dispatch. Whether that is a hand-rolled check in the handler, a `ProjectionModel` enum with
+  `TryFrom<&str>`/`FromStr` mapped to `ApiError::BadRequest`, or a typed axum path extractor is a
+  Run-phase decision; all satisfy the "never reach `unreachable!()`" contract. Recommend a
+  `ProjectionModel` enum so the two valid values live in one place reused by both the handler and the
+  discovery list. Confirm at run.

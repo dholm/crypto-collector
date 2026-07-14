@@ -1,14 +1,17 @@
 ---
 id: SPEC-CYCLE-001
 type: plan
-updated: 2026-07-13
+updated: 2026-07-14
 ---
 
 # SPEC-CYCLE-001 — Implementation Plan
 
 A new derived-analytics feature: a materialised Bitcoin halving-cycle overlay recomputed on the
-periodic collector tick, plus a new keyset-paginated `/v1` read route. Additive — no existing
-collection, provider, candle write path, cursor, or DTO changes. One new migration (next number
+periodic collector tick, plus a new keyset-paginated `/v1` read route. Phases 1–7 are additive — no
+existing collection, provider, candle write path, cursor, or DTO changes. **Phase 8 (v0.6.0) is the
+one exception: a deliberately breaking HTTP-surface refactor** that folds the two cycle endpoints
+into `GET /v1/coins/{coin_id}/cycle-projection/{model}` plus a base-path discovery endpoint, still
+with no migration, schema, or projection-math change. One new migration for the base feature (number
 `0013_*.sql`). Methodology per `quality.yaml`. Commit directly to `main` (no feature branches).
 Quality gate after each phase: `cargo fmt --check`, `cargo clippy --all-targets --all-features --
 -D warnings`, `cargo test`.
@@ -134,6 +137,56 @@ truncation and in-memory paginate/filter are new.
   compose, invalid `as_of` → 400); DB-backed as-of scenarios opt-in via
   `DATABASE_URL=... cargo test -- --ignored`.
 
+### Phase 8 — Fold the two cycle endpoints into one `{model}` data route + discovery (v0.6.0, Priority High)
+
+Breaking HTTP-surface refactor: **no migration, no schema change, no projection-math change, no
+`cycle_overlay_points` content change**. All work is route/handler wiring around the already-shared
+`list_overlay_for_model` and the already-existing `project_as_of_for_model` dispatch. The new risk is
+the `{model}` validation boundary and the parity-test rewrite.
+
+- **`ProjectionModel` enum (single source of truth, OR-CYCLE-9).** Add a small enum with variants
+  `Replay`/`Composite`, a `TryFrom<&str>`/`FromStr` that maps unknown strings (including `"real"`) to
+  `ApiError::BadRequest` (REQ-CYCLE-094/093), and an `as_projection_model_str()` returning
+  `"replay"`/`"composite"` for the SQL bind. Reuse the same enum to build the discovery list so the
+  set of valid models is declared once. Mark this enum + the validation step so a bad `{model}`
+  becomes a 400 **before** dispatch — the existing `unreachable!()` in `project_as_of_for_model`
+  (`src/api/cycle_overlay.rs:221`) then stays genuinely unreachable via the path.
+- **Data handler.** Replace `list_cycle_overlay`/`list_cycle_projection` with one handler taking
+  `Path((coin_id, model)): Path<(String, String)>` (or `Path<(String, ProjectionModel)>`), validating
+  `model`, then calling the unchanged `list_overlay_for_model(state, coin_id, params, model.as_str())`.
+  `ListCycleOverlayParams` (`src/api/cycle_overlay.rs:35`) — including `as_of` — carries over
+  unchanged. (REQ-CYCLE-090/091/092)
+- **Discovery handler.** New handler on the base path returning
+  `Json(CycleProjectionModelsDto { models: vec![replay_meta, composite_meta] })`, where each entry is
+  `{ id, description, has_confidence_bands }` (`replay` → `false`, `composite` → `true`). New DTO
+  `CycleProjectionModelsDto` + `CycleProjectionModelDto` in `src/api/dto.rs`. (REQ-CYCLE-095/096/097)
+- **Routes (`src/api/mod.rs:205-212`).** Remove the `/v1/coins/{coin_id}/cycle-overlay` route
+  entirely (→ 404, REQ-CYCLE-098). Repoint `/v1/coins/{coin_id}/cycle-projection` (base) to the
+  discovery handler, and add `/v1/coins/{coin_id}/cycle-projection/{model}` for the data handler. The
+  base and `{model}` paths differ by a segment, so there is no axum route-ordering conflict; both sit
+  under the existing `/v1/coins/{coin_id}/…` param family alongside `candles`.
+- **OpenAPI (`api/crypto-collector.yaml`).** Delete the `/coins/{coin_id}/cycle-overlay` path (~L431)
+  and the old data body of `/coins/{coin_id}/cycle-projection` (~L484). Add
+  `/coins/{coin_id}/cycle-projection/{model}` with a `model` path parameter (`enum: [replay,
+  composite]`), the carried-over `vs_currency`/`cycle`/`cursor`/`limit`/`cycle_as_of` parameters, and
+  the `CycleOverlayPointPage` response; add the base `/coins/{coin_id}/cycle-projection` discovery
+  operation with a new `CycleProjectionModels` schema. (REQ-CYCLE-099)
+- **Doc-parity tests (`src/api/mod.rs`).** Update `openapi_yaml_contains_all_operation_ids` (`:389`)
+  to drop `listCycleOverlay` and add the discovery operationId (recommended
+  `listCycleProjectionModels`, keeping `listCycleProjection` for the data op — OR-CYCLE-7). Rewrite
+  `openapi_yaml_documents_as_of_on_both_cycle_endpoints` (`:424`): `as_of` now lives on the single
+  `{model}` data path (not two endpoints) and MUST NOT be on the discovery path — assert it on
+  `/coins/{coin_id}/cycle-projection/{model}` and assert its absence on the bare discovery path.
+  `openapi_yaml_contains_key_schemas` (`:456`) gains the discovery schema name.
+- **@MX.** `@MX:ANCHOR` on `list_overlay_for_model` (single fan-in for the `{model}` dispatch);
+  `@MX:WARN`/`@MX:REASON` on the `{model}` validation → dispatch boundary (unvalidated `{model}` →
+  `unreachable!()` panic → 500 instead of the required 400).
+- Gate: `cargo test` — handler tests for `replay`/`composite` returning the same page shape as the
+  old endpoints, unknown `{model}` and `.../real` → 400, discovery two-entry payload with correct
+  `has_confidence_bands` and no `real`, old `.../cycle-overlay` → 404, base `.../cycle-projection`
+  returns discovery (not data), `as_of` still works per-model, and the updated OpenAPI parity tests.
+  DB-backed data scenarios opt-in via `DATABASE_URL=... cargo test -- --ignored`.
+
 ## Technical Approach Notes
 
 - **Pure transform, read-only source.** The overlay is a deterministic function of `coin_candles`
@@ -164,6 +217,14 @@ truncation and in-memory paginate/filter are new.
   SQL path does in the database; the projection math and the cursor/DTO contract are unchanged. The
   same-series truncation means `today` inside the pure functions becomes "latest candle `<= as_of`",
   which is precisely the point-in-time anchor REQ-CYCLE-073 requires, with no special-casing.
+- **Endpoint consolidation is a pure surface reshape (v0.6.0).** The two handlers already funnel into
+  one `list_overlay_for_model(..., projected_model)`; v0.6.0 only moves the `projected_model` string
+  from a hardcoded handler argument to a validated `{model}` path segment. Because the shared impl,
+  the `real`-baseline SQL filter, the DTO, the cursor, and the `as_of` branch are all untouched, the
+  data endpoint's behaviour is identical to the pre-refactor endpoints for the same model — the change
+  is entirely in routing, path validation, and the new discovery handler. The `ProjectionModel` enum
+  is the one place the two valid model strings live, shared by the data-path validation and the
+  discovery list so they cannot drift.
 
 ## Risk Analysis
 
@@ -196,6 +257,20 @@ truncation and in-memory paginate/filter are new.
   `as_of >= latest` request would not equal the no-`as_of` result (REQ-CYCLE-075). Mitigation:
   factor the source-building into one shared `load_daily_series(...)` used by both, and cover the
   equality with Scenario 21.
+- **`{model}` reaching `unreachable!()` (v0.6.0).** The single greatest v0.6.0 risk: if `{model}`
+  from the path is passed to `list_overlay_for_model`/`project_as_of_for_model` without being
+  validated, an unknown value (or `"real"`) hits the `match` fallthrough `unreachable!()` and panics
+  → HTTP 500 instead of the required HTTP 400. Mitigation: validate via the `ProjectionModel` enum in
+  the handler *before* dispatch (REQ-CYCLE-094), an `@MX:WARN` on the dispatch boundary, and explicit
+  400 tests for unknown `{model}` and `.../real` (Scenario 30).
+- **Breaking change lands without a client shim (v0.6.0).** Removing `.../cycle-overlay` and
+  reshaping the base `.../cycle-projection` is intentional (D12) but silently breaks any live client.
+  This is accepted per the confirmed decision; mitigation is limited to documenting the migration in
+  the OpenAPI descriptions and the CHANGELOG at sync — no alias is added (REQ-CYCLE-098, Exclusions).
+- **Doc-parity test drift (v0.6.0).** The `openapi_yaml_documents_as_of_on_both_cycle_endpoints` test
+  hardcodes the two old path strings and the "both endpoints" assumption; if it is not rewritten it
+  will pass against a stale document or fail spuriously. It must be updated to assert `as_of` on the
+  single `{model}` data path and its absence on the discovery path (REQ-CYCLE-099).
 
 ## Dependencies / Sequencing
 
@@ -208,6 +283,12 @@ truncation and in-memory paginate/filter are new.
   cursor/DTO already being in place; it adds no migration and reuses the Phase 4 recompute's
   source-building logic (native `1d` → widest-coverage finer aggregation, now with a `ts <= as_of`
   predicate). It is otherwise independent and lands after the base feature is complete.
+- Phase 8 (v0.6.0 endpoint fold) depends only on the Phase 5 route + the Phase 7 `as_of` branch
+  already existing (both `replay` and `composite` already route through `list_overlay_for_model` and
+  `project_as_of_for_model`). It adds no migration, no schema, and no projection math — only route
+  registration, the `{model}` validation enum, the discovery handler/DTO, and the OpenAPI + parity
+  test updates. It lands last and is the only phase that changes external HTTP behaviour in a
+  breaking way.
 - No dependency on other SPECs beyond the existing `coin_candles` schema (SPEC-DB-001 / SPEC-API-002),
   the periodic tick (SPEC-SCHED-001), and the `/v1` cursor/DTO/error conventions (SPEC-API-001).
   Optional reuse of SPEC-API-003 read-time `1d` aggregation is an Open Item (OR-CYCLE-4), not a
