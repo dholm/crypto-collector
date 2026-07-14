@@ -1,7 +1,8 @@
 # Bitcoin Halving-Cycle Prediction — Research Log
 
-Living research log for the redesign of the cycle-overlay projection algorithm behind
-`GET /v1/coins/{coin_id}/cycle-overlay` (SPEC-CYCLE-001). Maintained continuously during the
+Living research log for the redesign of the cycle-overlay projection algorithm, now served at
+`GET /v1/coins/{coin_id}/cycle-projection/composite` (composite model) and
+`GET /v1/coins/{coin_id}/cycle-projection/replay` (replay baseline) per SPEC-CYCLE-001. Maintained continuously during the
 work; sections are appended/revised as evidence accumulates.
 
 Status: **implemented** (SPEC-CYCLE-001 v0.4.0) — model in

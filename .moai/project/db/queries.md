@@ -34,7 +34,7 @@ this contract).
 | `GET /v1/coins/{coin_id}/quotes` | `TsKey { ts }` | `ts DESC` |
 | `GET /v1/coins/{coin_id}/candles` | `TsKey { ts }` | `ts DESC` |
 | `GET /v1/coins/{coin_id}/market` | `TsKey { ts }` | `ts DESC` |
-| `GET /v1/coins/{coin_id}/cycle-overlay` | `CycleOverlayKey { cycle_number, days_since_halving }` | `(cycle_number ASC, days_since_halving ASC)` |
+| `GET /v1/coins/{coin_id}/cycle-projection/{model}` | `CycleOverlayKey { cycle_number, days_since_halving }` | `(cycle_number ASC, days_since_halving ASC)` |
 
 The resource-specific filter (`coin_id`, `vs_currency`, `interval`, optional `cycle_number`) is
 kept in the `WHERE` clause, not embedded in the cursor, so cursors stay compact and stable.
