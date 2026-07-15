@@ -164,22 +164,6 @@ pub async fn batched_upsert_candles(
 
 // ── DB orchestration ───────────────────────────────────────────────────────────────────────
 
-/// Per-interval coverage probe, shared shape with `candles.rs` / `cycle_overlay.rs`.
-async fn coverage_for(
-    pool: &PgPool,
-    coin_id: &str,
-    vs_currency: &str,
-) -> Result<Vec<(String, DateTime<Utc>, DateTime<Utc>)>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT interval, MIN(ts), MAX(ts) FROM coin_candles \
-         WHERE coin_id = $1 AND vs_currency = $2 GROUP BY interval",
-    )
-    .bind(coin_id)
-    .bind(vs_currency)
-    .fetch_all(pool)
-    .await
-}
-
 /// Full-history backfill (REQ-CANDLE-010/011/012/013): walk `[earliest .. now]` in
 /// week-aligned windows, loading only each window's source rows before folding, so the
 /// per-window row count stays bounded regardless of total history length.
@@ -354,7 +338,7 @@ pub async fn run_rollup(
     // Per-coin source coverage is independent of the target interval, so probe it once and
     // reuse it across every TARGET_INTERVALS iteration rather than re-running the (full-history,
     // partition-unprunable) coverage query per target.
-    let coverage_rows = coverage_for(pool, coin_id, vs_currency).await?;
+    let coverage_rows = crate::db::interval_coverage(pool, coin_id, vs_currency).await?;
     let coverage: Vec<IntervalCoverage> = coverage_rows
         .iter()
         .map(|(iv, earliest, latest)| IntervalCoverage {

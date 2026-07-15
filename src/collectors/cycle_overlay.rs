@@ -544,14 +544,7 @@ async fn aggregate_daily_from_finer(
 
     // Per-interval coverage span, so we can prefer the interval that reaches furthest back
     // rather than the coarsest one (which may only hold recent live data).
-    let stored: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT interval, min(ts), max(ts) FROM coin_candles \
-         WHERE coin_id = $1 AND vs_currency = $2 GROUP BY interval",
-    )
-    .bind(coin_id)
-    .bind(vs_currency)
-    .fetch_all(pool)
-    .await?;
+    let stored = crate::db::interval_coverage(pool, coin_id, vs_currency).await?;
 
     let target_secs = interval_to_seconds("1d").expect("1d always has a known second count");
     let candidates: Vec<(&str, i64)> = stored

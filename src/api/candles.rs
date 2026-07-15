@@ -156,15 +156,7 @@ pub async fn list_candles(
     // depth and staleness — not just bucket divisibility. Two stored intervals may both divide
     // the target while spanning wildly different date ranges (e.g. a 9-year 5m backfill vs a
     // 1-month 4h series); coverage-aware selection avoids silently serving the shallow one.
-    let coverage_rows: Vec<(String, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT interval, MIN(ts) AS earliest, MAX(ts) AS latest \
-         FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2 \
-         GROUP BY interval",
-    )
-    .bind(&coin_id)
-    .bind(&vs_currency)
-    .fetch_all(&state.pool)
-    .await?;
+    let coverage_rows = crate::db::interval_coverage(&state.pool, &coin_id, &vs_currency).await?;
 
     // `interval` has already been validated against SUPPORTED_INTERVALS; all members of
     // SUPPORTED_INTERVALS are present in interval_to_seconds → this expect never panics.
