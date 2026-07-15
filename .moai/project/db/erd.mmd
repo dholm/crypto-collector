@@ -119,6 +119,7 @@ erDiagram
     cycle_overlay_points {
         TEXT coin_id PK
         TEXT vs_currency PK
+        TEXT projection_model PK
         INTEGER cycle_number PK
         DATE halving_date
         INTEGER days_since_halving PK
@@ -129,6 +130,8 @@ erDiagram
         BOOLEAN halving_baseline_approximate
         TIMESTAMPTZ updated_at
         BOOLEAN projected
+        NUMERIC price_low
+        NUMERIC price_high
     }
 
     tracked_coins ||--o{ coin_quotes : "has (ON DELETE CASCADE)"

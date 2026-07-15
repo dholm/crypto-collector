@@ -15,7 +15,7 @@ REQ-SCHED-040). Defined in `src/db/upserts.rs`:
 | Function | Table | Conflict target | Side effect |
 |---|---|---|---|
 | `upsert_coin_quote` | `coin_quotes` | `(coin_id, vs_currency, ts)` | `pg_notify('coin_quote_updated', …)` in the same transaction |
-| `upsert_coin_candle` | `coin_candles` | `(coin_id, vs_currency, interval, ts)` | Calls `ensure_candle_partition` first (creates the covering monthly partition if missing); `pg_notify('coin_candle_updated', …)` in the same transaction |
+| `upsert_coin_candle` | `coin_candles` | `(coin_id, vs_currency, interval, ts)` | `pg_notify('coin_candle_updated', …)` in the same transaction (since `0020`, `coin_candles` is a plain table — no partition-ensure step) |
 | `upsert_coin_market_snapshot` | `coin_market_snapshots` | `(coin_id, vs_currency, ts)` | none |
 | `upsert_coin_metadata` | `coin_metadata` | N/A — revision-pattern insert/update, not a plain upsert | inserts a new revision only if `metadata_has_changed()` returns true; otherwise advances `last_seen_at` on the existing revision |
 
@@ -24,9 +24,19 @@ REQ-SCHED-040). Defined in `src/db/upserts.rs`:
 ## Read patterns (keyset pagination)
 
 All `/v1` list endpoints use **keyset (cursor) pagination**, not `OFFSET`, for O(1)-deep stability
-over the append-heavy partitioned tables. Implemented in `src/api/cursor.rs`
+over the append-heavy time-series tables. Implemented in `src/api/cursor.rs`
 (`encode_keyset_cursor` / `decode_keyset_cursor`, `@MX:ANCHOR` — every list endpoint depends on
 this contract).
+
+### Interval coverage probe
+
+`src/db/candles.rs::interval_coverage` returns per-interval `(earliest, latest)` spans for a
+`(coin_id, vs_currency)` series, used by the rollup materializer, the API aggregation fallback,
+and the cycle-overlay daily derivation to pick an aggregation source interval. It is a **loose
+index scan** (recursive skip over the `(coin_id, vs_currency, interval, ts DESC)` btree visiting
+only distinct interval boundaries, then `ORDER BY ts … LIMIT 1` endpoint seeks), replacing the
+naive `SELECT interval, MIN(ts), MAX(ts) … GROUP BY interval` full scan that cost ~1s on a deep
+history.
 
 | Endpoint | Key type | Ordering |
 |---|---|---|

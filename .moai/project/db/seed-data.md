@@ -4,22 +4,24 @@ _Manually maintained — not auto-updated by the `moai-domain-db-docs` hook._
 
 ## What migrations seed
 
-Only **one** table is seeded by a migration: `upstream_request_pacer`
-(`migrations/0009_upstream_pacer.sql`). It inserts exactly 4 rows, one per known upstream
-provider, so consumers can `UPDATE ... RETURNING` without needing a prior `INSERT`:
+Only **one** table is seeded by migrations: `upstream_request_pacer`. `0009_upstream_pacer.sql`
+inserts 4 rows (one per original upstream provider) and `0018_bitstamp_pacer_seed.sql` adds a
+5th (`bitstamp`), so consumers can `UPDATE ... RETURNING` without needing a prior `INSERT`:
 
-| `provider` | `min_gap_ms` | `credit_limit` |
-|---|---|---|
-| `coingecko` | 2000 | 10000 (monthly cap, Demo tier) |
-| `binance` | 100 | NULL (unlimited) |
-| `coinbase` | 500 | NULL (unlimited) |
-| `kraken` | 500 | NULL (unlimited) |
+| `provider` | `min_gap_ms` | `credit_limit` | Seeded by |
+|---|---|---|---|
+| `coingecko` | 2000 | 10000 (monthly cap, Demo tier) | 0009 |
+| `binance` | 100 | NULL (unlimited) | 0009 |
+| `coinbase` | 500 | NULL (unlimited) | 0009 |
+| `kraken` | 500 | NULL (unlimited) | 0009 |
+| `bitstamp` | 500 | NULL (unlimited) | 0018 |
 
-The `INSERT ... ON CONFLICT (provider) DO NOTHING` makes this idempotent across repeated
+Both use `INSERT ... ON CONFLICT (provider) DO NOTHING`, making them idempotent across repeated
 migration runs.
 
-No other migration contains seed data (verified: `grep -rl "INSERT INTO" migrations/` matches
-only `0009_upstream_pacer.sql`).
+No other migration contains seed data. (`grep -rl "INSERT INTO" migrations/` also matches
+`0020_coin_candles_departition.sql`, but that `INSERT ... SELECT` is a row-copy during the
+de-partition, not seed data.)
 
 ## What is runtime-populated (not seeded)
 

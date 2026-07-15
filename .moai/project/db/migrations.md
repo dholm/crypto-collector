@@ -1,7 +1,7 @@
 # Migration History — crypto-collector
 
 Tool: `sqlx migrate` (sequential `migrations/NNNN_name.sql` files, embedded at compile time via
-`sqlx::migrate!()`, applied automatically at process startup). All 15 migrations below are
+`sqlx::migrate!()`, applied automatically at process startup). All 20 migrations below are
 **applied** in the current codebase.
 
 Cumulative note: several later migrations `ALTER`/`DROP` tables created by earlier migrations
@@ -26,6 +26,10 @@ for the final, cumulative table state — this file documents intent per migrati
 | 0014 | `0014_collection_queue_cycle_overlay_kind.sql` | Drops and recreates the `collection_queue_kind_check` CHECK constraint on `collection_queue.kind` to widen the enum with `'cycle_overlay'` (fixes a runtime constraint-violation bug that silently prevented the overlay recompute from being enqueued). | Constraint replace (not data-destructive) |
 | 0015 | `0015_cycle_overlay_projected.sql` | `ALTER TABLE cycle_overlay_points ADD COLUMN projected BOOLEAN NOT NULL DEFAULT FALSE` to distinguish real vs. projected (next-cycle-repeat) overlay points. | No (additive) |
 | 0016 | `0016_collection_queue_rollup_kind.sql` | Drops and recreates the `collection_queue_kind_check` CHECK constraint to widen the enum with `'rollup'` (SPEC-CANDLE-001, native 1d/1w OHLCV materialization). Follows the same DROP/ADD pattern as migration 0014. | Constraint replace (not data-destructive) |
+| 0017 | `0017_cycle_overlay_bands.sql` | `ALTER TABLE cycle_overlay_points ADD COLUMN` for nullable `price_low` / `price_high` (projection band bounds). | No (additive) |
+| 0018 | `0018_bitstamp_pacer_seed.sql` | Seeds a `bitstamp` row into `upstream_request_pacer` (`min_gap_ms = 500`) via `INSERT ... ON CONFLICT DO NOTHING`. Data-only; no schema change. | No |
+| 0019 | `0019_cycle_overlay_projection_model.sql` | `ALTER TABLE cycle_overlay_points ADD COLUMN projection_model TEXT NOT NULL DEFAULT 'composite'`, backfills `'real'` for non-projected rows, then widens the PK to `(coin_id, vs_currency, projection_model, cycle_number, days_since_halving)` and rebuilds `cycle_overlay_points_read_idx` to match. | Constraint/PK replace (data-preserving) |
+| 0020 | `0020_coin_candles_departition.sql` | **Restructure (data-preserving).** Renames the partitioned `coin_candles` aside, creates a plain replacement table (same columns/PK/FK + btree + BRIN indexes), copies every row, then `DROP TABLE … CASCADE` on the old partitioned parent. Eliminates ~200-partition query-planning overhead. Also removes the runtime partition-creation path (`src/db/partitions.rs`). | **Yes — DROP TABLE** on the old partitioned parent, but all rows are copied first (no data loss). |
 
 ## Destructive operations summary
 
@@ -33,6 +37,7 @@ for the final, cumulative table state — this file documents intent per migrati
 |---|---|
 | `0011_remove_markets.sql` | Drops 6 tables outright: `derivatives_quotes`, `candles`, `live_quotes`, `backfill_chunks`, `backfill_jobs`, `tracked_markets` (CASCADE). Of these, only `candles` and `backfill_jobs`/`backfill_chunks` have coin-keyed replacements (`coin_candles` in the same migration; `backfill_jobs`/`backfill_chunks` in 0012). `live_quotes` is replaced by `coin_quotes`. `derivatives_quotes` and `tracked_markets` have **no replacement** in the final schema. |
 | `0014_collection_queue_cycle_overlay_kind.sql` | Drops and replaces a CHECK constraint (no data loss; existing rows already satisfy the widened check). |
+| `0020_coin_candles_departition.sql` | `DROP TABLE` on the old partitioned `coin_candles` parent (as `coin_candles_partitioned`) after every row has been copied into the plain replacement — data-preserving despite the DROP. |
 
 ## Ambiguous / notable migrations
 

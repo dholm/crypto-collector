@@ -5,12 +5,13 @@ upsert helpers in `src/db/upserts.rs`, no ORM) · Migrations: `sqlx migrate`, em
 `sqlx::migrate!()` and applied at process startup (see `sqlx-migrate-embed-rebuild` memory: a
 migrations-only change requires rebuilding the binary).
 
-This document reflects the schema **after all 15 migrations have been applied**, not the
+This document reflects the schema **after all 20 migrations have been applied**, not the
 intermediate state at any single migration. See `migrations.md` for the ordered history,
 including the tables that were created and later dropped (`tracked_markets`, `live_quotes`,
 market-keyed `candles`, `derivatives_quotes`, market-keyed `backfill_jobs`/`backfill_chunks`).
 
-**Final table count: 10** (excluding monthly partition children).
+**Final table count: 10** (excluding monthly partition children of `coin_quotes` and
+`coin_market_snapshots`; `coin_candles` was de-partitioned into a plain table by `0020`).
 
 ---
 
@@ -84,7 +85,7 @@ Coin-keyed OHLCV time-series.
 | `coin_id` | TEXT | NOT NULL | — | FK → `tracked_coins(coin_id)` ON DELETE CASCADE |
 | `vs_currency` | TEXT | NOT NULL | — | |
 | `interval` | TEXT | NOT NULL | — | e.g. `1h`, `1d` — part of PK so intervals coexist |
-| `ts` | TIMESTAMPTZ | NOT NULL | — | partition key |
+| `ts` | TIMESTAMPTZ | NOT NULL | — | part of PK |
 | `open` | NUMERIC | NOT NULL | — | |
 | `high` | NUMERIC | NOT NULL | — | |
 | `low` | NUMERIC | NOT NULL | — | |
@@ -94,15 +95,20 @@ Coin-keyed OHLCV time-series.
 
 - **PK**: `(coin_id, vs_currency, interval, ts)`
 - **FK**: `coin_id` → `tracked_coins.coin_id` ON DELETE CASCADE
-- **Partitioning**: `PARTITION BY RANGE (ts)`, monthly, UTC. Static partitions `coin_candles_2024_01` … `coin_candles_2027_12`.
-  **Runtime partition creation**: `src/db/partitions.rs::ensure_candle_partition` creates
-  `coin_candles_YYYY_MM` on demand (guarded by `pg_advisory_xact_lock`) for historical backfill
-  reaching before 2024-01 or beyond the static range, called before every candle insert.
+- **Partitioning**: **none** — a plain table since `0020_coin_candles_departition.sql`. It was
+  originally `PARTITION BY RANGE (ts)` (monthly, UTC), but at the realized volume (~1.25M rows)
+  the ~200-partition fan-out cost 0.3–1.5s of query *planning* per statement (the naive
+  `MIN/MAX … GROUP BY interval` coverage probe was the worst). `0020` folded all partitions into
+  one table, collapsing planning to sub-millisecond; the runtime partition-creation path
+  (`src/db/partitions.rs::ensure_candle_partition`) was removed with it.
 - **Indexes**:
   - `coin_candles_coin_id_vs_currency_interval_ts_idx` — btree(`coin_id, vs_currency, interval, ts DESC`)
   - `coin_candles_ts_brin` — BRIN(`ts`)
+- **Coverage probe**: per-interval `(earliest, latest)` spans are read via a **loose index scan**
+  (`src/db/candles.rs::interval_coverage`) — a recursive skip over the btree that visits only
+  distinct interval boundaries, replacing the ~1s `MIN/MAX … GROUP BY interval` full scan.
 - **Upsert**: `ON CONFLICT (coin_id, vs_currency, interval, ts) DO UPDATE` (`upsert_coin_candle`); emits `pg_notify('coin_candle_updated', …)`.
-- **Last migration touching this table**: `0011_remove_markets.sql` (runtime partitions added by application code, not migrations)
+- **Last migration touching this table**: `0020_coin_candles_departition.sql`
 
 ---
 
@@ -262,9 +268,10 @@ Claimable work unit; crash-resumable via lease + heartbeat + cursor.
 
 ### `upstream_request_pacer`
 
-Per-provider, credit-aware outbound rate pacer. One row per provider; seeded on creation for all
-four known providers so consumers can `UPDATE ... RETURNING` without a prior `INSERT`. Shared
-across `live_poller`, `collection_queue` worker, and `backfill` worker.
+Per-provider, credit-aware outbound rate pacer. One row per provider; seeded on creation for the
+four original providers (`0009`) plus `bitstamp` (`0018`) so consumers can `UPDATE ... RETURNING`
+without a prior `INSERT`. Shared across `live_poller`, `collection_queue` worker, and `backfill`
+worker.
 
 | Column | Type | Nullable | Default | Notes |
 |---|---|---|---|---|
@@ -279,8 +286,9 @@ across `live_poller`, `collection_queue` worker, and `backfill` worker.
 
 - **PK**: `(provider)`
 - **FK**: none
-- **Seed data**: see `seed-data.md` — 4 rows inserted by `0009_upstream_pacer.sql`
-- **Last migration touching this table**: `0009_upstream_pacer.sql`
+- **Seed data**: see `seed-data.md` — 4 rows inserted by `0009_upstream_pacer.sql`, plus a
+  `bitstamp` row inserted by `0018_bitstamp_pacer_seed.sql` (`min_gap_ms = 500`, `ON CONFLICT DO NOTHING`)
+- **Last migration touching this table**: `0018_bitstamp_pacer_seed.sql`
 
 ---
 
@@ -307,25 +315,31 @@ is fetched from an upstream provider directly for this table. A recompute `DELET
 | `halving_baseline_approximate` | BOOLEAN | NOT NULL | `FALSE` | |
 | `updated_at` | TIMESTAMPTZ | NOT NULL | `now()` | |
 | `projected` | BOOLEAN | NOT NULL | `FALSE` | added by 0015; `true` for points repeating the last completed cycle's shape onto the current cycle out to the next halving |
+| `price_low` | NUMERIC | NULL | — | added by 0017; lower projection band |
+| `price_high` | NUMERIC | NULL | — | added by 0017; upper projection band |
+| `projection_model` | TEXT | NOT NULL | `'composite'` | added by 0019; part of PK. `'real'` for observed (non-projected) points, else the projection model name (e.g. `composite`) |
 
-- **PK**: `(coin_id, vs_currency, cycle_number, days_since_halving)`
+- **PK**: `(coin_id, vs_currency, projection_model, cycle_number, days_since_halving)` — widened by 0019 to admit multiple projection models side by side
 - **FK**: none (not linked to `tracked_coins`; `coin_id` is a plain text tag)
-- **Indexes**: `cycle_overlay_points_read_idx` — btree(`coin_id, vs_currency, cycle_number, days_since_halving`) — mirrors PK order for the keyset read route
-- **Last migration touching this table**: `0015_cycle_overlay_projected.sql`
+- **Indexes**: `cycle_overlay_points_read_idx` — btree(`coin_id, vs_currency, projection_model, cycle_number, days_since_halving`) — mirrors PK order for the keyset read route (rebuilt by 0019)
+- **Last migration touching this table**: `0019_cycle_overlay_projection_model.sql`
 
 ---
 
 ## Partitioning summary
 
-Four tables use PostgreSQL declarative `RANGE(ts)` partitioning, one partition per UTC calendar
+Two tables use PostgreSQL declarative `RANGE(ts)` partitioning, one partition per UTC calendar
 month:
 
 | Table | Static partition range (from migration) | Runtime partition creation? |
 |---|---|---|
 | `coin_quotes` | 2024-01 .. 2027-12 | No |
-| `coin_candles` | 2024-01 .. 2027-12 | **Yes** — `src/db/partitions.rs::ensure_candle_partition`, called before every candle insert, guarded by `pg_advisory_xact_lock` |
 | `coin_market_snapshots` | 2024-01 .. 2027-12 | No |
-| `cycle_overlay_points` | not partitioned (single table) | N/A |
+
+`coin_candles` **was** partitioned (2024-01 .. 2027-12 static + runtime monthly creation) but was
+folded into a single plain table by `0020_coin_candles_departition.sql` — the ~200-partition
+fan-out cost more in query planning than partitioning saved at this data volume. `cycle_overlay_points`
+is a single unpartitioned table.
 
 Historical (now-dropped) partitioned tables: `live_quotes`, market-keyed `candles`,
 `derivatives_quotes` — all removed by `0011_remove_markets.sql`.
