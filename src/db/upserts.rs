@@ -14,7 +14,6 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 
-use crate::db::partitions::ensure_candle_partition;
 use crate::models::quote::CoinCandle;
 use crate::providers::{CoinMarket, CoinMeta, SpotQuote};
 
@@ -118,11 +117,6 @@ pub async fn upsert_coin_candle(pool: &PgPool, candle: &CoinCandle) -> Result<()
         "source": candle.source,
     })
     .to_string();
-
-    // Ensure the covering monthly partition exists before insert (REQ historical
-    // backfill: coin_candles only has static partitions for 2024-01..2027-12).
-    // Runs in its own transaction, ahead of the insert transaction below.
-    ensure_candle_partition(pool, candle.ts).await?;
 
     let mut tx = pool.begin().await?;
 

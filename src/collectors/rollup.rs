@@ -14,13 +14,12 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 
 use crate::api::candles_agg::{
     aggregate_candles, bucket_start, interval_to_seconds, select_source_interval, IntervalCoverage,
 };
-use crate::db::partitions::ensure_candle_partition;
 use crate::models::quote::CoinCandle;
 
 /// Rollup source-marker prefix (REQ-CANDLE-003), distinct from the ephemeral read-time
@@ -102,17 +101,15 @@ pub fn reconcile_window(
 
 /// Batched upsert of rollup rows, avoiding the per-row transaction + `pg_notify` overhead of
 /// `upsert_coin_candle` (REQ-CANDLE-043). Preserves the identical
-/// `(coin_id, vs_currency, interval, ts)` conflict target and calls `ensure_candle_partition`
-/// for each distinct month touched, so parity and idempotency with the row-at-a-time path are
-/// unaffected.
+/// `(coin_id, vs_currency, interval, ts)` conflict target, so parity and idempotency with the
+/// row-at-a-time path are unaffected.
 ///
-// @MX:WARN: [AUTO] batched_upsert_candles — must call ensure_candle_partition per distinct
-//           month; must not fork candles_agg.rs folding; must preserve volume null-propagation.
-// @MX:REASON: A historical backfill spans partitions outside the static 2024-2027 range
-//             (migrations/0011); skipping the partition-ensure step fails inserts for any
-//             `ts` before 2024-01. The batch is a single UNNEST-based INSERT (one round trip,
-//             one tx) rather than N single-row upserts — do not revert to a per-row loop for
-//             historical backfill sizes (thousands of `1d` + hundreds of `1w` rows per coin).
+// @MX:NOTE: [AUTO] batched_upsert_candles — must not fork candles_agg.rs folding; must
+//           preserve volume null-propagation. The batch is a single UNNEST-based INSERT (one
+//           round trip, one tx) rather than N single-row upserts — do not revert to a per-row
+//           loop for historical backfill sizes (thousands of `1d` + hundreds of `1w` rows per
+//           coin). coin_candles is a plain table since migration 0020, so no partition-ensure
+//           step is needed for `ts` values outside any static range.
 // @MX:SPEC: SPEC-CANDLE-001 REQ-CANDLE-013 REQ-CANDLE-040 REQ-CANDLE-043
 pub async fn batched_upsert_candles(
     pool: &PgPool,
@@ -120,13 +117,6 @@ pub async fn batched_upsert_candles(
 ) -> Result<(), sqlx::Error> {
     if candles.is_empty() {
         return Ok(());
-    }
-
-    let mut months_seen: HashSet<(i32, u32)> = HashSet::new();
-    for c in candles {
-        if months_seen.insert((c.ts.year(), c.ts.month())) {
-            ensure_candle_partition(pool, c.ts).await?;
-        }
     }
 
     let coin_ids: Vec<&str> = candles.iter().map(|c| c.coin_id.as_str()).collect();
@@ -361,17 +351,20 @@ pub async fn run_rollup(
     vs_currency: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    for (target_interval, target_secs) in TARGET_INTERVALS {
-        let coverage_rows = coverage_for(pool, coin_id, vs_currency).await?;
-        let coverage: Vec<IntervalCoverage> = coverage_rows
-            .iter()
-            .map(|(iv, earliest, latest)| IntervalCoverage {
-                interval: iv.as_str(),
-                earliest: *earliest,
-                latest: *latest,
-            })
-            .collect();
+    // Per-coin source coverage is independent of the target interval, so probe it once and
+    // reuse it across every TARGET_INTERVALS iteration rather than re-running the (full-history,
+    // partition-unprunable) coverage query per target.
+    let coverage_rows = coverage_for(pool, coin_id, vs_currency).await?;
+    let coverage: Vec<IntervalCoverage> = coverage_rows
+        .iter()
+        .map(|(iv, earliest, latest)| IntervalCoverage {
+            interval: iv.as_str(),
+            earliest: *earliest,
+            latest: *latest,
+        })
+        .collect();
 
+    for (target_interval, target_secs) in TARGET_INTERVALS {
         // REQ-CANDLE-001: same selector the read path uses, called with window_start=None
         // (materialize the full-history canonical series).
         let Some(source_interval) = select_source_interval(&coverage, target_secs, None, now)
@@ -405,6 +398,7 @@ pub async fn run_rollup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
     use rust_decimal_macros::dec;
 
     fn ts_epoch(secs: i64) -> DateTime<Utc> {
