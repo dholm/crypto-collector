@@ -6,6 +6,30 @@ This document provides comprehensive reference information for SPEC workflow man
 
 ---
 
+## GEARS Migration (current notation)
+
+GEARS (Generalized EARS) is the canonical SPEC authoring notation as of v3.0.0. The SPEC lint engine emits a `LegacyEARSKeyword` warning when residual `IF/THEN` modality appears in NEW SPECs. Existing SPECs remain valid for 6 months from the v3.0.0 release per the backward-compatibility window.
+
+GEARS-to-EARS pattern mapping (cross-link to canonical guide in SKILL.md "GEARS Format" section):
+
+| GEARS (current) | EARS (legacy — 6-month window) | Status |
+|-----------------|--------------------------------|--------|
+| `Ubiquitous` — "The <subject> shall <behavior>" | "The system shall <behavior>" | Unchanged semantics; subject generalized |
+| `When <event-detected>` — event-driven | "WHEN <event>, the system shall <action>" | Unchanged semantics; spelling formalized |
+| `While <state>` — state-driven | "WHILE <state>, the system shall <action>" | Promoted as first-class pattern |
+| `Where <capability>` — capability gate | "WHERE <feature exists>, the system shall <action>" | Reframed (capability gate / feature flag / static config) |
+| `When <undesired-condition-detected>` | `IF <condition> THEN <action>` **[DEPRECATED — use WHEN <event-detected>]** | `IF/THEN` modality replaced |
+
+Compound clause: `Where <precondition> While <state> When <event> the <subject> shall <behavior>` — any subset of the three modifiers may chain.
+
+Generalized subject: GEARS allows `<subject>` to be any noun (system, component, service, agent, function, artifact). The 88 legacy SPECs retain "The system" as the default; NEW SPECs MAY use generalized subjects (e.g., "The skill shall ...", "The agent shall ...").
+
+See SKILL.md "GEARS Format" section for canonical guidance and the [docs-site GEARS notation reference](https://adk.mo.ai.kr/en/workflow-commands/moai-plan/#gears-notation) for the authoritative migration guide.
+
+> Templates in this file (Template 1 / Template 2 / Template 3 below) retain legacy EARS notation including `IF [condition] THEN [action]` constructs **[DEPRECATED — use WHEN <event-detected>]**. These templates remain valid examples during the 6-month backward-compatibility window; for NEW SPEC authoring prefer the GEARS forms documented above and in SKILL.md.
+
+---
+
 ## SPEC Document Templates
 
 ### Template 1: Simple CRUD Feature
@@ -16,7 +40,7 @@ This document provides comprehensive reference information for SPEC workflow man
 Created: YYYY-MM-DD
 Status: Planned
 Priority: Medium
-Assigned: manager-ddd
+Assigned: manager-develop
 
 ## Description
 [Brief description of the feature]
@@ -67,7 +91,7 @@ Business:
 Created: YYYY-MM-DD
 Status: Planned
 Priority: High
-Assigned: manager-ddd
+Assigned: manager-develop
 Related SPECs: SPEC-YYY, SPEC-ZZZ
 
 ## Description
@@ -146,7 +170,7 @@ Security:
 Created: YYYY-MM-DD
 Status: Planned
 Priority: Medium
-Assigned: expert-backend
+Assigned: Agent(general-purpose) with backend instructions
 
 ## API Definition
 
@@ -269,11 +293,11 @@ Technical:
 - Low: Enhancement or optional feature
 
 **Assigned Agents**:
-- manager-ddd: DDD-based implementation
+- manager-develop: DDD-based implementation
 - manager-spec: SPEC refinement and updates
-- expert-backend: Backend-specific features
-- expert-frontend: Frontend-specific features
-- expert-database: Database schema changes
+- Agent(general-purpose) with backend instructions: Backend-specific features
+- Agent(general-purpose) with frontend instructions: Frontend-specific features
+- Agent(general-purpose) with database instructions: Database schema changes
 
 ### Extended Fields
 
@@ -522,17 +546,17 @@ Technical:
 ```
 User Request
     ↓
-/moai:1-plan "feature description"
+/moai plan "feature description"
     ↓
 manager-spec creates SPEC-001
     ↓
 /clear (token optimization)
     ↓
-/moai:2-run SPEC-001
+/moai run SPEC-001
     ↓
-manager-ddd implements with ANALYZE-PRESERVE-IMPROVE
+manager-develop implements with ANALYZE-PRESERVE-IMPROVE
     ↓
-/moai:3-sync SPEC-001
+/moai sync SPEC-001
     ↓
 manager-docs updates documentation
     ↓
@@ -544,7 +568,7 @@ Feature Complete
 ```
 User Request
     ↓
-/moai:1-plan "feature1" "feature2" "feature3" --worktree
+/moai plan "feature1" "feature2" "feature3" --worktree
     ↓
 manager-spec creates SPEC-001, SPEC-002, SPEC-003
     ↓
@@ -555,12 +579,12 @@ Git Worktree setup for parallel development
 ┌─────────────┬─────────────┬─────────────┐
 │ Session 1   │ Session 2   │ Session 3   │
 │ SPEC-001    │ SPEC-002    │ SPEC-003    │
-│ /moai:2-run │ /moai:2-run │ /moai:2-run │
+│ /moai run │ /moai run │ /moai run │
 └─────────────┴─────────────┴─────────────┘
     ↓
 Worktree merge to main branch
     ↓
-/moai:3-sync SPEC-001 SPEC-002 SPEC-003
+/moai sync SPEC-001 SPEC-002 SPEC-003
     ↓
 All Features Complete
 ```
@@ -568,31 +592,31 @@ All Features Complete
 ### Dependency Chain Integration
 
 ```
-/moai:1-plan "database schema" --branch
+/moai plan "database schema" --branch
     ↓
 SPEC-001 created (foundation)
     ↓
-/moai:2-run SPEC-001
+/moai run SPEC-001
     ↓
 Database schema implemented
     ↓
-/moai:1-plan "backend API" --branch
+/moai plan "backend API" --branch
     ↓
 SPEC-002 created (depends on SPEC-001)
     ↓
-/moai:2-run SPEC-002
+/moai run SPEC-002
     ↓
 Backend API implemented
     ↓
-/moai:1-plan "frontend UI" --branch
+/moai plan "frontend UI" --branch
     ↓
 SPEC-003 created (depends on SPEC-002)
     ↓
-/moai:2-run SPEC-003
+/moai run SPEC-003
     ↓
 Frontend UI implemented
     ↓
-/moai:3-sync SPEC-001 SPEC-002 SPEC-003
+/moai sync SPEC-001 SPEC-002 SPEC-003
     ↓
 Full Stack Feature Complete
 ```

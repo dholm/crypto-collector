@@ -1,5 +1,4 @@
 ---
-name: moai-workflow-codemaps
 description: >
   Scan codebase and generate architecture documentation in .moai/project/codemaps/ directory.
   Creates module maps, dependency graphs, and entry point references.
@@ -22,7 +21,7 @@ progressive_disclosure:
 # MoAI Extension: Triggers
 triggers:
   keywords: ["codemaps", "architecture", "codebase map", "module map", "dependency graph"]
-  agents: ["Explore", "manager-docs"]
+  agents: ["Explore"]
   phases: ["codemaps"]
 ---
 
@@ -38,6 +37,22 @@ Flow: Explore Codebase -> Analyze Architecture -> Generate Maps -> Verify -> Rep
 - --area AREA: Focus on a specific area (e.g., --area api, --area auth, --area cli)
 - --format FORMAT: Output format (default: markdown). Options: markdown, mermaid, json
 - --depth N: Maximum directory depth for exploration (default: 4)
+
+## Pipeline Contract (Agentless Classification)
+
+<!-- @MX:NOTE - Agentless fixed-pipeline classification; localize→repair→validate contract. See spec-workflow.md#subcommand-classification. -->
+
+This subcommand is classified as **Agentless fixed-pipeline**.
+It executes a deterministic 3-phase contract: **localize → repair → validate**.
+
+- **Phase mapping**: localize ← Phase 1; repair ← Phase 2+3; validate ← Phase 4
+- **No LLM-driven control flow**: Agent() invocations exist for executor delegation within phases (e.g., `Explore` for codebase analysis) but never select the next phase.
+- **No-op exit**: When the localize phase finds zero targets, the pipeline exits with status `no-op` and exit code 0, skipping repair and validate.
+- **Fail-fast**: When repair encounters an unresolvable error, the pipeline terminates and reports the error. There is no multi-agent fallback.
+- **`--mode` flag handling**: Any `--mode` flag passed to this subcommand is ignored. The system logs `MODE_FLAG_IGNORED_FOR_UTILITY` at info level and proceeds with the fixed pipeline.
+- **Repeatability**: Even when the parent invocation supplies `--mode loop`, the pipeline runs once per command invocation. Re-entry requires explicit user re-invocation.
+
+See [Subcommand Classification matrix](../../rules/moai/workflow/spec-workflow.md#subcommand-classification) for the full pipeline-vs-multi-agent contract.
 
 ## Phase 1: Codebase Exploration
 
@@ -65,9 +80,9 @@ Expected Output from Explore agent:
 
 ## Phase 2: Architecture Analysis
 
-[HARD] Delegate architecture analysis to the manager-docs subagent.
+The orchestrator performs architecture analysis directly (no Agent() spawn) from the Phase 1 exploration output plus deterministic tooling (e.g., `go list -deps -json` + `go doc`, or the project language's equivalent dependency/doc extractors) — replacing the former analysis delegation spawn.
 
-Pass to manager-docs:
+Analysis inputs:
 
 - Explore agent results from Phase 1
 - Existing .moai/project/codemaps/ content (if --force not set, for incremental updates)
@@ -83,7 +98,7 @@ Analysis Tasks:
 
 ## Phase 3: Map Generation
 
-[HARD] Delegate map generation to the manager-docs subagent.
+The orchestrator generates the maps directly (no Agent() spawn) from the Phase 2 analysis — replacing the former generation delegation spawn. Phase 1's Explore spawn remains the workflow's single Agent() invocation.
 
 Output Files in `.moai/project/codemaps/` directory:
 
@@ -131,16 +146,16 @@ Next Steps (AskUserQuestion):
 
 ## Agent Chain Summary
 
-- Phase 1: Explore subagent (codebase exploration, read-only)
-- Phase 2-3: manager-docs subagent (analysis and generation)
+- Phase 1: Explore subagent (codebase exploration, read-only) — the workflow's single Agent() spawn
+- Phase 2-3: MoAI orchestrator (analysis and generation, orchestrator-direct from the Phase 1 exploration output + deterministic tooling)
 - Phase 4: MoAI orchestrator (verification checks)
 
 ## Execution Summary
 
 1. Parse arguments (extract flags: --force, --area, --format, --depth)
 2. Check for existing .moai/project/codemaps/ directory content
-3. Delegate codebase exploration to Explore subagent
-4. Delegate architecture analysis and map generation to manager-docs subagent
+3. Delegate codebase exploration to Explore subagent (the single Agent() spawn)
+4. Perform architecture analysis and map generation orchestrator-direct (exploration output + deterministic tooling)
 5. Verify generated maps for consistency
 6. TaskCreate/TaskUpdate for all generated files
 7. Report results with next step options

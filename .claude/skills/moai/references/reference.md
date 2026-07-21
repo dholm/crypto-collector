@@ -1,5 +1,4 @@
 ---
-name: moai-reference
 description: >
   Common execution patterns, flag reference, legacy command mapping,
   and resume patterns used across all MoAI workflows. Provides context
@@ -22,7 +21,7 @@ progressive_disclosure:
 # MoAI Extension: Triggers
 triggers:
   keywords: ["reference", "pattern", "flag", "config", "resume", "legacy", "mapping"]
-  agents: ["manager-spec", "manager-ddd", "manager-tdd", "manager-docs", "manager-quality", "manager-git"]
+  agents: ["manager-spec", "manager-develop", "manager-docs", "manager-git"]
   phases: ["plan", "run", "sync"]
 ---
 
@@ -32,8 +31,7 @@ Common patterns, flag reference, and legacy command mapping used across all MoAI
 
 For configuration file paths, see: CLAUDE.md Section 9
 For error handling delegation, see: CLAUDE.md Section 11
-For completion markers, see: .claude/rules/moai/core/moai-constitution.md
-For development mode details, see: .claude/rules/moai/workflow/workflow-modes.md
+For development mode details, see: .claude/rules/moai/workflow/spec-workflow.md (Run Phase section)
 
 ---
 
@@ -62,7 +60,7 @@ When operations have dependencies, chain them sequentially. Each Agent() call re
 
 Use Cases:
 
-- DDD/TDD Workflow: Phase 1 (planning) feeds Phase 2 (implementation) feeds Phase 2.5 (quality validation)
+- DDD/TDD Workflow: Phase 5 (planning) feeds Phase 11 (implementation) feeds Phase 13 (quality validation)
 - SPEC Creation: Explore agent results feed into manager-spec agent for document generation
 - Release Pipeline: Quality gates must pass before version selection, which must complete before tagging
 
@@ -87,11 +85,9 @@ Use Cases:
 
 Implementation:
 
-- TeamCreate to initialize team structure with shared task list
-- Agent() with team_name and name parameters to spawn teammates
-- SendMessage for inter-teammate coordination and idle handling
+- Agent() with the `name` parameter to spawn teammates — the team forms implicitly on first spawn (one team per session, no setup step); the `team_name` parameter is accepted but ignored (Claude Code v2.1.178)
 - TaskList for self-coordinated work distribution
-- TeamDelete after all teammates shut down
+- Team cleanup is automatic on session exit; no explicit teardown call is needed
 
 ---
 
@@ -143,7 +139,6 @@ Propagation Method:
 
 - --resume [ID]: Resume workflow from last checkpoint (SPEC-ID or snapshot ID)
 - --seq: Force sequential execution instead of parallel where applicable
-- --deepthink: Activate Sequential Thinking MCP for deep analysis before execution
 - --team: Force Agent Teams mode for parallel execution
 - --solo: Force sub-agent mode (single agent per phase)
 
@@ -196,18 +191,6 @@ Propagation Method:
 - --security: Focus on security review
 - --team: Force parallel multi-perspective review team
 
-### Coverage Flags
-
-- --target N: Set coverage target percentage
-- --file PATH: Analyze specific file
-- --report: Generate report only (no test generation)
-
-### E2E Flags
-
-- --record: Record browser session as GIF
-- --url URL: Target URL for testing
-- --journey NAME: Specific user journey to test
-
 ### Clean Flags
 
 - --dry: Preview dead code without removing
@@ -227,22 +210,18 @@ Propagation Method:
 
 Previous /moai:X-Y command format mapped to new /moai subcommand format:
 
-- /moai:0-project maps to /moai project
-- /moai:1-plan maps to /moai plan
-- /moai:2-run maps to /moai run
-- /moai:3-sync maps to /moai sync
-- /moai:9-feedback maps to /moai feedback
+- /moai project maps to /moai project
+- /moai plan maps to /moai plan
+- /moai run maps to /moai run
+- /moai sync maps to /moai sync
+- /moai feedback maps to /moai feedback
 - /moai:fix maps to /moai fix
 - /moai:loop maps to /moai loop
 - /moai:moai maps to /moai (default autonomous workflow)
 - /moai:review maps to /moai review
 - /moai:clean maps to /moai clean
 - /moai:codemaps maps to /moai codemaps
-- /moai:coverage maps to /moai coverage
-- /moai:e2e maps to /moai e2e
 - /moai:mx maps to /moai mx
-
-Note: /moai:99-release is a separate local-only command, not part of the /moai skill.
 
 ---
 

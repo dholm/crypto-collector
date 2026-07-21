@@ -4,9 +4,15 @@ description: >
   Canonical Claude Code authoring kit covering Skills, sub-agents, plugins, slash commands,
   hooks, memory, settings, sandboxing, headless mode, and advanced agent patterns.
   Use when creating Claude Code extensions or configuring Claude Code features.
+
+when_to_use: >
+  Use for Claude Code authoring and extension: Skills, sub-agents,
+  plugins, slash commands, hooks, memory, settings, sandboxing, headless
+  mode, orchestration, and delegation/agent-pattern authoring.
+
 license: Apache-2.0
 compatibility: Designed for Claude Code
-allowed-tools: Read, Write, Edit, Grep, Glob, mcp__context7__resolve-library-id, mcp__context7__get-library-docs
+allowed-tools: Read, Write, Edit, Grep, Glob
 user-invocable: false
 metadata:
   version: "5.0.0"
@@ -22,18 +28,6 @@ progressive_disclosure:
   enabled: true
   level1_tokens: 100
   level2_tokens: 5000
-
-# MoAI Extension: Triggers
-triggers:
-  keywords: ["skill", "agent", "plugin", "slash command", "hook", "sandbox", "headless", "memory", "settings", "claude code", "sub-agent", "agent pattern", "orchestration", "delegation"]
-  agents:
-    - "builder-agent"
-    - "builder-skill"
-    - "builder-plugin"
-  phases:
-    - "plan"
-    - "run"
-    - "sync"
 ---
 
 # Claude Code Authoring Kit
@@ -211,11 +205,11 @@ Phase 4 Commit: Descriptive messages, logical groupings, clean history
 
 ### Essential Sub-agents
 
-- spec-builder: EARS specifications
-- manager-ddd: DDD execution
-- expert-security: Security analysis
-- expert-backend: API development
-- expert-frontend: UI implementation
+- manager-spec: EARS specifications
+- manager-develop: DDD execution
+- Agent(general-purpose) with security instructions: Security analysis
+- Agent(general-purpose) with backend instructions: API development
+- Agent(general-purpose) with frontend instructions: UI implementation
 
 ## Security Features
 

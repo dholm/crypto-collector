@@ -1,6 +1,5 @@
 ---
-description: Worktree integration guide with path isolation rules for agents using isolation worktree
-globs: "**/.claude/agents/**,**/.claude/worktrees/**"
+paths: "**/.claude/agents/**,**/.claude/worktrees/**,**/.claude/teams/**"
 ---
 
 # Worktree Integration Guide
@@ -27,7 +26,7 @@ MoAI-ADK supports two complementary worktree systems for isolated development:
 | Feature | Claude Native | MoAI |
 |---------|--------------|------|
 | **Path** | `.claude/worktrees/<name>/` | `~/.moai/worktrees/{Project}/{SPEC}/` |
-| **Lifetime** | Ephemeral (session-scoped) | Persistent (SPEC-scoped) |
+| **Lifetime** | Ephemeral (session-scoped) | Persistent |
 | **Purpose** | Session isolation for subagents | SPEC development, PR creation |
 | **CLI** | `claude -w` (user) or `isolation: worktree` (agent) | `moai worktree new/list/remove` |
 | **Cleanup** | Automatic on session end | Manual via `moai worktree remove` |
@@ -35,6 +34,21 @@ MoAI-ADK supports two complementary worktree systems for isolated development:
 | **Team Use** | Single agent isolation | Multi-developer collaboration |
 | **State Persistence** | None | SPEC state, progress tracking |
 | **Hook Support** | WorktreeCreate/WorktreeRemove hooks | WorktreeCreate/WorktreeRemove hooks |
+
+## Terminology Glossary
+
+This glossary is the canonical definition surface for the L1 / L2 / L3 worktree-layer terms used across the MoAI rule set. Other rules (`spec-workflow.md`, `worktree-state-guard.md`, `session-handoff.md`, and `CLAUDE.md` §14) cross-reference `§ Terminology Glossary` for these definitions.
+
+| Layer | Name | What it is | Path / Trigger | Lifetime | Owner |
+|-------|------|-----------|----------------|----------|-------|
+| **L1** | Claude-native ephemeral worktree | Session-scoped isolation materialized by the Claude Code runtime for a subagent spawned with `Agent(isolation: "worktree")` (or `claude --worktree`). The runtime decides whether to materialize it. | `.claude/worktrees/<auto-name>/` | Ephemeral — auto-cleaned on session end | Claude Code runtime (autonomous; MoAI orchestrator does not mandate it per the opt-in policy) |
+| **L2** | MoAI persistent SPEC worktree | A persistent, SPEC-scoped working directory created by `moai worktree new SPEC-XXX`. Used for multi-session SPEC development (run + sync phases reuse the same L2 worktree). | `~/.moai/worktrees/<project>/<SPEC>/` | Persistent — disposed only via `moai worktree done SPEC-XXX` after both run + sync PRs merge | MoAI (user-managed via `moai worktree` CLI) |
+| **L3** | Worktree launch action (opt-in) | The user opt-in launch step that creates an L2 worktree, e.g. `/moai plan --worktree`. L3 is the *action*; L2 is the *artifact* it produces. Per the opt-in policy, L3 is opt-in; the default flow runs all phases on a `feat/SPEC-XXX` branch in the main checkout. | `/moai plan --worktree` (or `moai worktree new --worktree`) | n/a (an action, not a directory) | User (explicit opt-in) |
+
+Relationships:
+- An **L3** launch action (`--worktree`) creates an **L2** persistent SPEC worktree.
+- An **L1** ephemeral worktree is materialized autonomously by the Claude Code runtime for an isolated subagent; it is independent of L2/L3 and may occur inside either the main checkout or an L2 worktree.
+- When L3 was used, the paste-ready resume MUST anchor the next session inside the L2 worktree (Block 0) per `session-handoff.md` § Worktree-Anchored Resume Pattern.
 
 ## Claude Code 2.1.50+ Worktree Features
 
@@ -97,15 +111,45 @@ background: true   # Returns immediately; results delivered on next turn
 
 Use with `isolation: worktree` for optimal parallel execution in team mode.
 
-[HARD] Background agents auto-deny Write/Edit operations. Only use `background: true` for:
+Background-execution policy for write-capable agents is owned by `.claude/rules/moai/core/agent-common-protocol.md` § Background Agent Execution. As of Claude Code v2.1.198 subagents run in the background by default, and a background write surfaces a permission prompt in the main session naming the asking subagent; MoAI aligns with that runtime default rather than forcing foreground. The retained safeguard is concurrency, not backgrounding: MoAI does not run two write-capable agents concurrently. Use `background: true` for:
 - Read-only research and analysis agents
 - Agents whose write paths are pre-approved in settings.json `permissions.allow`
 
-For write-heavy agents without pre-approval, use `background: false` (foreground, sequential).
-
 Kill background agent: Press `Ctrl+X Ctrl+K` in Claude Code interface (v2.1.83+).
 
-## Worktree Selection Rules [HARD]
+### Worktree Base Branch (`worktree.baseRef`)
+
+Native worktrees (`--worktree` and subagent `isolation: worktree`) branch from the repository's default branch (`origin/HEAD`) by default, so they start from a clean tree matching the remote. If no remote is configured or the fetch fails, the worktree falls back to the current local `HEAD`. To always branch from local `HEAD` instead (carrying unpushed commits and feature-branch state), set `worktree.baseRef` to `"head"` in settings (accepts only `"fresh"` or `"head"`, not arbitrary refs):
+
+```json
+{
+  "worktree": {
+    "baseRef": "head"
+  }
+}
+```
+
+Use `"head"` when isolating subagents that must operate on in-progress work. To branch a native worktree from a specific pull request, pass the PR number prefixed with `#` (e.g. `claude --worktree "#1234"`); Claude Code fetches `pull/<number>/head` and creates the worktree at `.claude/worktrees/pr-<number>`.
+
+This setting governs **Claude-native** worktrees only. MoAI's own `moai worktree new` uses the Branch Origin Decision Protocol (`origin/main` default; see `.claude/rules/moai/development/branch-origin-protocol.md`) and is unaffected by `worktree.baseRef`.
+
+### `.worktreeinclude` (Copy Gitignored Files into Native Worktrees)
+
+A native worktree is a fresh checkout, so untracked files (`.env`, `.env.local`, local config) are not present. Add a `.worktreeinclude` file at the project root to copy them automatically when Claude creates a worktree. It uses `.gitignore` syntax; only files that match a pattern AND are gitignored are copied (tracked files are never duplicated):
+
+```text
+.env
+.env.local
+.moai/config/sections/*.local.yaml
+```
+
+Applies to `--worktree`, subagent `isolation: worktree` worktrees, and desktop parallel sessions. NOT processed when a custom `WorktreeCreate` hook replaces the default git behavior — copy local files inside the hook script instead.
+
+### `EnterWorktree` / `ExitWorktree` Tools
+
+Claude can move the session into a worktree mid-session via the `EnterWorktree` tool (e.g. when the user says "work in a worktree"), creating one under `.claude/worktrees/`. Once inside, Claude can switch directly to another worktree by calling `EnterWorktree` with a target path; the previous worktree stays on disk untouched. `ExitWorktree` returns to the originating checkout. These are Claude Code runtime tools — MoAI does not mandate their use; they are the interactive counterpart to the `--worktree` launch flag and `isolation: worktree` frontmatter.
+
+## Worktree Selection Rules [ZONE:Evolvable] [HARD]
 
 ### Decision Tree
 
@@ -131,10 +175,22 @@ Is this a one-shot sub-agent task?
 
 ### HARD Rules
 
-- [HARD] Implementation teammates in team mode (role_profiles: implementer, tester, designer) MUST use `isolation: "worktree"` when spawned via Agent()
-- [HARD] Read-only teammates (role_profiles: researcher, analyst, reviewer) MUST NOT use `isolation: "worktree"` — their `mode: "plan"` already prevents writes
-- [HARD] One-shot sub-agents that write files (expert-backend, expert-frontend, manager-ddd, manager-tdd) SHOULD use `isolation: "worktree"` when making cross-file changes
-- [HARD] GitHub workflow agents (fixer agents in /moai github issues) MUST use `isolation: "worktree"` for branch isolation
+- [ZONE:Evolvable] [HARD] Implementation teammates in team mode (role_profiles: implementer, tester, designer) MUST use `isolation: "worktree"` when spawned via Agent()
+- [ZONE:Evolvable] [HARD] Read-only teammates (role_profiles: researcher, analyst, reviewer) MUST NOT use `isolation: "worktree"` — their `mode: "plan"` already prevents writes
+- [ZONE:Evolvable] [HARD] One-shot sub-agents that write files across 3 or more paths per invocation MUST use `isolation: "worktree"`. This includes write-heavy retained agents (manager-develop), per-spawn `Agent(general-purpose)` specialists with a write-heavy domain whitelist (e.g. backend / frontend / devops / refactoring), and team-mode role profiles (implementer, tester, designer).
+<!-- @MX:ANCHOR: WorktreeMUSTRule — invariant contract; all write-heavy agents MUST declare isolation:worktree; enforced by LR-05 lint rule -->
+<!-- @MX:REASON: MUST level required to eliminate silent file-write conflict failure mode in parallel Agent() execution. -->
+- [ZONE:Evolvable] [HARD] GitHub workflow agents (fixer agents in /moai github issues) MUST use `isolation: "worktree"` for branch isolation
+
+## Sentinel Key Glossary
+
+Structured error codes emitted by `moai agent lint` and `moai workflow lint` for programmatic detection:
+
+| Sentinel Key | Source | Meaning |
+|---|---|---|
+| `ORC_WORKTREE_MISSING` | LR-05 (agent lint) | Write-heavy agent lacks `isolation: worktree` in frontmatter |
+| `ORC_WORKTREE_ON_READONLY` | LR-09 (agent lint) | Read-only agent (`permissionMode: plan`) has `isolation: worktree` — prohibited overhead |
+| `ORC_WORKTREE_REQUIRED` | `moai workflow lint` | `workflow.yaml` role_profiles entry for implementer/tester/designer has incorrect isolation value |
 
 ### When to Use Which
 
@@ -196,20 +252,27 @@ permissionMode: acceptEdits
 permissionMode: plan  # Read-only mode already provides safety
 ```
 
-## WorktreeCreate and WorktreeRemove Hooks
+## WorktreeCreate and WorktreeRemove Hooks (Not Registered by Default)
 
-MoAI-ADK implements hook handlers for worktree lifecycle events:
+Claude Code v2.1.49+ defines `WorktreeCreate` / `WorktreeRemove` hooks that **replace** Claude Code's default git worktree behavior — not extend it. Per the official contract (https://code.claude.com/docs/en/hooks):
 
-| Hook Event | Triggered When | MoAI Handler |
-|-----------|---------------|--------------|
-| WorktreeCreate | Agent with isolation: worktree spawns | `moai hook worktree-create` |
-| WorktreeRemove | Agent with isolation: worktree terminates | `moai hook worktree-remove` |
+| Hook | Role | stdout contract | Failure mode |
+|---|---|---|---|
+| WorktreeCreate | Active creator — MUST actually create the worktree directory and echo its absolute path to stdout (plain text only, no JSON; HTTP hooks use `{"hookSpecificOutput": {"worktreePath": "..."}}`). | Single line: `/absolute/path/to/worktree` | Empty stdout OR any non-zero exit aborts creation |
+| WorktreeRemove | Observer — runs during/after removal for cleanup. | No output required | Failures logged in debug mode only |
 
-Hook scripts are located at:
-- `.claude/hooks/moai/handle-worktree-create.sh`
-- `.claude/hooks/moai/handle-worktree-remove.sh`
+The stdin JSON for both events includes `worktree_path` (Claude Code's proposed path), `name`, `cwd`, `session_id`, `transcript_path`, `hook_event_name`.
 
-Currently the handlers log worktree creation and removal for session tracking.
+**MoAI-ADK does NOT register these hooks by default.** Claude Code's default git worktree handling is sufficient for our agent isolation use case — write-heavy work is declared `isolation: worktree` by the retained `manager-develop` agent, by per-spawn `Agent(general-purpose)` specialists with a write-heavy domain whitelist, and by team-mode role profiles (implementer, tester, designer) per the Worktree Selection Rules above. Registering observer-only hooks here would replace the default behavior with non-functional stubs and produce `"WorktreeCreate hook returned a path that is not a directory: {}"` because an empty JSON object cannot be parsed as a path.
+
+If a future use case requires custom worktree creation (e.g., non-git VCS, shared-file symlinks, per-worktree database setup), implement an active creator hook that:
+
+1. Reads stdin JSON (fields: `worktree_path`, `name`, `cwd`, `session_id`).
+2. Performs `git worktree add` (or equivalent for the VCS), redirecting its stdout to `/dev/null` so it does not pollute the hook stdout.
+3. Prints **only** the absolute worktree path to stdout. All progress/diagnostic output goes to stderr.
+4. Exits 0 on success; any non-zero exit aborts creation.
+
+Handler files at `internal/hook/worktree_{create,remove}.go` and `internal/cli/hook.go` `worktree-create` / `worktree-remove` subcommands are preserved as opt-in infrastructure for future active-creator implementations. They are not registered in `.claude/settings.json` until such an implementation lands. Likewise, `.claude/hooks/moai/handle-worktree-{create,remove}.sh` wrapper scripts exist but are not invoked by any settings.json entry.
 
 ## Prompt Path Rules for Worktree-Isolated Agents
 
@@ -217,10 +280,10 @@ When the orchestrator generates prompts for agents spawned with `isolation: "wor
 
 ### HARD Rules
 
-- [HARD] Do NOT include absolute paths to the main project directory in agent prompts for write-target files
-- [HARD] Do NOT include `cd /absolute/project/path &&` in Bash commands within agent prompts
-- [HARD] Reference write-target files by project-root-relative paths (e.g., `src/domains/auth/handler.go`) and let the agent resolve from its own CWD
-- [HARD] `$CLAUDE_PROJECT_DIR` in hook commands is acceptable — Claude Code resolves this to the correct directory for the agent's context
+- [ZONE:Frozen] [HARD] Do NOT include absolute paths to the main project directory in agent prompts for write-target files
+- [ZONE:Frozen] [HARD] Do NOT include `cd /absolute/project/path &&` in Bash commands within agent prompts
+- [ZONE:Frozen] [HARD] Reference write-target files by project-root-relative paths (e.g., `src/domains/auth/handler.go`) and let the agent resolve from its own CWD
+- [ZONE:Frozen] [HARD] `$CLAUDE_PROJECT_DIR` in hook commands is acceptable — Claude Code resolves this to the correct directory for the agent's context
 
 ### Path Categories
 
@@ -239,8 +302,8 @@ When `isolation: "worktree"` is set, Claude Code:
 3. The agent constructs absolute paths from its own CWD
 
 ```
-Main repo:  /Users/user/project/src/auth/handler.go
-Worktree:   /Users/user/project/.claude/worktrees/abc123/src/auth/handler.go
+Main repo:  $HOME/project/src/auth/handler.go
+Worktree:   $HOME/project/.claude/worktrees/abc123/src/auth/handler.go
 ```
 
 Both share the same project structure. `src/auth/handler.go` resolves correctly in either context.
@@ -249,10 +312,10 @@ Both share the same project structure. `src/auth/handler.go` resolves correctly 
 
 ```
 # WRONG: Absolute path in prompt bypasses worktree
-"Read /Users/user/project/src/auth/handler.go and fix the bug"
+"Read $HOME/project/src/auth/handler.go and fix the bug"
 
 # WRONG: cd to main project in Bash command
-"Run: cd /Users/user/project && go test ./..."
+"Run: cd $HOME/project && go test ./..."
 
 # CORRECT: Relative path — agent resolves from its own CWD
 "The bug is in src/auth/handler.go. Read the file and fix it."
@@ -260,6 +323,33 @@ Both share the same project structure. `src/auth/handler.go` resolves correctly 
 # CORRECT: No cd prefix — agent CWD is already worktree root
 "Run: go test ./..."
 ```
+
+## Team Launch Patterns
+
+The `moai worktree new <SPEC-ID> --team` flag launches a Claude or GLM session inside the new worktree based on the current environment. See `.claude/skills/moai-workflow-worktree/SKILL.md` § `--team` Flag for the full P1-P4 decision matrix, detection logic, and example invocations.
+
+> **Two distinct `teammateMode` fields — do not conflate.** The `teammateMode` referenced in the §HARD Rules and P1-P4 detection below is MoAI's own `.claude/settings.local.json` launcher-selection field (values `"tmux"` / `"glm"` / `"claude"`), set by `moai cg` / `moai glm` / `moai cc`. This is SEPARATE from the Claude Code runtime `teammateMode` setting, whose default changed from `auto` to `in-process` as of Claude Code v2.1.179 — with the in-process default, split panes no longer auto-open. Additionally, as of Claude Code v2.1.181, an idle teammate's agent-panel row hides after 30 seconds and reappears on the next turn. These two CC-runtime behaviors govern how teammates are displayed; MoAI's launcher-selection `teammateMode` governs which launcher (`moai cg` / `moai glm` / `moai cc`) the `--team` flag invokes. Both fields happen to share the name `teammateMode`.
+
+### HARD Rules
+
+[ZONE:Frozen] [HARD] CLI launch decisions MUST NOT invoke `AskUserQuestion`. All four launch patterns (P1 tmux+CG → moai glm, P2 tmux+CC → moai cc, P3 no-tmux → syscall.Exec, P4 no-flag → handoff) are selected deterministically from observable state (tmux session presence, `teammateMode`, GLM env vars). This satisfies the Branch Origin Decision Protocol (see `.claude/rules/moai/development/branch-origin-protocol.md` § HARD Rules).
+
+Static guard: `internal/cli/worktree/new_test.go` `TestNew_NoAskUserQuestion` scans all team-launch sources for `AskUserQuestion` / `mcp__askuser` references.
+
+[ZONE:Frozen] [HARD] `--team` and `--tmux` are mutually exclusive at the cobra flag layer. Combining them is rejected before any worktree state is created.
+
+### Swarm Registry Baseline
+
+`.moai/state/swarm/<SPEC-ID>.json` (per-project, 0o600 perms) is written after successful team launch in P1, P2, or P3. The registry is NOT written for P4 (no spawn occurred), and is NOT written if pane spawn fails or worktree creation fails.
+
+The 7-field schema (`spec_id`, `worktree_path`, `branch`, `pane_id`, `mode`, `created_at`, `created_by_pid`) is the baseline for future `moai swarm status / done / kill-all` commands. Those commands are out of scope for the current worktree team-launch contract — the current contract delivers only the registry write.
+
+### Cross-references
+
+- `.claude/skills/moai-workflow-worktree/SKILL.md` § `--team` Flag (P1-P4 matrix + examples)
+- `internal/cli/worktree/team_launch.go`, `team_launch_posix.go`, `team_launch_windows.go`, `swarm_registry.go`, `handoff_guidance.go`
+- The canonical worktree team-launch contract requirements
+- Branch Origin Decision Protocol (BODP)
 
 ## Minimum Version Requirements
 
@@ -277,7 +367,7 @@ Both share the same project structure. `src/auth/handler.go` resolves correctly 
 | `CLAUDE_ENV_FILE` on Windows | **2.1.111** | Prior versions: no-op on Windows; fixed to inject env as on macOS/Linux |
 | `disableBypassPermissionsMode` policy | **2.1.111** | Prevents agents from requesting `bypassPermissions` when `true` |
 
-**Recommended**: Claude Code **2.1.111 or later** for Opus 4.7 support, MCP doctor warnings, and Windows CLAUDE_ENV_FILE parity. Minimum baseline: **2.1.97** for worktree isolation.
+**Recommended**: Claude Code **2.1.186 or later** for current background-agent permission-prompt semantics, Opus 4.7+ / 4.8 support, MCP doctor warnings, and Windows CLAUDE_ENV_FILE parity. Minimum baseline: **2.1.97** for worktree isolation.
 
 ## Troubleshooting
 
@@ -291,13 +381,19 @@ Both share the same project structure. `src/auth/handler.go` resolves correctly 
 
 ## SPEC-to-Worktree Mapping
 
-| SPEC Phase | Worktree Type | Location |
-|------------|--------------|----------|
-| Plan | Claude Native | `.claude/worktrees/` (ephemeral) |
-| Run | MoAI | `~/.moai/worktrees/{Project}/{SPEC}/` |
-| Sync | MoAI | Same as Run phase |
+[ZONE:Frozen] [HARD] Per-step worktree applicability is governed by `.claude/rules/moai/workflow/spec-workflow.md` § SPEC Phase Discipline (canonical source). This table summarizes the mapping for quick reference; on conflict, spec-workflow.md wins.
+
+| Step | Phase   | Worktree?                | Location                              | Lifecycle event              |
+|------|---------|--------------------------|---------------------------------------|------------------------------|
+| 1    | Plan    | **NO** (main checkout)   | n/a — `plan/SPEC-XXX` branch on main  | plan PR merged               |
+| 2    | Run     | **opt-in (L3 `--worktree` / Route B)** | `~/.moai/worktrees/{project}/{SPEC}/` | run PR merged                |
+| 3    | Sync    | **opt-in (L3 `--worktree` / Route B)** — same as Step 2 | same path as Step 2 (do NOT recreate) | sync PR merged               |
+| 4    | Cleanup | n/a                      | host checkout                         | `moai worktree done SPEC-XXX` |
+
+(clause updated for v2.1.186 semantics) Worktree usage is user opt-in per the opt-in policy; the default flow runs all phases on a `feat/SPEC-XXX` branch in the main checkout.
+
+[ZONE:Frozen] [HARD] Disposal contract: `moai worktree done SPEC-XXX` MUST run only after BOTH run PR AND sync PR are merged. Premature disposal between Step 2 merge and Step 3 merge breaks Sync.
 
 ---
 
-Version: 3.0.0 (HARD Rules + Decision Tree)
-Source: SPEC-WORKTREE-001
+Version: 4.1.0 (Team Protocol section removed — Agent Teams static layer retired)

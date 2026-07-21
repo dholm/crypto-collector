@@ -104,7 +104,8 @@ ehthumbs.db
 # Logs & Temporary Files
 # ===========================================
 *.log
-logs/
+logs/*
+!logs/.gitkeep
 *.tmp
 *.temp
 *.bak
@@ -114,6 +115,7 @@ logs/
 # Backups
 # ===========================================
 .moai-backups/
+.moai/backups/
 *.backup/
 *-backup/
 *_backup_*/
@@ -155,6 +157,10 @@ secret-*.*
 .aws/config
 .aws/credentials
 
+# MINK agent credentials (plaintext API keys, per AC-CR-026).
+# Ignored anywhere in the tree so per-project auth dirs are never committed.
+**/.mink/auth/
+
 # ===========================================
 # Claude Code Configuration
 # ===========================================
@@ -186,6 +192,21 @@ secret-*.*
 .moai/state/
 .moai/temp/
 .moai/worktrees/
+.moai/branches/
+
+# ===========================================
+# Update Noise-Suppression Ledgers (per-machine, never tracked)
+# Per-machine state + cache ledgers used to suppress redundant update noise.
+# ===========================================
+.moai/state/
+.moai/cache/
+
+# ===========================================
+# Plan Audit Reports (local artifacts)
+# Plan-audit verdict reports are local artifacts; only .gitkeep is tracked.
+# ===========================================
+.moai/reports/plan-audit/*.md
+!.moai/reports/plan-audit/.gitkeep
 
 # ===========================================
 # Evolution Telemetry (local-only usage data)
@@ -217,15 +238,5 @@ dist-ssr/
 .netlify/
 .firebase/
 
-# Local-only private instructions
-*.local.md
-
-# ===========================================
-# Rust Build Artifacts
-# ===========================================
 /target/
-
-# ===========================================
-# MoAI transient session state
-# ===========================================
-.moai/state/session-memo.md
+*.local.md

@@ -6,7 +6,7 @@ description: >
   legacy code or reducing technical debt safely.
 license: Apache-2.0
 compatibility: Designed for Claude Code
-allowed-tools: Read, Write, Edit, Bash(git:*), Bash(pytest:*), Bash(ruff:*), Bash(npm:*), Bash(npx:*), Bash(node:*), Bash(uv:*), Bash(make:*), Bash(cargo:*), Bash(go:*), Bash(mix:*), Bash(bundle:*), Grep, Glob, mcp__context7__resolve-library-id, mcp__context7__get-library-docs
+allowed-tools: Read, Write, Edit, Bash(git:*), Bash(pytest:*), Bash(ruff:*), Bash(npm:*), Bash(npx:*), Bash(node:*), Bash(uv:*), Bash(make:*), Bash(cargo:*), Bash(go:*), Bash(mix:*), Bash(bundle:*), Grep, Glob
 user-invocable: false
 metadata:
   version: "1.0.0"
@@ -16,8 +16,6 @@ metadata:
   modularized: "true"
   tags: "workflow, refactoring, ddd, domain-driven, behavior-preservation, ast-grep, characterization-tests"
   author: "MoAI-ADK Team"
-  context: "fork"
-  agent: "manager-ddd"
   related-skills: "moai-tool-ast-grep, moai-workflow-testing, moai-foundation-quality"
 ---
 
