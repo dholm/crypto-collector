@@ -63,7 +63,7 @@ scope, note only).
 
 ```yaml
 run_complete_at: 2026-07-21
-run_commit_sha: pending-backfill-M1      # single amended commit; SHA backfilled at sync (D3 exemption)
+run_commit_sha: d4640cf                  # single amended commit; SHA backfilled at sync (D3 exemption)
 run_status: pass
 ac_pass_count: 11                        # all AC verified (unit + live-DB)
 ac_fail_count: 0
@@ -77,4 +77,9 @@ m1_to_mN_commit_strategy: single-commit  # Tier S, one endpoint (amended in plac
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — owned by manager-docs>_
+```yaml
+sync_complete_at: 2026-07-21
+sync_status: audit-ready
+sync_commit_sha: pending-backfill-sync   # this commit cannot name its own hash (D3 self-reference exemption)
+doc_surface_scope: none                  # no CHANGELOG.md in this repo (do not create); README has no /v1 endpoint list (do not add); OpenAPI (api/crypto-collector.yaml) already updated by manager-develop in run-phase
+```

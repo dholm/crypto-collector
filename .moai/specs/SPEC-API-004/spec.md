@@ -2,7 +2,7 @@
 id: SPEC-API-004
 title: "All-Coin Latest-Quote Overview"
 version: "0.1.0"
-status: in-progress
+status: completed
 created: 2026-07-21
 updated: 2026-07-21
 author: dholm
