@@ -176,6 +176,11 @@ pub fn build_api_router(state: AppState) -> Router {
             "/v1/coins/stream/candles",
             get(websocket::stream_coin_candles),
         )
+        // ── All-coin latest-quote overview (SPEC-API-004 REQ-API-308: BEFORE /v1/coins/{coin_id}) ──
+        // NOTE: literal `/v1/coins/quotes/latest` MUST precede `/v1/coins/{coin_id}` so Axum's
+        // literal-first matching lets the `quotes` segment win over binding `{coin_id}="quotes"`
+        // (literal-before-param, REQ-API-148/308).
+        .route("/v1/coins/quotes/latest", get(quotes::list_latest_quotes))
         // ── Parameterised coin routes (must come after all literal /v1/coins/* routes) ──
         .route(
             "/v1/coins/{coin_id}",
@@ -266,6 +271,7 @@ mod tests {
             "/v1/coins/search",
             "/v1/coins/stream/quotes",
             "/v1/coins/stream/candles",
+            "/v1/coins/quotes/latest",
             "/v1/coins/{coin_id}",
             "/v1/coins/{coin_id}/metadata",
             "/v1/coins/{coin_id}/market/latest",
@@ -333,6 +339,35 @@ mod tests {
         assert!(
             stream_c_pos < param_pos,
             "stream/candles must precede /{{coin_id}}"
+        );
+    }
+
+    // SPEC-API-004 Scenario 9 (REQ-API-308): the literal /v1/coins/quotes/latest route is
+    // registered before the parameterised /v1/coins/{coin_id} route so it resolves as an
+    // endpoint and not as {coin_id}="quotes" (literal-before-param, REQ-API-148).
+    #[test]
+    fn quotes_latest_route_precedes_coin_id_param_route() {
+        // Mirrors the source registration order in build_api_router: the literal-first block
+        // (search + stream + quotes/latest) precedes the parameterised /{coin_id} route.
+        let ordered_routes = [
+            "/v1/coins/search",
+            "/v1/coins/stream/quotes",
+            "/v1/coins/stream/candles",
+            "/v1/coins/quotes/latest",
+            // Parameterised must come last
+            "/v1/coins/{coin_id}",
+        ];
+        let param_pos = ordered_routes
+            .iter()
+            .position(|r| *r == "/v1/coins/{coin_id}")
+            .unwrap();
+        let quotes_latest_pos = ordered_routes
+            .iter()
+            .position(|r| *r == "/v1/coins/quotes/latest")
+            .unwrap();
+        assert!(
+            quotes_latest_pos < param_pos,
+            "quotes/latest must precede /{{coin_id}}"
         );
     }
 
@@ -410,6 +445,7 @@ mod tests {
             "listCoinMarket",
             "getLatestCoinQuote",
             "listCoinQuotes",
+            "listLatestCoinQuotes",
             "listCoinCandles",
             "streamCoinQuotes",
             "streamCoinCandles",

@@ -157,6 +157,43 @@ impl From<CoinQuote> for CoinQuoteDto {
     }
 }
 
+// ── All-coin latest-quote overview DTOs (SPEC-API-004 REQ-API-301/302/303/304) ─
+
+/// Response DTO for one row of the all-coin latest-quote overview.
+///
+/// One row per active tracked coin with a current quote in the bounded window:
+/// `ts`/`price`/`source` describe the current spot quote; `open_24h` is the
+/// baseline price ~24h earlier (REQ-API-302). `price` serializes as a non-null
+/// JSON string; `open_24h` as a JSON string or `null` (REQ-API-303/304, OR-API-2)
+/// — Decimal end-to-end, never f64 (REQ-PROV-012).
+///
+/// Derives `FromRow` because the overview has no dedicated model: the bounded
+/// LATERAL-join query is executed inline in `list_latest_quotes` and each result
+/// row maps directly onto this DTO (OR-API4-1).
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct CoinQuoteOverviewDto {
+    pub coin_id: String,
+    pub vs_currency: String,
+    pub ts: DateTime<Utc>,
+    #[serde(with = "rust_decimal::serde::str")]
+    pub price: Decimal,
+    /// Baseline price ~24h earlier; `null` when the trailing 24h window holds no
+    /// earlier quote (never zero-filled, never omitted) (REQ-API-303).
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub open_24h: Option<Decimal>,
+    pub source: String,
+}
+
+/// Bare `{"quotes":[...]}` envelope for the all-coin overview (REQ-API-301).
+///
+/// Deliberately NOT the shared `Page{items,next_cursor}` wrapper (D1): a single
+/// unpaginated all-coin snapshot with no cursor and no `limit`. An empty result
+/// serializes as `{"quotes":[]}`.
+#[derive(Debug, Serialize)]
+pub struct CoinQuoteOverviewPage {
+    pub quotes: Vec<CoinQuoteOverviewDto>,
+}
+
 // ── Coin OHLCV candle DTOs (SPEC-API-002 REQ-API-141/142) ────────────────────
 
 /// Response DTO for a coin-keyed OHLCV candle.
@@ -382,6 +419,68 @@ mod tests {
         assert!(
             json.contains(r#""price":"0.00000000001234""#),
             "price must serialize as JSON string; got: {json}"
+        );
+    }
+
+    // SPEC-API-004 Scenario 6 (REQ-API-304): CoinQuoteOverviewDto price serializes as a
+    // JSON string and open_24h serializes as a string when Some.
+    #[test]
+    fn coin_quote_overview_dto_price_and_open_24h_serialize_as_strings() {
+        let dto = CoinQuoteOverviewDto {
+            coin_id: "bitcoin".into(),
+            vs_currency: "usd".into(),
+            ts: chrono::Utc::now(),
+            price: dec!(67123.45),
+            open_24h: Some(dec!(65000.00)),
+            source: "binance".into(),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            json.contains(r#""price":"67123.45""#),
+            "price must serialize as JSON string; got: {json}"
+        );
+        assert!(
+            json.contains(r#""open_24h":"65000.00""#),
+            "open_24h must serialize as JSON string when Some; got: {json}"
+        );
+    }
+
+    // SPEC-API-004 Scenario 5/6 (REQ-API-303): open_24h serializes as JSON null (not 0,
+    // not omitted) when None.
+    #[test]
+    fn coin_quote_overview_dto_null_open_24h_serializes_as_null() {
+        let dto = CoinQuoteOverviewDto {
+            coin_id: "dogecoin".into(),
+            vs_currency: "usd".into(),
+            ts: chrono::Utc::now(),
+            price: dec!(0.42),
+            open_24h: None,
+            source: "binance".into(),
+        };
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            json.contains(r#""open_24h":null"#),
+            "None open_24h must serialize as JSON null; got: {json}"
+        );
+        assert!(
+            !json.contains(r#""open_24h":"0""#) && !json.contains(r#""open_24h":0"#),
+            "None open_24h must never be zero-filled; got: {json}"
+        );
+    }
+
+    // SPEC-API-004 Scenario 2/3 (REQ-API-301): the envelope is a bare object with a single
+    // `quotes` array — never the Page{items,next_cursor} wrapper — and empty is {"quotes":[]}.
+    #[test]
+    fn coin_quote_overview_page_is_bare_quotes_envelope() {
+        let empty = CoinQuoteOverviewPage { quotes: vec![] };
+        let json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(
+            json, r#"{"quotes":[]}"#,
+            "empty overview must be {{\"quotes\":[]}}"
+        );
+        assert!(
+            !json.contains("items") && !json.contains("next_cursor"),
+            "overview envelope must not carry items/next_cursor; got: {json}"
         );
     }
 

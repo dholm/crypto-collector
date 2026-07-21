@@ -316,6 +316,38 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  # ── All-coin latest-quote overview (SPEC-API-004 REQ-API-300..309) ───────────
+
+  /coins/quotes/latest:
+    get:
+      operationId: listLatestCoinQuotes
+      tags: [quotes]
+      summary: All-coin latest-quote overview (current spot price + 24h baseline)
+      description: >
+        Returns, for every **active** tracked coin that has a current quote in
+        the bounded window, one overview row carrying the coin's current spot
+        price (`price`) and a nullable 24h-ago baseline (`open_24h`), in a single
+        unpaginated snapshot. The response is a bare `{"quotes":[...]}` object —
+        NOT the shared `Page{items,next_cursor}` wrapper — with no cursor and no
+        `limit`. `open_24h` is `null` (never zero, never omitted) when the
+        trailing 24h window holds no earlier quote. A coin with no quote in the
+        last 48h is absent from the response. `vs_currency` defaults to `usd` and
+        is not allow-list-validated — an unrecognised value yields `{"quotes":[]}`.
+      parameters:
+        - name: vs_currency
+          in: query
+          schema:
+            type: string
+            default: usd
+          description: Quote currency (default usd); unrecognised value yields an empty overview
+      responses:
+        '200':
+          description: All-coin latest-quote overview (empty is `{"quotes":[]}`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoinQuoteOverviewPage'
+
   # ── Coin spot quote endpoints (SPEC-API-002 REQ-API-120/121/122) ─────────────
 
   /coins/{coin_id}/quotes/latest:
@@ -775,6 +807,49 @@ components:
               type: array
               items:
                 $ref: '#/components/schemas/CoinQuote'
+
+    # ── All-coin latest-quote overview schemas (SPEC-API-004) ─────────────────────
+
+    CoinQuoteOverview:
+      type: object
+      required: [coin_id, vs_currency, ts, price, source]
+      description: >
+        One active coin's current spot quote plus a 24h-ago baseline. `ts`/`price`/`source`
+        describe the current quote; `open_24h` is the baseline price ~24h earlier.
+      properties:
+        coin_id:
+          type: string
+          example: bitcoin
+        vs_currency:
+          type: string
+          example: usd
+        ts:
+          type: string
+          format: date-time
+        price:
+          $ref: '#/components/schemas/DecimalString'
+        open_24h:
+          $ref: '#/components/schemas/DecimalString'
+          nullable: true
+          description: >
+            Baseline price ~24h earlier (earliest quote in the trailing 24h window).
+            `null` when the 24h window holds no earlier quote — never zero, never omitted.
+        source:
+          type: string
+          example: binance
+
+    CoinQuoteOverviewPage:
+      type: object
+      required: [quotes]
+      description: >
+        Bare all-coin overview envelope — a single unpaginated snapshot with one row per
+        active coin. Deliberately NOT the shared `Page{items,next_cursor}` wrapper: no cursor,
+        no `limit`. Empty result is `{"quotes":[]}`.
+      properties:
+        quotes:
+          type: array
+          items:
+            $ref: '#/components/schemas/CoinQuoteOverview'
 
     # ── Coin OHLCV candle schemas ────────────────────────────────────────────────
 
