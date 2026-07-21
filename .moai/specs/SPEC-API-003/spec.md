@@ -1,9 +1,9 @@
 ---
 id: SPEC-API-003
 version: 0.3.0
-status: draft
+status: completed
 created: 2026-07-01
-updated: 2026-07-01
+updated: 2026-07-21
 author: dholm
 priority: medium
 issue_number: 0
