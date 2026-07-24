@@ -283,8 +283,11 @@ impl CoinGeckoClient {
         market_id: i64,
         interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
-        let interval = coingecko_range_snap_interval(interval_secs);
-        let max_span = coingecko_range_max_span(interval);
+        // F-20: split the API request param ("daily"/"hourly") from the canonical stamp
+        // ("1d"/"1h") — the param goes to the endpoint, the canonical name is stamped on
+        // every returned candle so it lands in the shared interval vocabulary.
+        let (param, canonical) = coingecko_range_snap_interval(interval_secs);
+        let max_span = coingecko_range_max_span(param);
         let clamped_end = end.min(start + max_span);
 
         let from_str = start.format("%Y-%m-%dT%H:%M").to_string();
@@ -296,7 +299,7 @@ impl CoinGeckoClient {
                 ("vs_currency", vs_currency),
                 ("from", &from_str),
                 ("to", &to_str),
-                ("interval", interval),
+                ("interval", param),
             ])
             .send()
             .await?;
@@ -304,7 +307,7 @@ impl CoinGeckoClient {
         let raw: Vec<Value> = transport::get_json(resp, "ohlc/range").await?;
 
         raw.iter()
-            .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
+            .map(|v| normalise_ohlc_item(v, market_id, vs_currency, canonical))
             .collect()
     }
 
@@ -593,19 +596,34 @@ pub fn coingecko_days_for_interval(interval: &str, requested_days: u32) -> u32 {
     }
 }
 
-/// Snap an interval in seconds to the `/ohlc/range` endpoint's two supported bands.
+/// Snap an interval in seconds to the `/ohlc/range` endpoint's two supported bands,
+/// returning a `(api_param, canonical_stamp)` pair (mirroring Bitstamp's
+/// `snap_to_bitstamp_step` `(i64, &'static str)` shape).
 ///
-/// Unlike `coingecko_snap_interval` (three bands for the day-bucketed `/ohlc` endpoint),
-/// `/ohlc/range` accepts only `"daily"` or `"hourly"` (confirmed via CoinGecko's official
-/// API reference). We snap by nearest-neighbour distance to the band midpoint
-/// (1h = 3 600 s, 1d = 86 400 s); ties resolve to `"hourly"`.
-pub fn coingecko_range_snap_interval(interval_secs: i64) -> &'static str {
-    const BANDS: &[(i64, &str)] = &[(3_600, "hourly"), (86_400, "daily")];
+/// `/ohlc/range` accepts only `"daily"` or `"hourly"` as the request `interval` param
+/// (confirmed via CoinGecko's official API reference), but those strings are ABSENT from
+/// the canonical `candles_agg::interval_to_seconds` vocabulary. The first tuple element is
+/// therefore the API REQUEST param (`"daily"`/`"hourly"`); the second is the canonical
+/// STAMP (`"1d"`/`"1h"`) written on every returned candle. We snap by nearest-neighbour
+/// distance to the band midpoint (1h = 3 600 s, 1d = 86 400 s); ties resolve to daily.
+///
+// @MX:ANCHOR: [AUTO] coingecko_range_snap_interval — canonical-stamp contract for the range path
+// @MX:REASON: F-20 — the /ohlc/range path stamped the API param strings "daily"/"hourly" as the
+//             candle `interval`, which are ABSENT from candles_agg::interval_to_seconds, so
+//             range-backfilled rows were invisible to interval resolution and coverage selection.
+//             The canonical stamp this returns ("1d"/"1h") MUST be a member of
+//             candles_agg::interval_to_seconds (pairs with that @MX:ANCHOR); the tuple keeps the
+//             API request param ("daily"/"hourly") separate from the stamp ("1d"/"1h"), mirroring
+//             Bitstamp's snap_to_bitstamp_step (step, canonical) split.
+// @MX:SPEC: SPEC-PROV-003 REQ-PROV-065 REQ-PROV-066
+pub fn coingecko_range_snap_interval(interval_secs: i64) -> (&'static str, &'static str) {
+    // (band_secs, (api_param, canonical_stamp))
+    const BANDS: &[(i64, (&str, &str))] = &[(3_600, ("hourly", "1h")), (86_400, ("daily", "1d"))];
     BANDS
         .iter()
         .min_by_key(|(s, _)| (interval_secs - s).abs())
-        .map(|(_, name)| *name)
-        .unwrap_or("daily")
+        .map(|(_, pair)| *pair)
+        .unwrap_or(("daily", "1d"))
 }
 
 /// Maximum time span the `/ohlc/range` endpoint accepts in a single request, per interval.
@@ -1366,18 +1384,67 @@ mod tests {
         ));
     }
 
-    // ── coingecko_range_snap_interval: two-band snapping (daily/hourly) ──────
+    // ── coingecko_range_snap_interval: two-band (param, canonical) snapping (F-20) ──
 
     #[test]
-    fn range_snap_interval_near_hourly_gives_hourly() {
-        assert_eq!(coingecko_range_snap_interval(3_600), "hourly");
-        assert_eq!(coingecko_range_snap_interval(60), "hourly");
+    fn range_snap_interval_near_hourly_gives_hourly_param_and_1h_stamp() {
+        // API param stays "hourly"; the canonical STAMP is "1h" (REQ-PROV-065).
+        assert_eq!(coingecko_range_snap_interval(3_600), ("hourly", "1h"));
+        assert_eq!(coingecko_range_snap_interval(60), ("hourly", "1h"));
     }
 
     #[test]
-    fn range_snap_interval_near_daily_gives_daily() {
-        assert_eq!(coingecko_range_snap_interval(86_400), "daily");
-        assert_eq!(coingecko_range_snap_interval(200_000), "daily");
+    fn range_snap_interval_near_daily_gives_daily_param_and_1d_stamp() {
+        // API param stays "daily"; the canonical STAMP is "1d" (REQ-PROV-065).
+        assert_eq!(coingecko_range_snap_interval(86_400), ("daily", "1d"));
+        assert_eq!(coingecko_range_snap_interval(200_000), ("daily", "1d"));
+    }
+
+    /// Scenario 1 cross-module (REQ-PROV-066, AC-PROV-065): the canonical stamp the range
+    /// snap produces MUST be a member of the canonical `candles_agg::interval_to_seconds`
+    /// vocabulary — this ties the PRODUCER (coingecko range stamp) to the CONSUMER
+    /// (interval resolution). Before F-20 the range path stamped "daily"/"hourly", which
+    /// are ABSENT from that table, so range-backfilled rows were invisible to interval
+    /// resolution and coverage selection.
+    #[test]
+    fn range_stamp_resolves_through_interval_to_seconds_vocabulary() {
+        use crate::api::candles_agg::interval_to_seconds;
+
+        // Daily band → canonical "1d" → 86_400 s in the shared vocabulary.
+        let (daily_param, daily_stamp) = coingecko_range_snap_interval(86_400);
+        assert_eq!(daily_param, "daily", "API request param is unchanged");
+        assert_eq!(
+            daily_stamp, "1d",
+            "candles are stamped with the canonical name"
+        );
+        assert_eq!(interval_to_seconds(daily_stamp), Some(86_400));
+
+        // Hourly band → canonical "1h" → 3_600 s in the shared vocabulary.
+        let (hourly_param, hourly_stamp) = coingecko_range_snap_interval(3_600);
+        assert_eq!(hourly_param, "hourly");
+        assert_eq!(hourly_stamp, "1h");
+        assert_eq!(interval_to_seconds(hourly_stamp), Some(3_600));
+
+        // The API param strings themselves are NOT members of the vocabulary — proving
+        // the split is load-bearing (stamping them directly would orphan the rows).
+        assert_eq!(interval_to_seconds("daily"), None);
+        assert_eq!(interval_to_seconds("hourly"), None);
+    }
+
+    /// Scenario 1 (REQ-PROV-066): a range candle normalised with the canonical stamp
+    /// carries an interval present in the shared vocabulary (no orphan stamp).
+    #[test]
+    fn normalised_range_candle_interval_is_in_the_vocabulary() {
+        use crate::api::candles_agg::interval_to_seconds;
+
+        let item = json!([1719820000000i64, 100.0, 110.0, 90.0, 105.0]);
+        let (_param, canonical) = coingecko_range_snap_interval(86_400);
+        let candle = normalise_ohlc_item(&item, 1, "usd", canonical).expect("normalise");
+        assert_eq!(candle.interval, "1d");
+        assert!(
+            interval_to_seconds(&candle.interval).is_some(),
+            "every stamped range interval must be a member of interval_to_seconds"
+        );
     }
 
     #[test]
@@ -1435,7 +1502,10 @@ mod tests {
         assert_eq!(candles.len(), 2);
         assert!(candles.iter().all(|c| c.volume.is_none()));
         assert!(candles.iter().all(|c| c.source == "coingecko"));
-        assert!(candles.iter().all(|c| c.interval == "daily"));
+        // F-20: the outbound request `interval` param stays "daily" (asserted via the
+        // query_param matcher above), but the candles are stamped with the CANONICAL "1d"
+        // — a member of candles_agg::interval_to_seconds — NOT the non-canonical "daily".
+        assert!(candles.iter().all(|c| c.interval == "1d"));
     }
 
     #[tokio::test]
