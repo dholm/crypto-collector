@@ -72,11 +72,44 @@ impl CoinGeckoConfig {
 /// Parse a `serde_json::Number` into `Decimal` using the exact string representation.
 ///
 /// With `serde_json/arbitrary_precision`, `Number::to_string()` preserves the original
-/// JSON string (e.g. `"0.00000000001234"`), giving exact `Decimal` parse (REQ-PROV-012).
-/// This path never goes through `f64` and cannot lose precision.
+/// JSON string (e.g. `"0.00000000001234"` or the scientific `"1.234e-11"`), giving an
+/// exact `Decimal` parse (REQ-PROV-012). `from_str` handles plain/high-precision forms;
+/// scientific-notation forms — which `from_str` rejects — fall back to
+/// `Decimal::from_scientific` (F-23). This path NEVER goes through `f64` and cannot lose
+/// precision.
+///
+// @MX:ANCHOR: [AUTO] decimal_from_number — the Decimal-only monetary parse core
+// @MX:REASON: Every provider serde_json::Number -> Decimal conversion routes through here
+//             (fan_in >= 3 across every normaliser). The Decimal-only invariant is absolute:
+//             the scientific-notation fallback goes through Decimal::from_scientific, NEVER
+//             f64 (REQ-PROV-012). F-23 existed because from_str alone rejects exponent forms,
+//             so one micro-cap price serialized as "1.234e-11" failed a whole page.
+// @MX:SPEC: SPEC-PROV-003 REQ-PROV-074 REQ-PROV-012
 fn decimal_from_number(n: &serde_json::Number) -> Result<Decimal, ProviderError> {
     let s = n.to_string();
-    Decimal::from_str(&s).map_err(|e| ProviderError::Parse(format!("Decimal parse '{s}': {e}")))
+    Decimal::from_str(&s)
+        .or_else(|_| Decimal::from_scientific(&s))
+        .map_err(|e| ProviderError::Parse(format!("Decimal parse '{s}': {e}")))
+}
+
+/// Parse an OPTIONAL provider decimal field, degrading an unparseable value to `None` with
+/// a `warn!` — the item and its containing page survive (REQ-PROV-075, F-23). Required
+/// monetary fields use `decimal_from_number` directly and keep failing loudly.
+fn optional_decimal(n: Option<&serde_json::Number>, field: &str, coin_id: &str) -> Option<Decimal> {
+    let n = n?;
+    match decimal_from_number(n) {
+        Ok(d) => Some(d),
+        Err(e) => {
+            tracing::warn!(
+                coin_id = coin_id,
+                field = field,
+                value = %n,
+                error = %e,
+                "unparseable optional field; degrading to None (item + page survive)"
+            );
+            None
+        }
+    }
 }
 
 /// Parse epoch milliseconds to `DateTime<Utc>` (Scenario 14, REQ-PROV-032).
@@ -505,6 +538,10 @@ fn normalise_market_item(
     item: CgMarketItem,
     vs_currency: &str,
 ) -> Result<CoinMarket, ProviderError> {
+    let coin_id = item.id;
+
+    // Required monetary field: a missing OR unparseable price fails the item loudly
+    // (REQ-PROV-075).
     let price = item
         .current_price
         .as_ref()
@@ -512,42 +549,50 @@ fn normalise_market_item(
         .and_then(decimal_from_number)?;
 
     let ts = match &item.last_updated {
-        Some(s) => DateTime::parse_from_rfc3339(s)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
+        Some(s) => match DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(e) => {
+                // F-27: keep the Utc::now() fallback (NOT None) but no longer silently —
+                // a malformed upstream timestamp masquerading as a fresh quote time is
+                // now visible (REQ-PROV-076).
+                tracing::warn!(
+                    coin_id = %coin_id,
+                    value = %s,
+                    error = %e,
+                    "unparseable last_updated; falling back to Utc::now()"
+                );
+                Utc::now()
+            }
+        },
         None => Utc::now(),
     };
 
+    // Optional monetary fields: an unparseable value degrades to None + warn! (item + page
+    // survive) rather than poisoning the whole page (REQ-PROV-075).
+    let market_cap = optional_decimal(item.market_cap.as_ref(), "market_cap", &coin_id);
+    let fully_diluted_valuation = optional_decimal(
+        item.fully_diluted_valuation.as_ref(),
+        "fully_diluted_valuation",
+        &coin_id,
+    );
+    let circulating_supply = optional_decimal(
+        item.circulating_supply.as_ref(),
+        "circulating_supply",
+        &coin_id,
+    );
+    let total_supply = optional_decimal(item.total_supply.as_ref(), "total_supply", &coin_id);
+    let volume_24h = optional_decimal(item.total_volume.as_ref(), "total_volume", &coin_id);
+
     Ok(CoinMarket {
-        coin_id: item.id,
+        coin_id,
         vs_currency: item.vs_currency.unwrap_or_else(|| vs_currency.to_string()),
         ts,
         price,
-        market_cap: item
-            .market_cap
-            .as_ref()
-            .map(decimal_from_number)
-            .transpose()?,
-        fully_diluted_valuation: item
-            .fully_diluted_valuation
-            .as_ref()
-            .map(decimal_from_number)
-            .transpose()?,
-        circulating_supply: item
-            .circulating_supply
-            .as_ref()
-            .map(decimal_from_number)
-            .transpose()?,
-        total_supply: item
-            .total_supply
-            .as_ref()
-            .map(decimal_from_number)
-            .transpose()?,
-        volume_24h: item
-            .total_volume
-            .as_ref()
-            .map(decimal_from_number)
-            .transpose()?,
+        market_cap,
+        fully_diluted_valuation,
+        circulating_supply,
+        total_supply,
+        volume_24h,
         source: "coingecko".to_string(),
     })
 }
@@ -1162,6 +1207,86 @@ mod tests {
         assert!(market.fully_diluted_valuation.is_none());
         assert!(market.circulating_supply.is_none());
         assert!(market.total_supply.is_none());
+    }
+
+    // ── Scenario 5 (REQ-PROV-074/075): scientific-notation Decimal + degradation (F-23) ──
+
+    /// A plain, a high-precision, and a scientific-notation number all parse EXACTLY to
+    /// Decimal — the scientific forms via `Decimal::from_scientific`, never `f64`
+    /// (REQ-PROV-074).
+    #[test]
+    fn decimal_from_number_parses_plain_high_precision_and_scientific_exactly() {
+        let parse = |s: &str| {
+            let n: serde_json::Number = serde_json::from_str(s).expect("parse json number");
+            decimal_from_number(&n).expect("decimal")
+        };
+        // Plain and high-precision: from_str handles these.
+        assert_eq!(parse("123.45"), Decimal::from_str("123.45").unwrap());
+        assert_eq!(
+            parse("0.00000000001234"),
+            Decimal::from_str("0.00000000001234").unwrap()
+        );
+        // Scientific notation: from_str REJECTS these; from_scientific parses them exactly.
+        // 1.234e-11 == 0.00000000001234 (a micro-cap price).
+        assert_eq!(
+            parse("1.234e-11"),
+            Decimal::from_str("0.00000000001234").unwrap()
+        );
+        // Positive-exponent scientific form (5.89e14 == 589000000000000, a SHIB-like supply).
+        assert_eq!(
+            parse("5.89e14"),
+            Decimal::from_str("589000000000000").unwrap()
+        );
+    }
+
+    /// An unparseable OPTIONAL field (1e50 overflows Decimal in BOTH from_str and
+    /// from_scientific) degrades to `None` while the item + its required price survive
+    /// (REQ-PROV-075). Before F-23 the `.transpose()?` propagated the error and failed the
+    /// whole item — this is the regression guard.
+    #[test]
+    fn markets_optional_field_degrades_to_none_when_unparseable() {
+        let json_str = r#"[{
+            "id": "overflowcoin",
+            "current_price": 100.0,
+            "market_cap": 1e50,
+            "fully_diluted_valuation": null,
+            "circulating_supply": null,
+            "total_supply": null,
+            "max_supply": null,
+            "total_volume": null,
+            "last_updated": null
+        }]"#;
+        let items: Vec<CgMarketItem> = serde_json::from_str(json_str).expect("parse");
+        let market = normalise_market_item(items.into_iter().next().unwrap(), "usd")
+            .expect("item must survive an unparseable optional field");
+        assert_eq!(market.price, Decimal::from_str("100").unwrap());
+        assert!(
+            market.market_cap.is_none(),
+            "unparseable optional market_cap must degrade to None, not fail the item"
+        );
+    }
+
+    /// An unparseable REQUIRED monetary field (current_price) still fails the item loudly —
+    /// it does NOT degrade to None (REQ-PROV-075).
+    #[test]
+    fn markets_required_price_hard_fails_when_unparseable() {
+        let json_str = r#"[{
+            "id": "overflowcoin",
+            "current_price": 1e50,
+            "market_cap": null,
+            "fully_diluted_valuation": null,
+            "circulating_supply": null,
+            "total_supply": null,
+            "max_supply": null,
+            "total_volume": null,
+            "last_updated": null
+        }]"#;
+        let items: Vec<CgMarketItem> = serde_json::from_str(json_str).expect("parse");
+        let result = normalise_market_item(items.into_iter().next().unwrap(), "usd");
+        assert!(
+            matches!(result, Err(ProviderError::Parse(_))),
+            "an unparseable required price must fail the item, not degrade"
+        );
     }
 
     #[test]
