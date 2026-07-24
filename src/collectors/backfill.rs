@@ -14,6 +14,18 @@
 //!
 //! All mutating UPDATEs after the claim guard with `AND claimed_by = $self`.
 //! A heartbeat task keeps the lease alive during long fetches.
+//!
+//! # Attempt counting & backpressure (SPEC-SCHED-002 REQ-SCHED-060/061/063)
+//!
+//! `attempts` is incremented at claim time, but only genuine transient failures count
+//! toward `max_attempts`. A **non-failure release** — a multi-page partial release or an
+//! empty-page forward-skip — routes through `RELEASE_BACKFILL_SQL`, which neutralizes the
+//! claim-time increment (`attempts = GREATEST(attempts - 1, 0)`) and writes `last_error =
+//! NULL`, so walking a multi-year range never exhausts the retry budget (REQ-SCHED-060.1).
+//! **Pacer** `Cooldown`/`CreditExhausted` is backpressure — released without an attempt,
+//! then the worker idles (REQ-SCHED-061). A **permanent** failure (coin not found, no
+//! provider supports OHLC) routes through `FAIL_PERMANENT_BACKFILL_SQL` and fails on the
+//! first attempt (REQ-SCHED-063.2); a **transient** failure retries with backoff.
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -22,6 +34,8 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
+use crate::collectors::collection_queue::pacer_should_skip_queue;
+use crate::collectors::retry::DispatchError;
 use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
@@ -162,13 +176,19 @@ pub fn next_cursor_for_page(
 ///
 /// Predicate: `status = 'pending'` OR (`status IN ('claimed','running')` AND lease expired).
 /// Ordered oldest-first (`created_at ASC`) for fair claiming.
-/// Increments `attempts` at claim time to bound retries (REQ-SCHED-027).
+/// Increments `attempts` at claim time. Per SPEC-SCHED-002 REQ-SCHED-060 the bound counts
+/// only genuine transient failures: a non-failure release (`RELEASE_BACKFILL_SQL`) decrements
+/// `attempts` to neutralize this `+1`, so multi-page partial releases / forward-skips (F-01)
+/// no longer count pages toward the bound; a crash re-claim keeps its `+1` (crash-loops stay
+/// bounded, and the un-indexed backfill reclaim path is unaffected).
 ///
 // @MX:ANCHOR: [AUTO] CLAIM_BACKFILL_SQL — FOR UPDATE SKIP LOCKED; at-most-one-replica per chunk
 // @MX:REASON: fan_in >= 3: claim_backfill_chunk(), SQL-shape tests, DB integration tests.
 //             REQ-SCHED-022: lease-expired re-claim enables crash recovery without orphaning chunks.
 //             REQ-SCHED-027: attempts incremented at claim time for bound retry accounting.
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-021 REQ-SCHED-022 REQ-SCHED-027
+//             SPEC-SCHED-002 REQ-SCHED-060: RELEASE_BACKFILL_SQL neutralizes this +1 on non-failure
+//             releases, so the bound counts genuine failures, not pages walked (F-01 root-cause fix).
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-021 REQ-SCHED-022 REQ-SCHED-027 SPEC-SCHED-002 REQ-SCHED-060
 pub const CLAIM_BACKFILL_SQL: &str = "\
     UPDATE backfill_chunks SET \
         status           = 'claimed', \
@@ -221,11 +241,57 @@ pub const COMPLETE_BACKFILL_SQL: &str = "\
         updated_at       = now() \
     WHERE id = $1 AND claimed_by = $2";
 
-/// Fail or retry a chunk: reset to `pending` if under max_attempts, else mark `failed` (REQ-SCHED-027).
+/// Genuine transient-failure UPDATE: reset to `pending` if under max_attempts, else mark
+/// `failed` (REQ-SCHED-027). This is the **transient-failure-only** path — non-failure
+/// releases use `RELEASE_BACKFILL_SQL` and permanent failures use `FAIL_PERMANENT_BACKFILL_SQL`.
+///
+// @MX:NOTE: [AUTO] FAIL_OR_RETRY_BACKFILL_SQL — genuine transient-failure-only path (SPEC-SCHED-002 REQ-SCHED-060.3/063.3)
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-027 SPEC-SCHED-002 REQ-SCHED-060 REQ-SCHED-063
 pub const FAIL_OR_RETRY_BACKFILL_SQL: &str = "\
     UPDATE backfill_chunks SET \
         status           = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END, \
         last_error       = $4, \
+        claimed_by       = NULL, \
+        lease_expires_at = NULL, \
+        heartbeat_at     = NULL, \
+        updated_at       = now() \
+    WHERE id = $1 AND claimed_by = $2";
+
+/// Administrative (non-failure) release of a claimed chunk — a multi-page partial release
+/// or an empty-page forward-skip (SPEC-SCHED-002 REQ-SCHED-060.1/065.1). Resets to `pending`,
+/// writes a NON-error marker (`last_error = NULL`, never `"partial"`), and neutralizes the
+/// claim-time `attempts + 1` via `GREATEST(attempts - 1, 0)` so walking pages never consumes
+/// the retry budget. Carries the `AND claimed_by = $2` fence like the failure paths.
+///
+// @MX:WARN: [AUTO] RELEASE_BACKFILL_SQL — administrative release; neutralizes the claim-time attempts+1 and clears last_error
+// @MX:REASON: SPEC-SCHED-002 REQ-SCHED-060/065 root-cause guard (F-01). Do NOT "restore" the old
+//             FAIL_OR_RETRY reuse with i32::MAX — that made multi-page partial re-claims count pages
+//             toward max_attempts and overwrote a prior genuine last_error with "partial". This
+//             path must stay attempt-neutral. Also do NOT park chunks in claimed/running via
+//             lease_expires_at for cooldown deferral: that collides with the backfill-stalled alarm
+//             and the un-indexed reclaim path (see plan.md § Schema Investigation, R3).
+// @MX:SPEC: SPEC-SCHED-002 REQ-SCHED-060 REQ-SCHED-065
+pub const RELEASE_BACKFILL_SQL: &str = "\
+    UPDATE backfill_chunks SET \
+        status           = 'pending', \
+        last_error       = NULL, \
+        attempts         = GREATEST(attempts - 1, 0), \
+        claimed_by       = NULL, \
+        lease_expires_at = NULL, \
+        heartbeat_at     = NULL, \
+        updated_at       = now() \
+    WHERE id = $1 AND claimed_by = $2";
+
+/// Permanent-failure UPDATE: mark `failed` immediately, regardless of `attempts`
+/// (SPEC-SCHED-002 REQ-SCHED-063.2). A permanent failure is terminal and does not consume
+/// or rely on the `max_attempts` retry budget. Carries the `AND claimed_by = $2` fence.
+///
+// @MX:NOTE: [AUTO] FAIL_PERMANENT_BACKFILL_SQL — terminal fail-fast, retry-budget-independent (SPEC-SCHED-002 REQ-SCHED-063.2)
+// @MX:SPEC: SPEC-SCHED-002 REQ-SCHED-063
+pub const FAIL_PERMANENT_BACKFILL_SQL: &str = "\
+    UPDATE backfill_chunks SET \
+        status           = 'failed', \
+        last_error       = $3, \
         claimed_by       = NULL, \
         lease_expires_at = NULL, \
         heartbeat_at     = NULL, \
@@ -336,7 +402,9 @@ pub async fn complete_backfill_chunk(
     Ok(())
 }
 
-/// Fail or retry a chunk (REQ-SCHED-027).
+/// Fail or retry a chunk on a genuine transient failure (REQ-SCHED-027). Non-failure
+/// releases use [`release_backfill_chunk`]; permanent failures use
+/// [`fail_permanent_backfill_chunk`].
 pub async fn fail_or_retry_backfill_chunk(
     pool: &PgPool,
     id: i64,
@@ -348,6 +416,39 @@ pub async fn fail_or_retry_backfill_chunk(
         .bind(id)
         .bind(claimed_by)
         .bind(max_attempts)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Administratively release a claimed chunk for a non-failure reason (a multi-page partial
+/// release or an empty-page forward-skip) without consuming the retry budget
+/// (SPEC-SCHED-002 REQ-SCHED-060.1/061/065.1).
+pub async fn release_backfill_chunk(
+    pool: &PgPool,
+    id: i64,
+    claimed_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(RELEASE_BACKFILL_SQL)
+        .bind(id)
+        .bind(claimed_by)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Mark a chunk permanently `failed` on a permanent dispatch error, immediately and
+/// independent of the retry budget (SPEC-SCHED-002 REQ-SCHED-063.2).
+pub async fn fail_permanent_backfill_chunk(
+    pool: &PgPool,
+    id: i64,
+    claimed_by: &str,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(FAIL_PERMANENT_BACKFILL_SQL)
+        .bind(id)
+        .bind(claimed_by)
         .bind(error)
         .execute(pool)
         .await?;
@@ -557,18 +658,37 @@ fn first_range_provider(chain: &[Arc<dyn Provider>]) -> Option<String> {
 
 // ── Worker loop ───────────────────────────────────────────────────────────────
 
-/// Process one claimed backfill chunk to completion (or failure).
+/// Outcome of processing one backfill chunk page (SPEC-SCHED-002 REQ-SCHED-060/061/063).
 ///
-/// Returns `(max_ts, interval_secs)` on success: `max_ts` is the max candle timestamp
-/// persisted this page (`None` when the page was empty); `interval_secs` is the
-/// candle granularity used, which the caller needs to compute the empty-page
-/// forward-skip span (see [`next_cursor_for_page`]).
+/// The `Err` channel ([`DispatchError`]) carries genuine failures classified
+/// transient-vs-permanent; pacer backpressure is the `SoftSkip` non-failure variant here,
+/// so it never touches the retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkOutcome {
+    /// A page was processed. `max_ts` is the max candle timestamp persisted this page
+    /// (`None` when the page was empty); `interval_secs` is the candle granularity used,
+    /// needed to compute the empty-page forward-skip span (see [`next_cursor_for_page`]).
+    Progress {
+        max_ts: Option<DateTime<Utc>>,
+        interval_secs: i64,
+    },
+    /// Pacer backpressure (cooldown / credit exhaustion) — release without an attempt,
+    /// then idle (REQ-SCHED-061).
+    SoftSkip,
+}
+
+/// Process one claimed backfill chunk page.
+///
+/// Returns `Ok(ChunkOutcome::Progress { .. })` after persisting a page (possibly empty),
+/// `Ok(ChunkOutcome::SoftSkip)` on pacer backpressure (no attempt consumed),
+/// `Err(DispatchError::Transient)` on a retryable failure, and `Err(DispatchError::Permanent)`
+/// on a terminal failure (coin not found, no provider supports OHLC — fail-fast, REQ-SCHED-063).
 async fn process_chunk(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     chunk: &ClaimedChunk,
     registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<(Option<DateTime<Utc>>, i64), String> {
+) -> Result<ChunkOutcome, DispatchError> {
     // Look up coin's trading symbol and per-coin poll interval from tracked_coins.
     let row: Option<(String, Option<String>)> = sqlx::query_as(
         "SELECT symbol, live_poll_interval::TEXT FROM tracked_coins WHERE coin_id = $1",
@@ -576,9 +696,9 @@ async fn process_chunk(
     .bind(&chunk.coin_id)
     .fetch_optional(pool)
     .await
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| DispatchError::Transient(e.to_string()))?;
     let (symbol, live_poll_interval) =
-        row.ok_or_else(|| format!("coin {} not found", chunk.coin_id))?;
+        row.ok_or_else(|| DispatchError::Permanent(format!("coin {} not found", chunk.coin_id)))?;
 
     let mq = MarketQuery {
         market_id: 0,
@@ -617,11 +737,19 @@ async fn process_chunk(
     } else {
         first_ohlc_provider(chain)
     }
-    .ok_or_else(|| "no provider supports OHLC".to_string())?;
+    .ok_or_else(|| DispatchError::Permanent("no provider supports OHLC".to_string()))?;
 
-    acquire_slot(pool, &provider_name)
-        .await
-        .map_err(|e| format!("pacer: {e}"))?;
+    // Classify the pacer outcome: cooldown / credit exhaustion is backpressure (soft-skip,
+    // no attempt), mirroring the collection-queue worker's `pacer_should_skip_queue`
+    // classification (REQ-SCHED-061); any other pacer error is a genuine transient failure.
+    match acquire_slot(pool, &provider_name).await {
+        Ok(()) => {}
+        Err(ref e) if pacer_should_skip_queue(e) => {
+            warn!("backfill_worker: pacer skip for chunk {}: {e}", chunk.id);
+            return Ok(ChunkOutcome::SoftSkip);
+        }
+        Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
+    }
 
     let candles = if use_range_path {
         let range_start = start.expect("checked by use_range_path");
@@ -635,16 +763,19 @@ async fn process_chunk(
             registry,
         )
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| DispatchError::Transient(e.to_string()))?
     } else {
         let days = range_to_days(start, chunk.range_end, 90); // fallback: recent-window path
         chain_fetch_ohlc_for_chunk(chain, &mq, days, interval_secs, registry)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| DispatchError::Transient(e.to_string()))?
     };
 
     if candles.is_empty() {
-        return Ok((None, interval_secs));
+        return Ok(ChunkOutcome::Progress {
+            max_ts: None,
+            interval_secs,
+        });
     }
 
     // Filter to range (provider may return slightly outside bounds).
@@ -684,14 +815,17 @@ async fn process_chunk(
                 if let Some(reg) = registry {
                     reg.record_upsert_failure();
                 }
-                return Err(e.to_string());
+                return Err(DispatchError::Transient(e.to_string()));
             }
         }
     }
 
     // Return the max timestamp for cursor advancement.
     let max_ts = filtered.iter().map(|c| c.ts).max();
-    Ok((max_ts, interval_secs))
+    Ok(ChunkOutcome::Progress {
+        max_ts,
+        interval_secs,
+    })
 }
 
 /// Run the backfill worker loop (REQ-SCHED-020/050/051).
@@ -717,15 +851,23 @@ pub async fn run_backfill_worker(
         let chunk = match claim_backfill_chunk(&pool, &claimed_by, lease_secs).await {
             Ok(Some(c)) => c,
             Ok(None) => {
+                // Chunk queue empty: idle until next check or shutdown. Break out of the
+                // loop when the shutdown sender is dropped (`changed()` → Err) rather than
+                // busy-spin on the immediate error (REQ-SCHED-065.3).
                 tokio::select! {
-                    _ = shutdown.changed() => {}
+                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
                     _ = tokio::time::sleep(idle_sleep) => {}
                 }
                 continue;
             }
             Err(e) => {
                 error!("backfill_worker: claim error: {e}");
-                tokio::time::sleep(StdDuration::from_secs(1)).await;
+                // Bounded pause raced against shutdown, not a bare sleep, so shutdown is
+                // prompt and a dropped sender breaks the loop (REQ-SCHED-062/065.3).
+                tokio::select! {
+                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                    _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
+                }
                 continue;
             }
         };
@@ -759,8 +901,15 @@ pub async fn run_backfill_worker(
         let result = process_chunk(&pool, &chain, &chunk, registry.as_deref()).await;
         hb_handle.abort();
 
+        // After a soft-skip or a retryable-failure release, pause before the next claim so
+        // a provider cooldown does not become a tight loop against the DB (REQ-SCHED-062).
+        let mut pause_before_next_claim = false;
+
         match result {
-            Ok((max_ts, interval_secs)) => {
+            Ok(ChunkOutcome::Progress {
+                max_ts,
+                interval_secs,
+            }) => {
                 // Empty-page forward-skip span: a fixed step tied to the candle
                 // interval and the largest provider page cap (Binance: 1000 candles
                 // per page) guarantees forward progress and termination even when a
@@ -791,20 +940,12 @@ pub async fn run_backfill_worker(
                     }
                     info!("backfill_worker: chunk {} done", chunk.id);
                 } else {
-                    // More data in range (or an empty page was skipped forward):
-                    // release for next cycle. Uses i32::MAX for max_attempts so a
-                    // partial release / forward-skip is never counted as a failure
-                    // toward the chunk's retry/fail limit (matches the non-empty
-                    // partial-release path below).
-                    if let Err(e) = fail_or_retry_backfill_chunk(
-                        &pool,
-                        chunk.id,
-                        &claimed_by,
-                        i32::MAX,
-                        "partial",
-                    )
-                    .await
-                    {
+                    // More data in range (or an empty page was skipped forward): this is a
+                    // NON-failure release. Route through RELEASE_BACKFILL_SQL so the
+                    // claim-time attempts+1 is neutralized and a prior genuine last_error is
+                    // not overwritten — a multi-page walk never consumes the retry budget
+                    // (REQ-SCHED-060.1, F-01 root-cause fix). No pause: this is forward progress.
+                    if let Err(e) = release_backfill_chunk(&pool, chunk.id, &claimed_by).await {
                         error!(
                             "backfill_worker: partial-release error for chunk {}: {e}",
                             chunk.id
@@ -812,13 +953,41 @@ pub async fn run_backfill_worker(
                     }
                 }
             }
-            Err(e) => {
+            Ok(ChunkOutcome::SoftSkip) => {
+                // Pacer backpressure: administratively release WITHOUT consuming the retry
+                // budget, then idle (REQ-SCHED-061). Mirrors the collection-queue soft-skip.
+                if let Err(e) = release_backfill_chunk(&pool, chunk.id, &claimed_by).await {
+                    error!(
+                        "backfill_worker: soft-skip release error for chunk {}: {e}",
+                        chunk.id
+                    );
+                }
+                pause_before_next_claim = true;
+            }
+            Err(DispatchError::Permanent(msg)) => {
+                // Terminal: fail immediately on the first attempt, independent of the retry
+                // budget (REQ-SCHED-063.2). No pause — the next claim is a different chunk.
                 warn!(
-                    "backfill_worker: chunk {} failed (attempts={}/{}): {e}",
+                    "backfill_worker: chunk {} permanently failed: {msg}",
+                    chunk.id
+                );
+                if let Err(db_err) =
+                    fail_permanent_backfill_chunk(&pool, chunk.id, &claimed_by, &msg).await
+                {
+                    error!(
+                        "backfill_worker: permanent-fail update error for chunk {}: {db_err}",
+                        chunk.id
+                    );
+                }
+            }
+            Err(DispatchError::Transient(msg)) => {
+                // Retryable: retry or fail at max_attempts (REQ-SCHED-027/063.3), then pause.
+                warn!(
+                    "backfill_worker: chunk {} failed (attempts={}/{}): {msg}",
                     chunk.id, chunk.attempts, max_attempts
                 );
                 if let Err(db_err) =
-                    fail_or_retry_backfill_chunk(&pool, chunk.id, &claimed_by, max_attempts, &e)
+                    fail_or_retry_backfill_chunk(&pool, chunk.id, &claimed_by, max_attempts, &msg)
                         .await
                 {
                     error!(
@@ -826,6 +995,16 @@ pub async fn run_backfill_worker(
                         chunk.id
                     );
                 }
+                pause_before_next_claim = true;
+            }
+        }
+
+        if pause_before_next_claim {
+            // Bounded pause raced against shutdown (REQ-SCHED-062.1): shutdown stays prompt,
+            // and a dropped sender breaks the loop instead of busy-spinning (REQ-SCHED-065.3).
+            tokio::select! {
+                res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                _ = tokio::time::sleep(idle_sleep) => {}
             }
         }
     }
@@ -1203,6 +1382,104 @@ mod tests {
         );
     }
 
+    // ── SPEC-SCHED-002: administrative-release + permanent-fail SQL shape ─────
+
+    #[test]
+    fn release_backfill_sql_neutralizes_claim_increment() {
+        assert!(
+            RELEASE_BACKFILL_SQL.contains("attempts         = GREATEST(attempts - 1, 0)"),
+            "release SQL must neutralize the claim-time attempts+1 (REQ-SCHED-060.1)"
+        );
+    }
+
+    #[test]
+    fn release_backfill_sql_resets_pending_and_clears_last_error() {
+        assert!(
+            RELEASE_BACKFILL_SQL.contains("status           = 'pending'"),
+            "release SQL must reset the chunk to pending"
+        );
+        assert!(
+            RELEASE_BACKFILL_SQL.contains("last_error       = NULL"),
+            "release SQL must write NULL (not 'partial') to last_error (REQ-SCHED-065.1)"
+        );
+    }
+
+    #[test]
+    fn release_backfill_sql_uses_fencing_guard() {
+        assert!(
+            RELEASE_BACKFILL_SQL.contains("AND claimed_by = $2"),
+            "release SQL must preserve the claimed_by fence"
+        );
+    }
+
+    #[test]
+    fn permanent_fail_backfill_sql_is_unconditional_failed() {
+        assert!(
+            FAIL_PERMANENT_BACKFILL_SQL.contains("status           = 'failed'"),
+            "permanent-fail SQL must set status = 'failed' unconditionally (REQ-SCHED-063.2)"
+        );
+        assert!(
+            !FAIL_PERMANENT_BACKFILL_SQL.contains("attempts"),
+            "permanent-fail SQL must not depend on the attempts budget (REQ-SCHED-063.2)"
+        );
+        assert!(
+            FAIL_PERMANENT_BACKFILL_SQL.contains("AND claimed_by = $2"),
+            "permanent-fail SQL must preserve the claimed_by fence"
+        );
+    }
+
+    // ── AC-SCHED-061: backfill classifies pacer cooldown as soft-skip ────────
+    // Mirrors the collection_queue soft-skip classification tests — the backfill worker
+    // calls the SAME `pacer_should_skip_queue` predicate, so cooldown/credit-exhaustion is
+    // backpressure (released without an attempt) and NotFound is a genuine error.
+
+    #[test]
+    fn backfill_classifies_cooldown_as_soft_skip() {
+        let cooldown =
+            crate::pacer::AcquireSlotError::Cooldown("coingecko".to_string(), chrono::Utc::now());
+        assert!(
+            pacer_should_skip_queue(&cooldown),
+            "backfill must treat pacer cooldown as backpressure (REQ-SCHED-061)"
+        );
+    }
+
+    #[test]
+    fn backfill_classifies_credit_exhausted_as_soft_skip() {
+        let exhausted = crate::pacer::AcquireSlotError::CreditExhausted("coingecko".to_string());
+        assert!(
+            pacer_should_skip_queue(&exhausted),
+            "backfill must treat credit exhaustion as backpressure (REQ-SCHED-061)"
+        );
+    }
+
+    #[test]
+    fn backfill_does_not_soft_skip_not_found() {
+        let not_found = crate::pacer::AcquireSlotError::NotFound("coingecko".to_string());
+        assert!(
+            !pacer_should_skip_queue(&not_found),
+            "pacer NotFound is a genuine error, not backpressure (acceptance.md edge case)"
+        );
+    }
+
+    // ── AC-SCHED-065c: guarded shutdown select! arm (mechanical) ──────────────
+
+    #[test]
+    fn worker_select_arms_guard_dropped_sender() {
+        let src = std::fs::read_to_string("src/collectors/backfill.rs").expect("read backfill.rs");
+        // Scan only the production code (before the test module) so this scan does not match
+        // its own assertion-message string literals.
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            code.contains("res.is_err()"),
+            "worker loop select! arms must break on a dropped shutdown sender (REQ-SCHED-065.3)"
+        );
+        assert!(
+            !code.contains("_ = shutdown.changed()"),
+            "no un-captured `_ = shutdown.changed()` arm may remain — the result must be \
+             bound and is_err()-guarded (REQ-SCHED-065.3)"
+        );
+    }
+
     #[test]
     fn enqueue_job_sql_uses_on_conflict_do_nothing() {
         assert!(
@@ -1498,5 +1775,179 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup tracked_coins");
+    }
+
+    /// AC-SCHED-060a / REQ-SCHED-060.1: a chunk that is claimed and partial-released more
+    /// than `max_attempts` times (walking pages) and then hits exactly ONE genuine transient
+    /// failure must remain `pending` (still retryable), NOT `failed` — page count must never
+    /// fail a chunk (F-01 root-cause regression test).
+    #[tokio::test]
+    #[ignore]
+    async fn db_partial_release_page_walk_does_not_fail_chunk() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+        let max_attempts = 5;
+        let coin_id = "test-f01-page-walk";
+
+        // Fresh job + chunk (no tracked_coins row needed — this drives the claim/release SQL
+        // wrappers directly, not process_chunk).
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup jobs");
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
+             VALUES ($1, 'ohlc_1d', 'pending', now(), now()) RETURNING id",
+        )
+        .bind(coin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert job");
+        let chunk_id: i64 = sqlx::query_scalar(
+            "INSERT INTO backfill_chunks \
+             (job_id, coin_id, dataset, interval, range_start, range_end, status, created_at, updated_at) \
+             VALUES ($1, $2, 'ohlc_1d', '1d', now() - INTERVAL '30 days', now(), 'pending', now(), now()) \
+             RETURNING id",
+        )
+        .bind(job_id)
+        .bind(coin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert chunk");
+
+        // Walk pages: claim (attempts += 1) then partial-release (attempts -= 1), more than
+        // max_attempts times.
+        for _ in 0..(max_attempts + 3) {
+            let claimed = claim_backfill_chunk(&pool, "test-replica", 300)
+                .await
+                .expect("claim")
+                .expect("should re-claim the released chunk");
+            assert_eq!(claimed.id, chunk_id);
+            release_backfill_chunk(&pool, chunk_id, "test-replica")
+                .await
+                .expect("partial release");
+        }
+
+        let attempts_after_walk: i32 =
+            sqlx::query_scalar("SELECT attempts FROM backfill_chunks WHERE id = $1")
+                .bind(chunk_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch attempts");
+        assert_eq!(
+            attempts_after_walk, 0,
+            "page-walking must leave the effective attempt count unchanged (REQ-SCHED-060.1)"
+        );
+
+        // One genuine transient failure: claim (attempts→1) then fail_or_retry.
+        let claimed = claim_backfill_chunk(&pool, "test-replica", 300)
+            .await
+            .expect("claim")
+            .expect("claim for genuine failure");
+        assert_eq!(claimed.attempts, 1);
+        fail_or_retry_backfill_chunk(&pool, chunk_id, "test-replica", max_attempts, "boom")
+            .await
+            .expect("genuine transient failure");
+
+        let status: String = sqlx::query_scalar("SELECT status FROM backfill_chunks WHERE id = $1")
+            .bind(chunk_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch status");
+        assert_eq!(
+            status, "pending",
+            "a page-count of releases must not fail a chunk (F-01, AC-SCHED-060a)"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup jobs");
+    }
+
+    /// AC-SCHED-060c / REQ-SCHED-060.3: genuine failures still bound retries — after
+    /// `max_attempts` genuine transient failures the chunk is marked `failed`.
+    #[tokio::test]
+    #[ignore]
+    async fn db_genuine_failures_still_bound_retries() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+        let max_attempts = 3;
+        let coin_id = "test-f01-bound";
+
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup jobs");
+        let job_id: i64 = sqlx::query_scalar(
+            "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
+             VALUES ($1, 'ohlc_1d', 'pending', now(), now()) RETURNING id",
+        )
+        .bind(coin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert job");
+        let chunk_id: i64 = sqlx::query_scalar(
+            "INSERT INTO backfill_chunks \
+             (job_id, coin_id, dataset, interval, range_start, range_end, status, created_at, updated_at) \
+             VALUES ($1, $2, 'ohlc_1d', '1d', now() - INTERVAL '30 days', now(), 'pending', now(), now()) \
+             RETURNING id",
+        )
+        .bind(job_id)
+        .bind(coin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("insert chunk");
+
+        // max_attempts genuine transient failures: each claims (attempts += 1) then fails.
+        let mut last_status = String::new();
+        for _ in 0..max_attempts {
+            let claimed = claim_backfill_chunk(&pool, "test-replica", 300)
+                .await
+                .expect("claim")
+                .expect("claim");
+            fail_or_retry_backfill_chunk(&pool, chunk_id, "test-replica", max_attempts, "boom")
+                .await
+                .expect("genuine failure");
+            last_status = sqlx::query_scalar("SELECT status FROM backfill_chunks WHERE id = $1")
+                .bind(claimed.id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch status");
+        }
+        assert_eq!(
+            last_status, "failed",
+            "max_attempts genuine failures must mark the chunk failed (REQ-SCHED-060.3)"
+        );
+
+        sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup chunks");
+        sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup jobs");
     }
 }

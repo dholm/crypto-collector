@@ -20,6 +20,7 @@ pub mod collection_queue;
 pub mod cycle_overlay;
 pub mod cycle_projection;
 pub mod live_poller;
+pub mod retry;
 pub mod rollup;
 
 use sqlx::PgPool;
@@ -43,6 +44,9 @@ pub struct WorkerConfig {
     pub live_quote_poll_interval_secs: i64,
     /// In-flight claim TTL: self-expiry protects against crashed replicas.
     pub live_poll_claim_ttl_secs: i64,
+    /// Max coins claimed per live-poll batch, sized to complete within the claim TTL
+    /// (SPEC-SCHED-002 REQ-SCHED-064).
+    pub live_poll_claim_batch_limit: i64,
     /// How often to tick the live-poller loop.
     pub live_poller_tick: Duration,
 
@@ -75,6 +79,7 @@ impl WorkerConfig {
             replica_id: config::replica_id().to_string(),
             live_quote_poll_interval_secs: config::live_quote_poll_interval_secs(),
             live_poll_claim_ttl_secs: config::live_poll_claim_ttl_secs(),
+            live_poll_claim_batch_limit: config::live_poll_claim_batch_limit(),
             // Tick at 1/6th of the poll interval (min 5s) so a coin whose due
             // time slips past a tick boundary is picked up within one extra tick,
             // not an entire poll-interval later.
@@ -228,6 +233,7 @@ async fn run_supervised_live_poller(
                 chain_inner,
                 cfg_inner.live_quote_poll_interval_secs,
                 cfg_inner.live_poll_claim_ttl_secs,
+                cfg_inner.live_poll_claim_batch_limit,
                 cfg_inner.live_poller_tick,
                 shutdown_inner,
                 registry_inner,

@@ -87,18 +87,24 @@ pub fn pacer_should_skip(err: &AcquireSlotError) -> bool {
 ///
 /// $1 = global default cadence as `"<n> seconds"` INTERVAL string (REQ-SCHED-002).
 /// $2 = claim TTL as `"<n> seconds"` INTERVAL string (REQ-SCHED-007).
+/// $3 = claim-batch bound (`LIVE_POLL_CLAIM_BATCH_LIMIT`, REQ-SCHED-064.1/064.2).
 ///
 /// INVARIANT: sets `live_poll_claimed_until` (the in-flight marker), NOT `last_polled_at`.
 /// INVARIANT: this SQL runs inside a short tx that commits BEFORE any provider call.
+/// INVARIANT: `LIMIT $3` bounds each batch so a full batch completes within the claim TTL;
+///            `ORDER BY last_polled_at ASC NULLS FIRST` gives the most-overdue (and
+///            never-polled) coins priority so the bound does not starve any coin.
 ///
-// @MX:ANCHOR: [AUTO] LIVE_COIN_CLAIM_SQL — due+not-in-flight predicate; marker-on-claim in short tx
+// @MX:ANCHOR: [AUTO] LIVE_COIN_CLAIM_SQL — due+not-in-flight predicate; marker-on-claim in short tx; LIMIT-bounded batch
 // @MX:REASON: fan_in >= 3: claim_due_coins(), SQL-shape tests, DB integration test.
 //             REQ-SCHED-003: sets live_poll_claimed_until NOT last_polled_at.
 //             REQ-SCHED-004: claim tx commits/releases locks BEFORE any provider network call.
 //             REQ-SCHED-007: self-expiring marker = cross-replica in-flight dedup.
+//             SPEC-SCHED-002 REQ-SCHED-064: LIMIT $3 sizes the batch to complete within the
+//             claim TTL, so a full batch never outlives its own marker.
 // @MX:WARN: [AUTO] do NOT add any provider or network call inside the transaction that runs this SQL
 // @MX:REASON: holding a row lock across network I/O serialises all replicas through one DB lock cycle
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-003 REQ-SCHED-004 REQ-SCHED-007
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-003 REQ-SCHED-004 REQ-SCHED-007 SPEC-SCHED-002 REQ-SCHED-064
 pub const LIVE_COIN_CLAIM_SQL: &str = "\
     WITH claimed AS (\
         SELECT coin_id FROM tracked_coins \
@@ -106,6 +112,8 @@ pub const LIVE_COIN_CLAIM_SQL: &str = "\
           AND (last_polled_at IS NULL \
                OR last_polled_at + COALESCE(live_poll_interval, $1::interval) <= now()) \
           AND (live_poll_claimed_until IS NULL OR live_poll_claimed_until <= now()) \
+        ORDER BY last_polled_at ASC NULLS FIRST \
+        LIMIT $3 \
         FOR UPDATE SKIP LOCKED\
     ) \
     UPDATE tracked_coins \
@@ -142,6 +150,26 @@ pub const LIVE_COIN_FAILURE_CLEAR_SQL: &str = "\
     SET live_poll_claimed_until = NULL \
     WHERE coin_id = $1";
 
+/// Permanent per-coin-error UPDATE: defer the coin's re-claim by setting the in-flight
+/// marker FORWARD by a widened interval, instead of clearing it (SPEC-SCHED-002
+/// REQ-SCHED-063.4). This is the per-coin consequence beyond log level: a coin no provider
+/// can serve is not immediately re-due (no tight re-poll loop), yet — because
+/// `last_polled_at` is intentionally left stale — it stays visible to the aggregated
+/// `coins-stalled` alarm (REQ-ALARM-040) rather than being silently re-polled every tick.
+///
+/// $1 = coin_id. $2 = widened-interval INTERVAL string (e.g. `"3600 seconds"`).
+///
+// @MX:WARN: [AUTO] LIVE_COIN_DEFER_SQL — sets marker FORWARD (widened interval); intentionally leaves last_polled_at STALE
+// @MX:REASON: REQ-SCHED-063.4: a permanent per-coin error must have a consequence beyond
+//             logging. Deferring the marker (not clearing it) stops the immediate re-poll
+//             loop; leaving last_polled_at stale is a DELIBERATE trade-off so the stuck coin
+//             surfaces via coins-stalled rather than being silently re-polled (plan.md §2).
+// @MX:SPEC: SPEC-SCHED-002 REQ-SCHED-063
+pub const LIVE_COIN_DEFER_SQL: &str = "\
+    UPDATE tracked_coins \
+    SET live_poll_claimed_until = now() + $2::interval \
+    WHERE coin_id = $1";
+
 // ── DB functions ──────────────────────────────────────────────────────────────
 
 /// Row returned by the coin claim query; holds the context needed to build a
@@ -170,6 +198,7 @@ pub async fn claim_due_coins(
     pool: &PgPool,
     global_interval_secs: i64,
     claim_ttl_secs: i64,
+    batch_limit: i64,
 ) -> Result<Vec<ClaimedCoin>, sqlx::Error> {
     let global_pg = secs_to_pg_interval(global_interval_secs);
     let ttl_pg = secs_to_pg_interval(claim_ttl_secs);
@@ -179,6 +208,7 @@ pub async fn claim_due_coins(
     let coins: Vec<ClaimedCoin> = sqlx::query_as(LIVE_COIN_CLAIM_SQL)
         .bind(&global_pg) // $1: global interval
         .bind(&ttl_pg) // $2: claim TTL
+        .bind(batch_limit) // $3: claim-batch bound (REQ-SCHED-064)
         .fetch_all(&mut *tx)
         .await?;
     // COMMIT — row locks released BEFORE any provider call (REQ-SCHED-004).
@@ -205,39 +235,63 @@ pub async fn clear_coin_poll_marker(pool: &PgPool, coin_id: &str) -> Result<(), 
     Ok(())
 }
 
+/// Defer a coin's re-claim after a permanent per-coin error by setting the in-flight marker
+/// forward by `widened_interval_secs`, instead of clearing it (SPEC-SCHED-002 REQ-SCHED-063.4).
+/// Leaves `last_polled_at` intentionally stale so the coin stays visible to `coins-stalled`.
+pub async fn defer_coin_poll(
+    pool: &PgPool,
+    coin_id: &str,
+    widened_interval_secs: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(LIVE_COIN_DEFER_SQL)
+        .bind(coin_id)
+        .bind(secs_to_pg_interval(widened_interval_secs))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // ── Worker loop ───────────────────────────────────────────────────────────────
 
 /// Run the live-quote poll loop until `shutdown` is signalled (REQ-SCHED-001/008/050).
 ///
 /// No calendar, market-hours, or phase gate — collection is continuous (REQ-SCHED-008).
 /// Each tick claims due coins in a short tx, then paces + fetches outside the tx.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_live_poller(
     pool: PgPool,
     chain: Arc<Vec<Arc<dyn Provider>>>,
     global_interval_secs: i64,
     claim_ttl_secs: i64,
+    claim_batch_limit: i64,
     tick_interval: StdDuration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
     info!(
-        "live_poller: started (interval={}s, claim_ttl={}s)",
-        global_interval_secs, claim_ttl_secs
+        "live_poller: started (interval={}s, claim_ttl={}s, batch_limit={})",
+        global_interval_secs, claim_ttl_secs, claim_batch_limit
     );
 
     let mut ticker = tokio::time::interval(tick_interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // A cloned receiver shares the channel; poll_cycle reads it to stop between coins on
+    // shutdown (REQ-SCHED-064.3). Cloning avoids borrowing `shutdown` in two select! arms.
+    let shutdown_cycle = shutdown.clone();
+
     loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            res = shutdown.changed() => {
+                // Break on a dropped shutdown sender too, rather than busy-spin on the
+                // immediate Err (REQ-SCHED-065.3).
+                if res.is_err() || *shutdown.borrow() {
                     info!("live_poller: shutdown signal received");
                     break;
                 }
             }
             _ = ticker.tick() => {
-                if let Err(e) = poll_cycle(&pool, &chain, global_interval_secs, claim_ttl_secs, registry.as_deref()).await {
+                if let Err(e) = poll_cycle(&pool, &chain, global_interval_secs, claim_ttl_secs, claim_batch_limit, &shutdown_cycle, registry.as_deref()).await {
                     error!("live_poller: cycle error: {e}");
                 }
             }
@@ -249,14 +303,26 @@ pub async fn run_live_poller(
 }
 
 /// Execute one poll cycle: claim due coins, then fetch+persist outside the tx.
+///
+/// The claimed batch is `LIMIT`-bounded (REQ-SCHED-064.1); the per-coin loop checks
+/// `shutdown` between coins and stops promptly (REQ-SCHED-064.3).
 async fn poll_cycle(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     global_interval_secs: i64,
     claim_ttl_secs: i64,
+    claim_batch_limit: i64,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
     registry: Option<&crate::alarm::HealthRegistry>,
 ) -> Result<()> {
-    let coins = match claim_due_coins(pool, global_interval_secs, claim_ttl_secs).await {
+    let coins = match claim_due_coins(
+        pool,
+        global_interval_secs,
+        claim_ttl_secs,
+        claim_batch_limit,
+    )
+    .await
+    {
         Ok(cs) => cs,
         Err(e) => {
             error!("live_poller: claim error: {e}");
@@ -265,6 +331,12 @@ async fn poll_cycle(
     };
 
     for coin in coins {
+        // Graceful shutdown: stop processing the remainder of the batch promptly rather
+        // than waiting out the whole claimed set (REQ-SCHED-064.3).
+        if *shutdown.borrow() {
+            break;
+        }
+
         let mq = MarketQuery {
             market_id: 0, // dummy; coin-keyed path does not use market_id
             coin_id: Some(coin.coin_id.clone()),
@@ -278,11 +350,25 @@ async fn poll_cycle(
         let provider_name = match chain.iter().find(|p| p.supports(Capability::Spot)) {
             Some(p) => p.name().to_string(),
             None => {
+                // No provider can ever serve this coin — a PERMANENT per-coin condition.
+                // Defer its re-claim (marker forward) rather than clear it, so it is not
+                // immediately re-due every tick (REQ-SCHED-063.4).
                 warn!(
-                    "live_poller: no provider supports Spot for coin {}",
+                    "live_poller: no provider supports Spot for coin {}; deferring",
                     coin.coin_id
                 );
-                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                if let Err(e) = defer_coin_poll(
+                    pool,
+                    &coin.coin_id,
+                    crate::config::live_poll_max_interval_secs() as i64,
+                )
+                .await
+                {
+                    warn!(
+                        "live_poller: defer marker failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
                 continue;
             }
         };
@@ -293,12 +379,22 @@ async fn poll_cycle(
             Err(ref e) if pacer_should_skip(e) => {
                 // Cooldown or credit exhaustion — release the marker, skip for now.
                 warn!("live_poller: pacer skip for coin {}: {e}", coin.coin_id);
-                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                    warn!(
+                        "live_poller: marker clear failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
                 continue;
             }
             Err(e) => {
                 error!("live_poller: pacer error for coin {}: {e}", coin.coin_id);
-                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                    warn!(
+                        "live_poller: marker clear failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
                 continue;
             }
         }
@@ -316,7 +412,12 @@ async fn poll_cycle(
                     if let Some(reg) = registry {
                         reg.record_upsert_failure();
                     }
-                    let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                    if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                        warn!(
+                            "live_poller: marker clear failed for coin {}: {e}",
+                            coin.coin_id
+                        );
+                    }
                     continue;
                 }
                 if let Some(reg) = registry {
@@ -336,14 +437,33 @@ async fn poll_cycle(
                     "live_poller: transient error for coin {}: {e}",
                     coin.coin_id
                 );
-                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                    warn!(
+                        "live_poller: marker clear failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
             }
             Err(e) => {
+                // Permanent per-coin error: apply a consequence beyond log level — defer the
+                // coin's re-claim by a widened interval so it is not immediately re-due, and
+                // stays visible to the coins-stalled alarm (REQ-SCHED-063.4).
                 error!(
-                    "live_poller: permanent error for coin {}: {e}",
+                    "live_poller: permanent error for coin {}: {e}; deferring re-claim",
                     coin.coin_id
                 );
-                let _ = clear_coin_poll_marker(pool, &coin.coin_id).await;
+                if let Err(e) = defer_coin_poll(
+                    pool,
+                    &coin.coin_id,
+                    crate::config::live_poll_max_interval_secs() as i64,
+                )
+                .await
+                {
+                    warn!(
+                        "live_poller: defer marker failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
             }
         }
     }
@@ -555,6 +675,79 @@ mod tests {
         );
     }
 
+    // ── AC-SCHED-064a / REQ-SCHED-064: claim batch is LIMIT-bounded ───────────
+
+    #[test]
+    fn claim_sql_has_limit_clause() {
+        assert!(
+            LIVE_COIN_CLAIM_SQL.contains("LIMIT"),
+            "claim SQL must bound each batch with a LIMIT (REQ-SCHED-064.1)"
+        );
+    }
+
+    #[test]
+    fn claim_sql_limit_binds_batch_parameter() {
+        // The LIMIT must be a bound parameter ($3), not a hardcoded constant, so operators
+        // can override via LIVE_POLL_CLAIM_BATCH_LIMIT (REQ-SCHED-064.2).
+        assert!(
+            LIVE_COIN_CLAIM_SQL.contains("LIMIT $3"),
+            "claim SQL must bind the batch limit as $3 (REQ-SCHED-064.2)"
+        );
+    }
+
+    // ── AC-SCHED-063c / REQ-SCHED-063.4: permanent-error defer consequence ────
+
+    #[test]
+    fn defer_sql_sets_marker_forward_not_last_polled_at() {
+        // Deferring sets the in-flight marker FORWARD (widened interval) so the coin is not
+        // immediately re-due, and MUST NOT touch last_polled_at (intentional staleness so the
+        // coin surfaces via coins-stalled).
+        assert!(
+            LIVE_COIN_DEFER_SQL.contains("live_poll_claimed_until = now() + $2::interval"),
+            "defer SQL must push the marker forward by a widened interval (REQ-SCHED-063.4)"
+        );
+        assert!(
+            !LIVE_COIN_DEFER_SQL.contains("last_polled_at"),
+            "defer SQL must NOT advance last_polled_at — the coin stays stale on purpose"
+        );
+    }
+
+    // ── AC-SCHED-065b (mechanical): no silent marker-clear discards remain ────
+
+    #[test]
+    fn no_silent_marker_clear_discards_remain() {
+        let src =
+            std::fs::read_to_string("src/collectors/live_poller.rs").expect("read live_poller.rs");
+        // Scan only the production code (before the test module). The needle is assembled at
+        // runtime so this file contains no contiguous copy of the discard pattern: the
+        // acceptance-criterion grep for a discarded marker-clear must return 0 matches over
+        // the WHOLE file, so the guard itself must not embed that literal anywhere.
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let discard_needle = format!("let _ = clear_coin_poll_marker{}", "(");
+        assert!(
+            !code.contains(&discard_needle),
+            "every clear_coin_poll_marker call must be warn!-logged, not silently discarded \
+             (REQ-SCHED-065.2, AC-SCHED-065b)"
+        );
+    }
+
+    // ── AC-SCHED-065c (mechanical): guarded shutdown select! arm ──────────────
+
+    #[test]
+    fn worker_select_arm_guards_dropped_sender() {
+        let src =
+            std::fs::read_to_string("src/collectors/live_poller.rs").expect("read live_poller.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            code.contains("res.is_err()"),
+            "the main loop select! arm must break on a dropped shutdown sender (REQ-SCHED-065.3)"
+        );
+        assert!(
+            !code.contains("_ = shutdown.changed()"),
+            "no un-captured `_ = shutdown.changed()` arm may remain (REQ-SCHED-065.3)"
+        );
+    }
+
     // ── Scenario 4 / REQ-SCHED-005/006: success vs failure SQL shape ──────────
 
     #[test]
@@ -639,8 +832,8 @@ mod tests {
         // Run two claims concurrently.
         let pool2 = pool.clone();
         let (r1, r2) = tokio::join!(
-            claim_due_coins(&pool, 60, 120),
-            claim_due_coins(&pool2, 60, 120),
+            claim_due_coins(&pool, 60, 120, 50),
+            claim_due_coins(&pool2, 60, 120, 50),
         );
 
         let ids1: std::collections::HashSet<String> = r1

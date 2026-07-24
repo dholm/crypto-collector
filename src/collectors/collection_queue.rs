@@ -9,11 +9,18 @@
 //! All mutating UPDATEs after the claim include `AND claimed_by = $self` so that a
 //! re-claimed row by another replica cannot be double-updated ("zombie fencing").
 //!
-//! # Attempt counting
+//! # Attempt counting (SPEC-SCHED-002 REQ-SCHED-060/063)
 //!
-//! `attempts` is incremented at claim time. On transient failure the row is released
-//! for retry (`status = 'pending'`); on permanent failure or `attempts >= max_attempts`
-//! the row is marked `'failed'` (REQ-SCHED-013).
+//! `attempts` is incremented at claim time, but only *genuine transient failures* count
+//! toward `max_attempts`. A **non-failure release** (a pacer soft-skip) routes through
+//! `RELEASE_QUEUE_SQL`, which resets the row to `pending`, writes `last_error = NULL`, and
+//! neutralizes the claim-time increment (`attempts = GREATEST(attempts - 1, 0)`), so
+//! walking the queue under backpressure never exhausts the retry budget (REQ-SCHED-060).
+//! A **permanent** failure (coin not found, no provider supports the capability, unknown
+//! dispatch kind) routes through `FAIL_PERMANENT_QUEUE_SQL` and is marked `'failed'`
+//! immediately on the first attempt, without relying on the retry budget (REQ-SCHED-063.2).
+//! A **transient** failure routes through `FAIL_OR_RETRY_QUEUE_SQL`, which marks `'failed'`
+//! only once `attempts >= max_attempts` (REQ-SCHED-013/060.3).
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -22,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
+use crate::collectors::retry::DispatchError;
 use crate::db::upserts::{
     upsert_coin_candle, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_coin_quote,
 };
@@ -53,13 +61,18 @@ pub fn pacer_should_skip_queue(err: &AcquireSlotError) -> bool {
 ///
 /// Predicate: `status = 'pending'` OR (`status IN ('claimed','running')` AND lease expired).
 /// Ordered oldest-first (`enqueued_at ASC`) for fair claiming.
-/// Increments `attempts` at claim time to bound retries (REQ-SCHED-013).
+/// Increments `attempts` at claim time. Per SPEC-SCHED-002 REQ-SCHED-060 the bound now
+/// counts only genuine transient failures: a non-failure release (`RELEASE_QUEUE_SQL`)
+/// decrements `attempts` back to neutralize this claim-time `+1`, so a soft-skip walk
+/// never advances the budget; a crash re-claim keeps its `+1` (crash-loops stay bounded).
 ///
 // @MX:ANCHOR: [AUTO] CLAIM_QUEUE_SQL — FOR UPDATE SKIP LOCKED single-owner invariant
 // @MX:REASON: fan_in >= 3: claim_queue_item(), SQL-shape tests, DB integration tests.
 //             REQ-SCHED-015: SKIP LOCKED + lease = at-most-one replica per row at a time.
 //             REQ-SCHED-014: lease-expired predicate allows crash-recovery re-claim.
-// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-010 REQ-SCHED-011 REQ-SCHED-014 REQ-SCHED-015
+//             SPEC-SCHED-002 REQ-SCHED-060: attempts+1 here is neutralized by RELEASE_QUEUE_SQL
+//             on non-failure releases, so the bound counts genuine failures, not pages walked.
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-010 REQ-SCHED-011 REQ-SCHED-014 REQ-SCHED-015 SPEC-SCHED-002 REQ-SCHED-060
 pub const CLAIM_QUEUE_SQL: &str = "\
     UPDATE collection_queue SET \
         status           = 'claimed', \
@@ -96,11 +109,55 @@ pub const COMPLETE_QUEUE_SQL: &str = "\
         updated_at = now() \
     WHERE id = $1 AND claimed_by = $2";
 
-/// Failure UPDATE: increment attempts; mark `failed` at max, else reset to `pending` (REQ-SCHED-013).
+/// Genuine-failure UPDATE: mark `failed` once `attempts >= $3`, else reset to `pending`
+/// for retry (REQ-SCHED-013). This is the **transient-failure-only** path — non-failure
+/// releases use `RELEASE_QUEUE_SQL` and permanent failures use `FAIL_PERMANENT_QUEUE_SQL`.
+///
+// @MX:NOTE: [AUTO] FAIL_OR_RETRY_QUEUE_SQL — genuine transient-failure-only path (SPEC-SCHED-002 REQ-SCHED-060.3/063.3)
+// @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-013 SPEC-SCHED-002 REQ-SCHED-060 REQ-SCHED-063
 pub const FAIL_OR_RETRY_QUEUE_SQL: &str = "\
     UPDATE collection_queue SET \
         status           = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'pending' END, \
         last_error       = $4, \
+        lease_expires_at = NULL, \
+        claimed_by       = NULL, \
+        heartbeat_at     = NULL, \
+        updated_at       = now() \
+    WHERE id = $1 AND claimed_by = $2";
+
+/// Administrative (non-failure) release of a claimed item — a pacer soft-skip
+/// (SPEC-SCHED-002 REQ-SCHED-060.2/061/065.1). Resets to `pending`, writes a NON-error
+/// marker (`last_error = NULL`, never `"pacer_skip"`), and neutralizes the claim-time
+/// `attempts + 1` via `GREATEST(attempts - 1, 0)` so a soft-skip never consumes the
+/// retry budget. Carries the `AND claimed_by = $2` fence like the failure paths.
+///
+// @MX:WARN: [AUTO] RELEASE_QUEUE_SQL — administrative release; neutralizes the claim-time attempts+1 and clears last_error
+// @MX:REASON: SPEC-SCHED-002 REQ-SCHED-060/065 root-cause guard (F-01). Do NOT "restore" the old
+//             FAIL_OR_RETRY reuse with i32::MAX — that reused the failure SQL for soft-skips, so
+//             page-walking/backpressure re-claims counted toward max_attempts and overwrote a
+//             prior genuine last_error with "pacer_skip". This path must stay attempt-neutral.
+// @MX:SPEC: SPEC-SCHED-002 REQ-SCHED-060 REQ-SCHED-061 REQ-SCHED-065
+pub const RELEASE_QUEUE_SQL: &str = "\
+    UPDATE collection_queue SET \
+        status           = 'pending', \
+        last_error       = NULL, \
+        attempts         = GREATEST(attempts - 1, 0), \
+        lease_expires_at = NULL, \
+        claimed_by       = NULL, \
+        heartbeat_at     = NULL, \
+        updated_at       = now() \
+    WHERE id = $1 AND claimed_by = $2";
+
+/// Permanent-failure UPDATE: mark `failed` immediately, regardless of `attempts`
+/// (SPEC-SCHED-002 REQ-SCHED-063.2). A permanent failure is terminal and does not consume
+/// or rely on the `max_attempts` retry budget. Carries the `AND claimed_by = $2` fence.
+///
+// @MX:NOTE: [AUTO] FAIL_PERMANENT_QUEUE_SQL — terminal fail-fast, retry-budget-independent (SPEC-SCHED-002 REQ-SCHED-063.2)
+// @MX:SPEC: SPEC-SCHED-002 REQ-SCHED-063
+pub const FAIL_PERMANENT_QUEUE_SQL: &str = "\
+    UPDATE collection_queue SET \
+        status           = 'failed', \
+        last_error       = $3, \
         lease_expires_at = NULL, \
         claimed_by       = NULL, \
         heartbeat_at     = NULL, \
@@ -187,7 +244,9 @@ pub async fn complete_queue_item(
     Ok(())
 }
 
-/// Handle a work failure: retry if under max_attempts, else permanently fail (REQ-SCHED-013).
+/// Handle a genuine transient failure: retry if under max_attempts, else permanently
+/// fail (REQ-SCHED-013). Non-failure releases use [`release_queue_item`]; permanent
+/// failures use [`fail_permanent_queue_item`].
 pub async fn fail_or_retry_queue_item(
     pool: &PgPool,
     id: i64,
@@ -199,6 +258,38 @@ pub async fn fail_or_retry_queue_item(
         .bind(id)
         .bind(claimed_by)
         .bind(max_attempts)
+        .bind(error)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Administratively release a claimed item for a non-failure reason (a pacer soft-skip)
+/// without consuming the retry budget (SPEC-SCHED-002 REQ-SCHED-060.2/061/065.1).
+pub async fn release_queue_item(
+    pool: &PgPool,
+    id: i64,
+    claimed_by: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(RELEASE_QUEUE_SQL)
+        .bind(id)
+        .bind(claimed_by)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Mark an item permanently `failed` on a permanent dispatch error, immediately and
+/// independent of the retry budget (SPEC-SCHED-002 REQ-SCHED-063.2).
+pub async fn fail_permanent_queue_item(
+    pool: &PgPool,
+    id: i64,
+    claimed_by: &str,
+    error: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(FAIL_PERMANENT_QUEUE_SQL)
+        .bind(id)
+        .bind(claimed_by)
         .bind(error)
         .execute(pool)
         .await?;
@@ -385,37 +476,57 @@ fn first_provider_for_cap(chain: &[Arc<dyn Provider>], cap: Capability) -> Optio
 
 // ── Worker dispatch ───────────────────────────────────────────────────────────
 
+/// Outcome of dispatching one claimed queue item (SPEC-SCHED-002 REQ-SCHED-060/061/063).
+///
+/// The `Err` channel ([`DispatchError`]) carries genuine failures classified
+/// transient-vs-permanent; backpressure is the `SoftSkip` non-failure variant here, so it
+/// never touches the retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOutcome {
+    /// Work completed successfully — mark the item `done`.
+    Done,
+    /// Pacer backpressure (cooldown / credit exhaustion) — release without an attempt,
+    /// then idle (REQ-SCHED-060.2/061).
+    SoftSkip,
+}
+
 /// Dispatch one claimed queue item to its collector and upsert the result.
 ///
-/// Returns `Ok(true)` on success, `Ok(false)` on transient failure (pacer skip or soft error),
-/// `Err(e)` on a hard dispatch error that should increment attempts.
+/// Returns `Ok(DispatchOutcome::Done)` on success, `Ok(DispatchOutcome::SoftSkip)` on pacer
+/// backpressure (no attempt consumed), `Err(DispatchError::Transient)` on a retryable
+/// failure, and `Err(DispatchError::Permanent)` on a terminal failure (coin not found, no
+/// provider supports the capability, unknown dispatch kind — fail-fast, REQ-SCHED-063).
 async fn dispatch_item(
     pool: &PgPool,
     chain: &[Arc<dyn Provider>],
     item: &ClaimedQueueItem,
     registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<bool, String> {
+) -> Result<DispatchOutcome, DispatchError> {
     match (item.target_kind.as_str(), item.kind.as_str()) {
         ("coin", "candles") => {
             let coin_id = &item.target_id;
 
             let (symbol, live_poll_interval) = fetch_coin_context(pool, coin_id)
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("coin {coin_id} not found"))?;
+                .map_err(|e| DispatchError::Transient(e.to_string()))?
+                .ok_or_else(|| DispatchError::Permanent(format!("coin {coin_id} not found")))?;
 
             let cap = Capability::Ohlc;
             let provider_name = match first_provider_for_cap(chain, cap) {
                 Some(n) => n,
-                None => return Err("no provider supports OHLC".to_string()),
+                None => {
+                    return Err(DispatchError::Permanent(
+                        "no provider supports OHLC".to_string(),
+                    ))
+                }
             };
 
             match acquire_slot(pool, &provider_name).await {
                 Err(ref e) if pacer_should_skip_queue(e) => {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(false); // soft skip, no attempt increment
+                    return Ok(DispatchOutcome::SoftSkip); // no attempt increment
                 }
-                Err(e) => return Err(format!("pacer: {e}")),
+                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
                 Ok(()) => {}
             }
 
@@ -458,7 +569,7 @@ async fn dispatch_item(
                 "capability" => "ohlc",
             )
             .record(fetch_dur);
-            let candles = candles_result.map_err(|e| e.to_string())?;
+            let candles = candles_result.map_err(|e| DispatchError::Transient(e.to_string()))?;
 
             for c in &candles {
                 let candle = CoinCandle {
@@ -485,7 +596,7 @@ async fn dispatch_item(
                         if let Some(reg) = registry {
                             reg.record_upsert_failure();
                         }
-                        return Err(e.to_string());
+                        return Err(DispatchError::Transient(e.to_string()));
                     }
                 }
             }
@@ -497,7 +608,7 @@ async fn dispatch_item(
                 warn!("queue_worker: rollup enqueue failed for coin {coin_id}: {e}");
             }
 
-            Ok(true)
+            Ok(DispatchOutcome::Done)
         }
 
         ("coin", "spot") => {
@@ -505,21 +616,25 @@ async fn dispatch_item(
 
             let (symbol, _) = fetch_coin_context(pool, coin_id)
                 .await
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("coin {coin_id} not found"))?;
+                .map_err(|e| DispatchError::Transient(e.to_string()))?
+                .ok_or_else(|| DispatchError::Permanent(format!("coin {coin_id} not found")))?;
 
             let cap = Capability::Spot;
             let provider_name = match first_provider_for_cap(chain, cap) {
                 Some(n) => n,
-                None => return Err("no provider supports Spot".to_string()),
+                None => {
+                    return Err(DispatchError::Permanent(
+                        "no provider supports Spot".to_string(),
+                    ))
+                }
             };
 
             match acquire_slot(pool, &provider_name).await {
                 Err(ref e) if pacer_should_skip_queue(e) => {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(false);
+                    return Ok(DispatchOutcome::SoftSkip);
                 }
-                Err(e) => return Err(format!("pacer: {e}")),
+                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
                 Ok(()) => {}
             }
 
@@ -554,7 +669,7 @@ async fn dispatch_item(
                 "capability" => "spot",
             )
             .record(fetch_dur);
-            let quote = quote_result.map_err(|e| e.to_string())?;
+            let quote = quote_result.map_err(|e| DispatchError::Transient(e.to_string()))?;
 
             match upsert_coin_quote(pool, coin_id, &quote).await {
                 Ok(()) => {
@@ -566,11 +681,11 @@ async fn dispatch_item(
                     if let Some(reg) = registry {
                         reg.record_upsert_failure();
                     }
-                    return Err(e.to_string());
+                    return Err(DispatchError::Transient(e.to_string()));
                 }
             }
 
-            Ok(true)
+            Ok(DispatchOutcome::Done)
         }
 
         ("coin", "metadata") => {
@@ -579,15 +694,19 @@ async fn dispatch_item(
             let cap = Capability::CoinMetadata;
             let provider_name = match first_provider_for_cap(chain, cap) {
                 Some(n) => n,
-                None => return Err("no provider supports CoinMetadata".to_string()),
+                None => {
+                    return Err(DispatchError::Permanent(
+                        "no provider supports CoinMetadata".to_string(),
+                    ))
+                }
             };
 
             match acquire_slot(pool, &provider_name).await {
                 Err(ref e) if pacer_should_skip_queue(e) => {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(false);
+                    return Ok(DispatchOutcome::SoftSkip);
                 }
-                Err(e) => return Err(format!("pacer: {e}")),
+                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
                 Ok(()) => {}
             }
 
@@ -613,7 +732,7 @@ async fn dispatch_item(
                 "capability" => "coin_metadata",
             )
             .record(fetch_dur);
-            let meta = meta_result.map_err(|e| e.to_string())?;
+            let meta = meta_result.map_err(|e| DispatchError::Transient(e.to_string()))?;
 
             // Revision upsert (REQ-SCHED-042): new revision only if values changed.
             match upsert_coin_metadata(pool, &meta).await {
@@ -626,11 +745,11 @@ async fn dispatch_item(
                     if let Some(reg) = registry {
                         reg.record_upsert_failure();
                     }
-                    return Err(e.to_string());
+                    return Err(DispatchError::Transient(e.to_string()));
                 }
             }
 
-            Ok(true)
+            Ok(DispatchOutcome::Done)
         }
 
         ("coin", "market") => {
@@ -639,15 +758,19 @@ async fn dispatch_item(
             let cap = Capability::CoinMarket;
             let provider_name = match first_provider_for_cap(chain, cap) {
                 Some(n) => n,
-                None => return Err("no provider supports CoinMarket".to_string()),
+                None => {
+                    return Err(DispatchError::Permanent(
+                        "no provider supports CoinMarket".to_string(),
+                    ))
+                }
             };
 
             match acquire_slot(pool, &provider_name).await {
                 Err(ref e) if pacer_should_skip_queue(e) => {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(false);
+                    return Ok(DispatchOutcome::SoftSkip);
                 }
-                Err(e) => return Err(format!("pacer: {e}")),
+                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
                 Ok(()) => {}
             }
 
@@ -673,7 +796,7 @@ async fn dispatch_item(
                 "capability" => "coin_market",
             )
             .record(fetch_dur);
-            let snapshot = snapshot_result.map_err(|e| e.to_string())?;
+            let snapshot = snapshot_result.map_err(|e| DispatchError::Transient(e.to_string()))?;
 
             match upsert_coin_market_snapshot(pool, &snapshot).await {
                 Ok(()) => {
@@ -685,11 +808,11 @@ async fn dispatch_item(
                     if let Some(reg) = registry {
                         reg.record_upsert_failure();
                     }
-                    return Err(e.to_string());
+                    return Err(DispatchError::Transient(e.to_string()));
                 }
             }
 
-            Ok(true)
+            Ok(DispatchOutcome::Done)
         }
 
         ("coin", "cycle_overlay") => {
@@ -699,8 +822,8 @@ async fn dispatch_item(
             let vs_currency = crate::config::cycle_overlay_vs_currency();
             crate::collectors::cycle_overlay::recompute_cycle_overlay(pool, coin_id, &vs_currency)
                 .await
-                .map_err(|e| e.to_string())?;
-            Ok(true)
+                .map_err(|e| DispatchError::Transient(e.to_string()))?;
+            Ok(DispatchOutcome::Done)
         }
 
         ("coin", "rollup") => {
@@ -715,13 +838,15 @@ async fn dispatch_item(
                 Utc::now(),
             )
             .await
-            .map_err(|e| e.to_string())?;
-            Ok(true)
+            .map_err(|e| DispatchError::Transient(e.to_string()))?;
+            Ok(DispatchOutcome::Done)
         }
 
-        (target_kind, kind) => Err(format!(
+        // An unknown (target_kind, kind) pair is a permanent misconfiguration: no amount
+        // of retrying will teach the worker a dispatch it does not implement (REQ-SCHED-063.2).
+        (target_kind, kind) => Err(DispatchError::Permanent(format!(
             "unknown dispatch: target_kind={target_kind:?} kind={kind:?}"
-        )),
+        ))),
     }
 }
 
@@ -750,16 +875,23 @@ pub async fn run_collection_queue_worker(
         let item = match claim_queue_item(&pool, &claimed_by, lease_secs).await {
             Ok(Some(i)) => i,
             Ok(None) => {
-                // Queue empty: idle until next check or shutdown signal.
+                // Queue empty: idle until next check or shutdown signal. Break out of the
+                // loop when the shutdown sender is dropped (`changed()` → Err) rather than
+                // busy-spin on the immediate error (REQ-SCHED-065.3).
                 tokio::select! {
-                    _ = shutdown.changed() => {}
+                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
                     _ = tokio::time::sleep(idle_sleep) => {}
                 }
                 continue;
             }
             Err(e) => {
                 error!("collection_queue_worker: claim error: {e}");
-                tokio::time::sleep(StdDuration::from_secs(1)).await;
+                // Bounded pause raced against shutdown, not a bare sleep, so shutdown is
+                // prompt and a dropped sender breaks the loop (REQ-SCHED-062/065.3).
+                tokio::select! {
+                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                    _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
+                }
                 continue;
             }
         };
@@ -796,8 +928,12 @@ pub async fn run_collection_queue_worker(
 
         hb_handle.abort();
 
+        // After a soft-skip or a retryable-failure release, pause before the next claim so
+        // a provider cooldown does not become a tight loop against the DB (REQ-SCHED-062).
+        let mut pause_before_next_claim = false;
+
         match dispatch_result {
-            Ok(true) => {
+            Ok(DispatchOutcome::Done) => {
                 // Success: mark done (REQ-SCHED-012).
                 if let Err(e) = complete_queue_item(&pool, item.id, &claimed_by).await {
                     error!(
@@ -807,39 +943,58 @@ pub async fn run_collection_queue_worker(
                 }
                 info!("collection_queue_worker: item {} done", item.id);
             }
-            Ok(false) => {
-                // Soft skip (pacer): release for retry without incrementing attempts further.
-                // The item was claimed (attempts already incremented at claim time).
-                // Reset to pending so it gets picked up next cycle.
-                if let Err(e) = fail_or_retry_queue_item(
-                    &pool,
-                    item.id,
-                    &claimed_by,
-                    i32::MAX, // never mark failed on a skip
-                    "pacer_skip",
-                )
-                .await
-                {
+            Ok(DispatchOutcome::SoftSkip) => {
+                // Pacer backpressure: administratively release WITHOUT consuming the retry
+                // budget and WITHOUT overwriting a prior genuine last_error (REQ-SCHED-060.2/061/065.1).
+                if let Err(e) = release_queue_item(&pool, item.id, &claimed_by).await {
                     error!(
                         "collection_queue_worker: skip-release error for item {}: {e}",
                         item.id
                     );
                 }
+                pause_before_next_claim = true;
             }
-            Err(e) => {
-                // Hard error: increment attempts, retry or fail (REQ-SCHED-013).
+            Err(DispatchError::Permanent(msg)) => {
+                // Terminal: fail immediately on the first attempt, independent of the retry
+                // budget (REQ-SCHED-063.2). No pause — the next claim is a different item.
                 warn!(
-                    "collection_queue_worker: item {} failed (attempts={}/{}): {e}",
+                    "collection_queue_worker: item {} permanently failed: {msg}",
+                    item.id
+                );
+                if let Err(db_err) =
+                    fail_permanent_queue_item(&pool, item.id, &claimed_by, &msg).await
+                {
+                    error!(
+                        "collection_queue_worker: permanent-fail update error for item {}: {db_err}",
+                        item.id
+                    );
+                }
+            }
+            Err(DispatchError::Transient(msg)) => {
+                // Retryable: increment counts (attempts already +1 at claim), retry or fail
+                // at max_attempts (REQ-SCHED-013/063.3), then pause (REQ-SCHED-062).
+                warn!(
+                    "collection_queue_worker: item {} failed (attempts={}/{}): {msg}",
                     item.id, item.attempts, max_attempts
                 );
                 if let Err(db_err) =
-                    fail_or_retry_queue_item(&pool, item.id, &claimed_by, max_attempts, &e).await
+                    fail_or_retry_queue_item(&pool, item.id, &claimed_by, max_attempts, &msg).await
                 {
                     error!(
                         "collection_queue_worker: fail update error for item {}: {db_err}",
                         item.id
                     );
                 }
+                pause_before_next_claim = true;
+            }
+        }
+
+        if pause_before_next_claim {
+            // Bounded pause raced against shutdown (REQ-SCHED-062.1): shutdown stays prompt,
+            // and a dropped sender breaks the loop instead of busy-spinning (REQ-SCHED-065.3).
+            tokio::select! {
+                res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                _ = tokio::time::sleep(idle_sleep) => {}
             }
         }
     }
@@ -984,6 +1139,83 @@ mod tests {
         );
     }
 
+    // ── SPEC-SCHED-002: administrative-release + permanent-fail SQL shape ─────
+
+    #[test]
+    fn release_sql_neutralizes_claim_increment() {
+        // The non-failure release must decrement attempts to cancel the claim-time +1
+        // (F-01 root-cause fix, REQ-SCHED-060).
+        assert!(
+            RELEASE_QUEUE_SQL.contains("attempts         = GREATEST(attempts - 1, 0)"),
+            "release SQL must neutralize the claim-time attempts+1 (REQ-SCHED-060)"
+        );
+    }
+
+    #[test]
+    fn release_sql_resets_pending_and_clears_last_error() {
+        assert!(
+            RELEASE_QUEUE_SQL.contains("status           = 'pending'"),
+            "release SQL must reset the row to pending"
+        );
+        assert!(
+            RELEASE_QUEUE_SQL.contains("last_error       = NULL"),
+            "release SQL must write NULL (not 'pacer_skip') to last_error (REQ-SCHED-065.1)"
+        );
+    }
+
+    #[test]
+    fn release_sql_uses_fencing_guard() {
+        assert!(
+            RELEASE_QUEUE_SQL.contains("AND claimed_by = $2"),
+            "release SQL must preserve the claimed_by fence"
+        );
+    }
+
+    #[test]
+    fn permanent_fail_sql_is_unconditional_failed() {
+        // A permanent failure is terminal regardless of attempts (REQ-SCHED-063.2): no
+        // CASE/attempts comparison, an unconditional status = 'failed'.
+        assert!(
+            FAIL_PERMANENT_QUEUE_SQL.contains("status           = 'failed'"),
+            "permanent-fail SQL must set status = 'failed' unconditionally (REQ-SCHED-063.2)"
+        );
+        assert!(
+            !FAIL_PERMANENT_QUEUE_SQL.contains("attempts"),
+            "permanent-fail SQL must not depend on the attempts budget (REQ-SCHED-063.2)"
+        );
+        assert!(
+            FAIL_PERMANENT_QUEUE_SQL.contains("AND claimed_by = $2"),
+            "permanent-fail SQL must preserve the claimed_by fence"
+        );
+    }
+
+    // ── AC-SCHED-065c: guarded shutdown select! arm (mechanical) ──────────────
+
+    #[test]
+    fn worker_select_arms_guard_dropped_sender() {
+        let src = std::fs::read_to_string("src/collectors/collection_queue.rs")
+            .expect("read collection_queue.rs");
+        // Scan only the production code (before the test module) so this scan does not match
+        // its own assertion-message string literals.
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            code.contains("res.is_err()"),
+            "worker loop select! arms must break on a dropped shutdown sender (REQ-SCHED-065.3)"
+        );
+        assert!(
+            !code.contains("_ = shutdown.changed()"),
+            "no un-captured `_ = shutdown.changed()` arm may remain — the result must be \
+             bound and is_err()-guarded (REQ-SCHED-065.3)"
+        );
+    }
+
+    // ── DispatchOutcome / DispatchError classification (in-process) ───────────
+
+    #[test]
+    fn dispatch_outcome_variants_are_distinct() {
+        assert_ne!(DispatchOutcome::Done, DispatchOutcome::SoftSkip);
+    }
+
     #[test]
     fn enqueue_sql_uses_on_conflict_do_nothing() {
         assert!(
@@ -1084,6 +1316,204 @@ mod tests {
         );
 
         // Cleanup.
+        sqlx::query("DELETE FROM collection_queue WHERE id = $1")
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// AC-SCHED-060a / REQ-SCHED-060.2: soft-skip releases (walking the queue under pacer
+    /// backpressure) more than `max_attempts` times must NOT consume the retry budget — one
+    /// subsequent genuine transient failure leaves the item `pending`, not `failed`.
+    #[tokio::test]
+    #[ignore]
+    async fn db_soft_skip_release_does_not_consume_retry_budget() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+        let max_attempts = 5;
+
+        let item_id: i64 = sqlx::query_scalar(
+            "INSERT INTO collection_queue \
+             (target_kind, target_id, kind, status, enqueued_at, updated_at) \
+             VALUES ('coin', 'test-f01-soft-skip', 'metadata', 'pending', now(), now()) \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert item");
+
+        // Walk the queue under backpressure > max_attempts times: each iteration claims
+        // (attempts += 1) then administratively releases (attempts -= 1, net zero).
+        for _ in 0..(max_attempts + 3) {
+            let claimed = claim_queue_item(&pool, "test-replica", 120)
+                .await
+                .expect("claim")
+                .expect("should re-claim the released item");
+            assert_eq!(claimed.id, item_id);
+            release_queue_item(&pool, item_id, "test-replica")
+                .await
+                .expect("soft-skip release");
+        }
+
+        // Effective attempts must be back at 0 after all the neutralized releases.
+        let attempts_after_walk: i32 =
+            sqlx::query_scalar("SELECT attempts FROM collection_queue WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch attempts");
+        assert_eq!(
+            attempts_after_walk, 0,
+            "soft-skip walk must leave the effective attempt count unchanged (REQ-SCHED-060)"
+        );
+
+        // Now exactly ONE genuine transient failure: claim (attempts→1) then fail_or_retry.
+        let claimed = claim_queue_item(&pool, "test-replica", 120)
+            .await
+            .expect("claim")
+            .expect("claim for genuine failure");
+        assert_eq!(claimed.attempts, 1, "first genuine attempt is attempt #1");
+        fail_or_retry_queue_item(&pool, item_id, "test-replica", max_attempts, "boom")
+            .await
+            .expect("genuine transient failure");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM collection_queue WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch status");
+        assert_eq!(
+            status, "pending",
+            "one genuine failure after many soft-skips must stay pending, NOT failed (F-01)"
+        );
+
+        sqlx::query("DELETE FROM collection_queue WHERE id = $1")
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// AC-SCHED-063a / REQ-SCHED-063.2: a permanent dispatch error (unknown coin) fails the
+    /// item on the FIRST attempt with a descriptive `last_error`, never exhausting retries.
+    #[tokio::test]
+    #[ignore]
+    async fn db_permanent_dispatch_fails_fast() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        // A coin_id guaranteed absent from tracked_coins → fetch_coin_context returns None.
+        let coin = "test-f04-unknown-coin";
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin)
+            .execute(&pool)
+            .await
+            .expect("ensure coin absent");
+
+        let item_id: i64 = sqlx::query_scalar(
+            "INSERT INTO collection_queue \
+             (target_kind, target_id, kind, status, enqueued_at, updated_at) \
+             VALUES ('coin', $1, 'candles', 'pending', now(), now()) RETURNING id",
+        )
+        .bind(coin)
+        .fetch_one(&pool)
+        .await
+        .expect("insert item");
+
+        let item = claim_queue_item(&pool, "test-replica", 120)
+            .await
+            .expect("claim")
+            .expect("should claim");
+        assert_eq!(
+            item.attempts, 1,
+            "permanent failure occurs on the first attempt"
+        );
+
+        // Dispatch with an empty chain: the candles arm looks up the coin FIRST, so it
+        // classifies as Permanent before ever needing a provider or the pacer.
+        let empty_chain: Vec<Arc<dyn Provider>> = vec![];
+        let result = dispatch_item(&pool, &empty_chain, &item, None).await;
+        let msg = match result {
+            Err(DispatchError::Permanent(m)) => m,
+            other => panic!("expected Permanent, got {other:?}"),
+        };
+        assert!(
+            msg.contains("not found"),
+            "descriptive last_error expected: {msg}"
+        );
+
+        fail_permanent_queue_item(&pool, item.id, "test-replica", &msg)
+            .await
+            .expect("permanent fail");
+
+        let (status, attempts, last_error): (String, i32, Option<String>) = sqlx::query_as(
+            "SELECT status, attempts, last_error FROM collection_queue WHERE id = $1",
+        )
+        .bind(item_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch row");
+        assert_eq!(
+            status, "failed",
+            "permanent error fails on the first attempt"
+        );
+        assert_eq!(
+            attempts, 1,
+            "retries were NOT exhausted (attempts stays at 1)"
+        );
+        assert!(
+            last_error.as_deref().unwrap_or("").contains("not found"),
+            "last_error must be descriptive (REQ-SCHED-063.2)"
+        );
+
+        sqlx::query("DELETE FROM collection_queue WHERE id = $1")
+            .bind(item_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
+    /// AC-SCHED-063b / REQ-SCHED-063.3: a single transient failure resets the item to
+    /// `pending` for retry — it is not failed on the first transient error.
+    #[tokio::test]
+    #[ignore]
+    async fn db_transient_failure_retries_not_fails() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+        let pool = crate::db::connect(&url).await.expect("connect");
+
+        let item_id: i64 = sqlx::query_scalar(
+            "INSERT INTO collection_queue \
+             (target_kind, target_id, kind, status, enqueued_at, updated_at) \
+             VALUES ('coin', 'test-f04-transient', 'metadata', 'pending', now(), now()) \
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert item");
+
+        let item = claim_queue_item(&pool, "test-replica", 120)
+            .await
+            .expect("claim")
+            .expect("claim");
+        assert_eq!(item.attempts, 1);
+
+        fail_or_retry_queue_item(&pool, item_id, "test-replica", 5, "network blip")
+            .await
+            .expect("transient failure");
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM collection_queue WHERE id = $1")
+                .bind(item_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch status");
+        assert_eq!(
+            status, "pending",
+            "a single transient failure must reset to pending, not fail (REQ-SCHED-063.3)"
+        );
+
         sqlx::query("DELETE FROM collection_queue WHERE id = $1")
             .bind(item_id)
             .execute(&pool)

@@ -258,6 +258,16 @@ pub fn live_poll_claim_ttl_secs() -> i64 {
     parse_env_i64("LIVE_POLL_CLAIM_TTL_SECS", 120)
 }
 
+/// Maximum coins claimed per live-poll batch, bounding the batch so it completes within
+/// the claim TTL (SPEC-SCHED-002 REQ-SCHED-064.1/064.2, OR-SCHED-1 resolved).
+///
+/// Env var: `LIVE_POLL_CLAIM_BATCH_LIMIT`. Default: 50 (operator-overridable).
+/// Derivation: at the 120 s claim TTL and a conservative ~2 s per-coin serial cost
+/// (pacer min-gap dominated), 50 coins × ~2 s ≈ 100 s stays within the 120 s TTL.
+pub fn live_poll_claim_batch_limit() -> i64 {
+    parse_env_i64("LIVE_POLL_CLAIM_BATCH_LIMIT", 50)
+}
+
 /// Collection-queue worker lease duration in seconds.
 ///
 /// Env var: `COLLECTION_LEASE_SECONDS`. Default: 120 s.
@@ -692,6 +702,14 @@ mod tests {
     fn live_poll_claim_ttl_secs_default() {
         if std::env::var("LIVE_POLL_CLAIM_TTL_SECS").is_err() {
             assert_eq!(live_poll_claim_ttl_secs(), 120);
+        }
+    }
+
+    // AC-SCHED-064a (OR-SCHED-1 resolved): batch-limit default is 50 when unset.
+    #[test]
+    fn live_poll_claim_batch_limit_default_is_50() {
+        if std::env::var("LIVE_POLL_CLAIM_BATCH_LIMIT").is_err() {
+            assert_eq!(live_poll_claim_batch_limit(), 50);
         }
     }
 
