@@ -849,6 +849,101 @@ fn normalise_deriv_ticker(
     })
 }
 
+// ── Boundary-aware derivatives matching (F-24) ────────────────────────────────
+
+/// Common quote / settlement currencies used to recognise a genuine BASE/QUOTE derivatives
+/// symbol (e.g. `"BTCUSDT"` = BTC + USDT), distinguishing it from leveraged / index tokens
+/// like `"BTCDOM"` / `"BTCUP"` / `"BTCST"` whose remainder after the base is NOT a quote.
+const KNOWN_DERIV_QUOTES: &[&str] = &[
+    "USDT", "USD", "USDC", "BUSD", "USDE", "FDUSD", "DAI", "TUSD",
+];
+
+/// Whether a derivatives `symbol` denotes the queried `base` (uppercased), by symbol
+/// BOUNDARY (F-24, REQ-PROV-077): an exact match, OR the base as a prefix followed by
+/// either a non-alphanumeric separator (`"BTC-PERP"`, `"BTC/USD"`) or a recognised quote
+/// currency (`"BTCUSDT"` via the queried `quote_upper` or `KNOWN_DERIV_QUOTES`). A bare
+/// alphanumeric continuation (`"BTCDOM"` / `"BTCUP"` / `"BTCST"`) does NOT match.
+fn symbol_matches_base(symbol: &str, base_upper: &str, quote_upper: &str) -> bool {
+    let sym = symbol.to_uppercase();
+    if sym == base_upper {
+        return true;
+    }
+    let Some(rest) = sym.strip_prefix(base_upper) else {
+        return false;
+    };
+    // A non-alphanumeric separator is an unambiguous boundary ("BTC-PERP", "BTC_USDT").
+    match rest.chars().next() {
+        None => true, // exact (defensive; handled above)
+        Some(c) if !c.is_ascii_alphanumeric() => true,
+        // Otherwise the remainder must be a recognised quote currency — so "BTCUSDT"
+        // matches but "BTCDOM" / "BTCUP" / "BTCST" do not.
+        Some(_) => rest == quote_upper || KNOWN_DERIV_QUOTES.contains(&rest),
+    }
+}
+
+/// Open-interest sort key for the deterministic tie-break (0 when absent or unparseable).
+/// `rust_decimal::Decimal` is `Ord`.
+fn deriv_open_interest(t: &CgDerivTicker) -> Decimal {
+    t.open_interest
+        .as_ref()
+        .and_then(|n| decimal_from_number(n).ok())
+        .unwrap_or(Decimal::ZERO)
+}
+
+/// Select the derivatives ticker for `base`/`quote` from the payload (F-24): a
+/// boundary-aware symbol match, venue preference when `venue` is present, then a
+/// deterministic tie-break (highest open interest, then symbol lexicographically). Returns
+/// `None` when nothing matches. NEVER depends on upstream response order (REQ-PROV-077/078).
+fn select_deriv_ticker<'a>(
+    tickers: &'a [CgDerivTicker],
+    base: &str,
+    quote: &str,
+    venue: Option<&str>,
+) -> Option<&'a CgDerivTicker> {
+    let base_upper = base.to_uppercase();
+    let quote_upper = quote.to_uppercase();
+
+    let mut candidates: Vec<&CgDerivTicker> = tickers
+        .iter()
+        .filter(|t| {
+            t.symbol
+                .as_deref()
+                .map(|s| symbol_matches_base(s, &base_upper, &quote_upper))
+                .unwrap_or(false)
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Venue preference: when the queried venue is present AND at least one candidate is on
+    // that venue, restrict to those (REQ-PROV-078).
+    if let Some(v) = venue {
+        let v_lower = v.to_lowercase();
+        let venue_matches: Vec<&CgDerivTicker> = candidates
+            .iter()
+            .copied()
+            .filter(|t| {
+                t.market
+                    .as_deref()
+                    .map(|m| m.to_lowercase() == v_lower)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !venue_matches.is_empty() {
+            candidates = venue_matches;
+        }
+    }
+
+    // Deterministic tie-break: highest open interest, then symbol lexicographically — never
+    // upstream response order (REQ-PROV-078).
+    candidates.into_iter().max_by(|a, b| {
+        deriv_open_interest(a)
+            .cmp(&deriv_open_interest(b))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    })
+}
+
 // ── CoinGeckoProvider (implements Provider trait) ─────────────────────────────
 
 /// CoinGecko `Provider` implementation.
@@ -1014,25 +1109,27 @@ impl Provider for CoinGeckoProvider {
             .ok_or_else(|| ProviderError::Parse(format!("no market data for {coin_id}")))
     }
 
+    // @MX:NOTE: [AUTO] derivatives ticker selection is boundary-aware + venue-preferring +
+    //           deterministic (F-24): symbol matches base by boundary (exact / separator /
+    //           quote currency) so "BTC" never binds "BTCDOM"/"BTCUP"/"BTCST"; the queried
+    //           venue is preferred; ties break on highest open interest — never upstream
+    //           response order. Logic lives in select_deriv_ticker (pure, tested no-DB).
+    // @MX:SPEC: SPEC-PROV-003 REQ-PROV-077 REQ-PROV-078
     async fn fetch_derivatives(&self, market: &MarketQuery) -> Result<DerivTick, ProviderError> {
         let tickers = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
             self.client.fetch_derivatives_tickers()
         })
         .await?;
 
-        // Match ticker by base symbol (case-insensitive prefix match)
-        let base_upper = market.base.to_uppercase();
-        let ticker = tickers
-            .iter()
-            .find(|t| {
-                t.symbol
-                    .as_deref()
-                    .map(|s| s.to_uppercase().starts_with(&base_upper))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                ProviderError::Parse(format!("no derivatives ticker for {}", market.base))
-            })?;
+        let ticker = select_deriv_ticker(
+            &tickers,
+            &market.base,
+            &market.quote,
+            market.venue.as_deref(),
+        )
+        .ok_or_else(|| {
+            ProviderError::Parse(format!("no derivatives ticker for {}", market.base))
+        })?;
 
         normalise_deriv_ticker(ticker, market.market_id)
     }
@@ -1713,6 +1810,87 @@ mod tests {
         assert!(deriv.mark_price.is_some());
         assert!(deriv.index_price.is_some());
         assert!(deriv.basis.is_some());
+    }
+
+    // ── Scenario 7 (REQ-PROV-077/078): boundary-aware derivatives matching (F-24) ──
+
+    fn deriv_fixture(market: &str, symbol: &str, open_interest: u64) -> CgDerivTicker {
+        CgDerivTicker {
+            market: Some(market.to_string()),
+            symbol: Some(symbol.to_string()),
+            price: Some(serde_json::Number::from(1u64)),
+            contract_type: Some("perpetual".to_string()),
+            index: None,
+            basis: None,
+            funding_rate: None,
+            open_interest: Some(serde_json::Number::from(open_interest)),
+            volume_24h: None,
+            last_traded_at: None,
+        }
+    }
+
+    #[test]
+    fn symbol_boundary_match_excludes_dominance_and_leveraged_tokens() {
+        // Exact / separator / quote-currency boundaries match (REQ-PROV-077).
+        assert!(symbol_matches_base("BTC", "BTC", "USDT"));
+        assert!(symbol_matches_base("BTC-PERP", "BTC", "USDT"));
+        assert!(symbol_matches_base("BTCUSDT", "BTC", "USDT")); // base + queried quote
+        assert!(symbol_matches_base("BTCUSDC", "BTC", "USDT")); // base + known quote
+                                                                // Bare alphanumeric continuations (index / leveraged tokens) do NOT match.
+        assert!(!symbol_matches_base("BTCDOM", "BTC", "USDT"));
+        assert!(!symbol_matches_base("BTCUP", "BTC", "USDT"));
+        assert!(!symbol_matches_base("BTCST", "BTC", "USDT"));
+        // A different base entirely does not match.
+        assert!(!symbol_matches_base("ETHUSDT", "BTC", "USDT"));
+    }
+
+    #[test]
+    fn select_deriv_ticker_matches_boundary_not_dominance_or_leveraged() {
+        let tickers = vec![
+            deriv_fixture("Binance", "BTCDOM", 100),
+            deriv_fixture("Binance", "BTCUP", 200),
+            deriv_fixture("Kraken", "BTC-PERP", 50),
+            deriv_fixture("Binance", "BTCUSDT", 300),
+        ];
+        let chosen = select_deriv_ticker(&tickers, "BTC", "USDT", None).expect("a BTC match");
+        let sym = chosen.symbol.as_deref().unwrap();
+        // Never a dominance / leveraged token; among the boundary matches the highest OI
+        // (BTCUSDT 300 > BTC-PERP 50) wins deterministically.
+        assert_ne!(sym, "BTCDOM");
+        assert_ne!(sym, "BTCUP");
+        assert_eq!(sym, "BTCUSDT");
+    }
+
+    #[test]
+    fn select_deriv_ticker_prefers_queried_venue_over_higher_oi() {
+        let tickers = vec![
+            deriv_fixture("Binance", "BTC-PERP", 500),
+            deriv_fixture("Kraken", "BTC-PERP", 100),
+        ];
+        // Binance has the higher OI, but venue=kraken is queried → prefer Kraken
+        // (REQ-PROV-078).
+        let chosen = select_deriv_ticker(&tickers, "BTC", "USD", Some("kraken")).expect("a match");
+        assert_eq!(chosen.market.as_deref(), Some("Kraken"));
+    }
+
+    #[test]
+    fn select_deriv_ticker_tie_break_is_highest_open_interest() {
+        let tickers = vec![
+            deriv_fixture("Binance", "BTCUSDT", 100),
+            deriv_fixture("Bybit", "BTCUSD", 900),
+            deriv_fixture("OKX", "BTC-PERP", 400),
+        ];
+        // No venue preference → the highest open interest wins (Bybit BTCUSD 900), never
+        // upstream response order (REQ-PROV-078).
+        let chosen = select_deriv_ticker(&tickers, "BTC", "USDT", None).expect("a match");
+        assert_eq!(chosen.market.as_deref(), Some("Bybit"));
+        assert_eq!(chosen.symbol.as_deref(), Some("BTCUSD"));
+    }
+
+    #[test]
+    fn select_deriv_ticker_returns_none_when_nothing_matches() {
+        let tickers = vec![deriv_fixture("Binance", "ETHUSDT", 100)];
+        assert!(select_deriv_ticker(&tickers, "BTC", "USDT", None).is_none());
     }
 
     // ── CoinMeta normalisation ────────────────────────────────────────────────
