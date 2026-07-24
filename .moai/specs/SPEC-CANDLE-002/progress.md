@@ -1,6 +1,7 @@
 # SPEC-CANDLE-002 — Progress
 
-Lifecycle: plan → run → sync. Status: **in-progress** (run-phase, TDD RED→GREEN→REFACTOR).
+Lifecycle: plan → run → sync. Status: **completed** (3-phase close; sync-auditor
+PASS-WITH-DEBT — both findings remediated and verified green; see §E.4).
 
 ## §E.1 Plan-phase Audit-Ready Signal
 
@@ -82,4 +83,99 @@ m1_to_mN_commit_strategy: per-milestone separate commits (M1 RED / M2 GREEN F-09
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase>_
+### sync-auditor verdict (independent quality review)
+
+sync-auditor scored SPEC-CANDLE-002 **PASS-WITH-DEBT (~0.89 harmonic mean)** across the
+4-dimension scoring (Functionality 92 / Security 95 / Craft 76 / Consistency 90). The must-pass
+firewall held — the F-07 three-layer defense (source-filtered SELECT + source-filtered DELETE +
+native-wins upsert) and the F-09 guard-ordering correctness both verified without qualification.
+Two findings were recorded as debt:
+
+- **F1 — 1d backward-repair non-termination.** The initial `backward_repair_window` trigger used a
+  WEEK-aligned bucket comparison for both `1d` and `1w` targets. Because `week_bucket(source_min) <
+  day_bucket(source_min)` holds for ~6/7 of coins (any non-epoch-Thursday day), the `1d` backward
+  pass would re-fire on every recompute instead of self-terminating after the first repair.
+- **F2 — missing native-survival regression at a no-source `ts`.** The DB-gated test suite proved
+  native-wins on a `ts` that collides with an *emitted* rollup bucket (Scenario 2), but lacked a
+  test proving a native row at a `ts` with **no** corresponding rollup emission also survives the
+  reconcile DELETE inside the affected window.
+
+### Debt closure — remediation + verification
+
+Both findings are **REMEDIATED and verified green**, commit `b287979` (code) + `63d7dae` (§E
+evidence):
+
+- **F1 fix**: `backward_repair_window`'s trigger comparison is now **target-interval-aware** — it
+  compares `bucket_start(source_min, target_secs)` (the DAY bucket for `1d`, the WEEK bucket for
+  `1w`) against `earliest_materialized`, while the walk **start** stays WEEK-aligned (preserving
+  the memory bound). After the first repair, the earliest materialized bucket moves back to the
+  target-interval bucket of `source_min`, so the next run's core returns `None` for both `1d` and
+  `1w` — no repeat. Proven by
+  `backward_repair_window_some_when_source_precedes_earliest ... ok` and
+  `..._none_when_watermark_not_before_earliest ... ok` (pure, offline).
+- **F2 fix**: added
+  `db_native_row_without_source_in_window_survives_reconcile` — a native row at a no-emission `ts`
+  inside the reconcile window is asserted byte-identical after a full reconcile cycle. Green
+  against live Postgres 16, `--test-threads=1`.
+
+### Offline + DB-gated evidence (re-confirmed at sync)
+
+```
+$ cargo test                                                  → 606 passed, 0 failed (offline);
+                                                                  backtest 2 passed unchanged
+$ cargo clippy --all-targets --all-features -- -D warnings    → exit 0, clean
+$ cargo fmt --check                                            → exit 0, clean
+$ DATABASE_URL=postgres://... cargo test -- --ignored --test-threads=1
+  db_mixed_source_preserves_native_and_reconciles_rollup ... ok
+  db_collision_native_wins ... ok
+  db_history_repair_backward_pass_is_idempotent ... ok
+  db_native_row_without_source_in_window_survives_reconcile ... ok
+  test result: ok. 4 passed; 0 failed
+$ cargo test --test backtest_projection                        → 2 passed; 0 failed (unchanged)
+```
+
+No new migration (`Cargo.toml`/migrations untouched), no new dependency, Decimal-only monetary
+paths preserved.
+
+### @MX validation (sync sub-step)
+
+All @MX Annotation Targets named in `plan.md` § MX Tag Targets are present and well-formed — no
+additions required:
+
+- `incremental_recompute_target` — `@MX:ANCHOR` + `@MX:REASON` (data-loss prevention) +
+  `@MX:SPEC SPEC-CANDLE-002 REQ-CANDLE-050 REQ-CANDLE-051 REQ-CANDLE-053 REQ-CANDLE-054
+  REQ-CANDLE-055` (rollup.rs:345-354).
+- `batched_upsert_candles` — `@MX:ANCHOR` (native-wins collision contract) +
+  `@MX:REASON` (fan_in >= 3 + collision policy D1) + `@MX:SPEC ... SPEC-CANDLE-002 REQ-CANDLE-052`
+  (rollup.rs:158-174).
+- `materialize_window_walk` (backward-repair reuse) — `@MX:WARN` (memory-bounded) +
+  `@MX:REASON` (OOM prevention) + `@MX:SPEC ... SPEC-CANDLE-002 REQ-CANDLE-055 REQ-CANDLE-056`
+  (rollup.rs:235-242).
+- `project_composite` — pre-existing `@MX:ANCHOR` (continuity boundary), unaffected — the F-09
+  guard did not require a new tag per plan.md §5 (no cycle_projection.rs entry in the MX Tag
+  Targets table).
+
+No missing tags found; no churn applied.
+
+### Sync-phase close signal
+
+```yaml
+sync_complete_at: 2026-07-24
+sync_status: completed
+sync_auditor_verdict: pass-with-debt
+sync_auditor_score: 0.89
+sync_auditor_dimensions:
+  functionality: 92
+  security: 95
+  craft: 76
+  consistency: 90
+debt_closed: true
+debt_closure_evidence: "F1 target-interval-aware trigger + F2 native-survival DB test, both green (offline + live Postgres 16, --test-threads=1)"
+remediation_commit: b287979
+remediation_evidence_commit: 63d7dae
+run_commit_sha: b287979
+sync_commit_sha: pending-backfill-this-commit   # self-referential — backfilled in a follow-up commit per spec-frontmatter-schema.md § SHA placeholder backfill exemption (D3)
+frontmatter_status_transitions:
+  in-progress_to_implemented_to_completed: sync-commit (this commit)
+mx_validation: pass — all plan.md § MX Tag Targets present and well-formed, no additions needed
+```
