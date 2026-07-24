@@ -114,23 +114,34 @@ pub fn reconcile_window(
 
 /// Pure decision core for the F-08 source low-watermark history repair
 /// (SPEC-CANDLE-002 REQ-CANDLE-054/055): given the source interval's low-watermark
-/// (`source_min_ts` = `MIN(ts)` of the source rows) and the earliest already-materialized
-/// `rollup:*` bucket (`earliest_materialized_ts`), return the bounded backward window
-/// `[week-aligned(source_min), earliest_materialized)` to repair, or `None` when the source
-/// does not precede existing materialization.
+/// (`source_min_ts` = `MIN(ts)` of the source rows), the earliest already-materialized
+/// `rollup:*` bucket (`earliest_materialized_ts`), and the TARGET interval width
+/// (`target_secs`), return the bounded backward window `[week-aligned(source_min),
+/// earliest_materialized)` to repair, or `None` when the source does not precede existing
+/// materialization.
 ///
-/// Week-aligning the start (via `bucket_start(_, WEEK_SECS)`) reuses the same chunk boundary
-/// the backfill/repair walk uses, so no `1d`/`1w` bucket straddles a chunk edge. The pass is
-/// self-terminating for aligned/`1w` cases: once the earliest materialized bucket has moved
-/// back to the source low-watermark bucket, the next call returns `None`; any residual overlap
-/// re-materializes identical `rollup:*` buckets idempotently (native-wins protects any native
-/// row). This is the AC-CANDLE-055 pure-test target — DB-free by construction.
+/// Two distinct alignments, on purpose:
+/// - **Trigger** = `bucket_start(source_min, target_secs)` — the TARGET-interval bucket
+///   (day bucket for `1d`, week bucket for `1w`). This is what genuinely self-terminates the
+///   pass: once the earliest materialized bucket has moved back to the target-interval bucket
+///   of the source low-watermark, `trigger < earliest_materialized` is false → `None`. Using a
+///   WEEK-aligned trigger for a `1d` target would re-fire on every recompute for ~6/7 of coins
+///   (any day that is not the epoch-week Thursday), since `week_bucket(source_min) <
+///   day_bucket(source_min)` — a recurring bounded-but-real hot-path cost, not a hang.
+/// - **Walk start** = `bucket_start(source_min, WEEK_SECS)` — always week-aligned so the
+///   `materialize_window_walk` chunk boundary never splits a `1d`/`1w` bucket (memory bound).
+///
+/// This is the AC-CANDLE-055 pure-test target — DB-free by construction.
 pub fn backward_repair_window(
     source_min_ts: DateTime<Utc>,
     earliest_materialized_ts: DateTime<Utc>,
+    target_secs: i64,
 ) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
-    let start = bucket_start(source_min_ts, WEEK_SECS);
-    if start < earliest_materialized_ts {
+    // Trigger on the TARGET-interval bucket so the pass self-terminates for 1d and 1w alike.
+    let trigger = bucket_start(source_min_ts, target_secs);
+    if trigger < earliest_materialized_ts {
+        // Walk stays week-aligned to keep each chunk memory-bounded (no bucket straddles).
+        let start = bucket_start(source_min_ts, WEEK_SECS);
         Some((start, earliest_materialized_ts))
     } else {
         None
@@ -467,7 +478,7 @@ async fn incremental_recompute_target(
 
     if let (Some(source_min), Some(earliest_materialized)) = (source_min, earliest_materialized) {
         if let Some((repair_start, repair_end)) =
-            backward_repair_window(source_min, earliest_materialized)
+            backward_repair_window(source_min, earliest_materialized, target_secs)
         {
             // Accept the idempotent overshoot (plan §3 option a): reuse the bounded walk with
             // `ceiling = earliest_materialized`. The final chunk may re-fold buckets at/after
@@ -861,20 +872,22 @@ mod tests {
     }
 
     // ── F-08 backward-repair pure decision core (SPEC-CANDLE-002, pure) ─────────────────────
-    // AC-CANDLE-055 pure portion. Returns Some (week-aligned start) when the source
-    // low-watermark precedes the earliest materialized bucket; None otherwise.
+    // AC-CANDLE-055 pure portion. The trigger is TARGET-interval-aware (day bucket for 1d,
+    // week bucket for 1w) while the walk start stays week-aligned for memory bounding.
+    const DAY_SECS: i64 = 86_400;
+
     #[test]
     fn backward_repair_window_some_when_source_precedes_earliest() {
         let source_min = ts_epoch(10 * 86_400);
         let earliest_materialized = ts_epoch(20 * 86_400);
 
-        let (start, end) = backward_repair_window(source_min, earliest_materialized)
+        let (start, end) = backward_repair_window(source_min, earliest_materialized, DAY_SECS)
             .expect("source precedes earliest materialized → Some");
 
         assert_eq!(
             start,
             bucket_start(source_min, WEEK_SECS),
-            "start must be week-aligned to source_min's bucket"
+            "walk start must be week-aligned to source_min's bucket (memory bound)"
         );
         assert!(
             start <= source_min,
@@ -889,19 +902,64 @@ mod tests {
 
     #[test]
     fn backward_repair_window_none_when_watermark_not_before_earliest() {
-        // earliest materialized already at the source low-watermark's week bucket (epoch 0
-        // Thursday): week-aligned(source_min) == 0 is NOT < 0 → None (self-terminating).
-        let earliest_materialized = ts_epoch(0);
-        let source_min_same_week = ts_epoch(3 * 86_400); // < WEEK_SECS → same bucket as epoch 0
+        // Source strictly AHEAD of materialization (materialized history is older) → None,
+        // for both target intervals.
+        let earliest = ts_epoch(5 * 86_400);
+        let source = ts_epoch(40 * 86_400);
+        assert!(backward_repair_window(source, earliest, DAY_SECS).is_none());
+        assert!(backward_repair_window(source, earliest, WEEK_SECS).is_none());
+    }
+
+    // F1 REGRESSION (SPEC-CANDLE-002 sync-audit): the 1d repair MUST self-terminate. After a
+    // repair the earliest materialized bucket is the DAY bucket of source_min; with a
+    // day-aligned trigger the next call returns None. The OLD week-aligned trigger returned
+    // Some here (week_bucket=epoch-Thursday < day_bucket), re-firing on every recompute for any
+    // non-Thursday day — the row-count idempotency test could not catch it.
+    #[test]
+    fn backward_repair_window_1d_self_terminates_after_repair() {
+        // source_min on a NON-Thursday day (Friday = day 1), 1h in.
+        let source_min = ts_epoch(86_400 + 3_600);
+        let earliest_after_repair = bucket_start(source_min, DAY_SECS); // day bucket = Friday 00:00
+
+        // The week-aligned start is strictly before the day bucket — this is exactly the gap
+        // the old trigger tripped over.
         assert!(
-            backward_repair_window(source_min_same_week, earliest_materialized).is_none(),
-            "no source before the earliest materialized bucket → None"
+            bucket_start(source_min, WEEK_SECS) < earliest_after_repair,
+            "precondition: week bucket precedes the day bucket for a non-Thursday day"
         );
 
-        // Source strictly AHEAD of materialization (materialized history is older) → None.
-        let earliest2 = ts_epoch(5 * 86_400);
-        let source2 = ts_epoch(40 * 86_400);
-        assert!(backward_repair_window(source2, earliest2).is_none());
+        assert!(
+            backward_repair_window(source_min, earliest_after_repair, DAY_SECS).is_none(),
+            "1d repair must self-terminate once earliest == day_bucket(source_min)"
+        );
+    }
+
+    #[test]
+    fn backward_repair_window_1d_fires_when_source_precedes_earliest_day() {
+        // A full day before the earliest materialized day bucket → repair fires; walk start
+        // stays week-aligned.
+        let source_min = ts_epoch(5 * 86_400 + 100);
+        let earliest_materialized = ts_epoch(10 * 86_400);
+        let (start, end) = backward_repair_window(source_min, earliest_materialized, DAY_SECS)
+            .expect("earlier source day → Some");
+        assert_eq!(
+            start,
+            bucket_start(source_min, WEEK_SECS),
+            "walk start week-aligned"
+        );
+        assert_eq!(end, earliest_materialized);
+    }
+
+    #[test]
+    fn backward_repair_window_1w_self_terminates_after_repair() {
+        // For 1w the trigger == walk start == week bucket, so it terminates once earliest is the
+        // week bucket of source_min (unchanged behaviour, now explicit).
+        let source_min = ts_epoch(3 * 86_400); // within the epoch week
+        let earliest_after_repair = bucket_start(source_min, WEEK_SECS); // == 0
+        assert!(
+            backward_repair_window(source_min, earliest_after_repair, WEEK_SECS).is_none(),
+            "1w repair self-terminates once earliest == week_bucket(source_min)"
+        );
     }
 
     // ── DB-gated integration tests (SPEC-CANDLE-002) ───────────────────────────────────────
@@ -1184,6 +1242,57 @@ mod tests {
             count_1d(&pool, coin).await,
             count_before_rerun,
             "re-running the rollup produced no further change (idempotent)"
+        );
+
+        cleanup_coin(&pool, coin).await;
+    }
+
+    // F2 REGRESSION (SPEC-CANDLE-002 sync-audit, REQ-CANDLE-051): the core F-07 failure mode —
+    // a native `1d` row inside the recompute window at a ts where NO rollup bucket is emitted
+    // (its day has no source). The OLD unfiltered reconcile read it as previously-materialized,
+    // found it absent from the emitted set, and DELETED it. The source-filtered SELECT keeps it
+    // out of previously_materialized (so never in the delete set) and the filtered DELETE is a
+    // second guard — the native row MUST survive.
+    #[tokio::test]
+    #[ignore]
+    async fn db_native_row_without_source_in_window_survives_reconcile() {
+        let pool = db_pool().await;
+        let coin = "test-candle002-survive";
+        cleanup_coin(&pool, coin).await;
+        seed_tracked_coin(&pool, coin).await;
+
+        let day0 = 0i64; // epoch Thursday → week-aligned, no backward-repair fire
+        let day2 = 2 * DAY;
+
+        // Healthy rollup path: full 5m for day0 + a pre-existing rollup row at day0 forces the
+        // reconcile path (recompute_start = day0).
+        seed_full_5m_day(&pool, coin, day0, dec!(100)).await;
+        insert_1d(&pool, coin, day0, dec!(999), "rollup:5m").await;
+        // Native row at day2, INSIDE the window [day0, now], with NO 5m source for day2 → no
+        // rollup bucket is emitted at day2, so the reconcile's delete set would target it under
+        // the old unfiltered logic.
+        insert_1d(&pool, coin, day2, dec!(77777), "bitstamp").await;
+
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("reconcile cycle");
+
+        let native = fetch_1d(&pool, coin, day2)
+            .await
+            .expect("native day2 row must survive");
+        assert_eq!(
+            native.0, "bitstamp",
+            "native source preserved (not read as materialized)"
+        );
+        assert_eq!(
+            native.1,
+            dec!(77777),
+            "native row not deleted by the reconcile"
+        );
+        assert_eq!(
+            count_1d(&pool, coin).await,
+            2,
+            "day0 rollup + day2 native — native neither deleted nor duplicated"
         );
 
         cleanup_coin(&pool, coin).await;

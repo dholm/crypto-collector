@@ -93,20 +93,35 @@ would require an explicit justification amendment here (D2).
 fn backward_repair_window(
     source_min_ts: DateTime<Utc>,
     earliest_materialized_ts: DateTime<Utc>,
+    target_secs: i64,
 ) -> Option<(DateTime<Utc> /* start, week-aligned */, DateTime<Utc> /* end-exclusive */)>
 ```
 
-Returns `Some((bucket_start(source_min, WEEK_SECS), earliest_materialized))` when
-`bucket_start(source_min) < earliest_materialized`, else `None`. This mirrors the existing pure-core
-style (`reconcile_window`, `page_end_secs`, `pacer_decision`) and is the AC-CANDLE-055 pure test
-target.
+The trigger and the walk-start use **two distinct alignments** — this is load-bearing for
+self-termination. Returns `Some((bucket_start(source_min, WEEK_SECS), earliest_materialized))`
+when the **target-interval bucket** of the source low-watermark precedes the earliest
+materialized bucket — i.e. when `bucket_start(source_min, target_secs) < earliest_materialized`
+(day bucket for `1d`, week bucket for `1w`) — else `None`. The returned window START stays
+**week-aligned** (`bucket_start(source_min, WEEK_SECS)`) so the walk chunk boundary never splits a
+`1d`/`1w` bucket (memory bound). Using a WEEK-aligned *trigger* for a `1d` target would be a bug:
+after a repair the earliest `1d` bucket is DAY-aligned, and `week_bucket(source_min) <
+day_bucket(source_min)` holds for ~6/7 of coins (any non-epoch-Thursday day), so the pass would
+re-fire on every recompute. The target-interval-aware trigger is what makes it terminate. This
+mirrors the existing pure-core style (`reconcile_window`, `page_end_secs`, `pacer_decision`) and is
+the AC-CANDLE-055 pure test target.
 
 **Execution:** when the pure core returns `Some(window)`, walk `[start, earliest_materialized)` in
 the SAME week-aligned `WEEK_SECS * BACKFILL_CHUNK_WEEKS` chunks `backfill_target` already uses
 (`rollup.rs:194-199`), folding each window via `candles_agg.rs` and upserting via
 `batched_upsert_candles` (so native-wins §1 applies here too). Per-window memory is bounded
-(REQ-CANDLE-056). **Idempotent + self-terminating:** after the first repair, `earliest_materialized`
-moves back to `source_min`'s bucket, so the next run's core returns `None` — no repeat.
+(REQ-CANDLE-056). **Idempotent + self-terminating (target-interval-aware trigger):** after the
+first repair the earliest materialized bucket moves back to the TARGET-interval bucket of
+`source_min` — the DAY bucket for `1d`, the WEEK bucket for `1w`. Because the trigger compares
+`bucket_start(source_min, target_secs)` (NOT the week-aligned walk start) against
+`earliest_materialized`, the next run's core returns `None` for BOTH `1d` and `1w` — no repeat.
+(A week-aligned trigger would have re-fired the `1d` pass every recompute for any non-Thursday
+day; the target-aware trigger is the fix. Any residual overshoot within a single fired pass
+re-materializes identical `rollup:*` buckets idempotently, native-wins protects any native row.)
 
 **End-bound handling (`backfill_target` loop reuse — explicit implementer note):** `backfill_target`'s
 loop is `while window_start <= ceiling { window_end = window_start + chunk; … }` (`rollup.rs:198-199`).
