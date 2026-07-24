@@ -8,6 +8,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **SPEC-PROV-003** — Provider data correctness & tier configuration
+  (`src/config.rs`, `src/providers/{coingecko,binance,mod}.rs`,
+  `migrations/0021_coingecko_range_interval_canonicalise.sql`,
+  `tests/{migration_files,db_integration}.rs`):
+  - **F-20** (High): the CoinGecko `/ohlc/range` path stamped the raw API param strings
+    `"daily"`/`"hourly"` as the persisted `coin_candles.interval`, invisible to
+    `candles_agg::interval_to_seconds`, so range-fetched candles silently dropped out of
+    rollup/aggregation. Fixed: `coingecko_range_snap_interval` now returns a
+    `(param, canonical)` tuple — the API keeps `"daily"`/`"hourly"`, the persisted stamp is
+    always `"1d"`/`"1h"` — mirroring the existing Bitstamp convention. A collision-safe
+    migration (`0021_coingecko_range_interval_canonicalise.sql`, DELETE-shadowed-then-UPDATE,
+    no-op on already-canonical rows) rewrites historical non-canonical rows in place.
+  - **F-21** (High): paid CoinGecko tiers `analyst`/`lite`/`enterprise` sent the *demo*
+    `x-cg-demo-api-key` header against the *demo* host while the range capability was
+    (incorrectly) enabled for them — three tier decisions lived in two files with two
+    divergent tier sets. Fixed with a typed `Tier` enum (`Demo`/`Analyst`/`Lite`/`Pro`/
+    `Enterprise`) whose `is_paid()` is the single authority driving the API-key header, the
+    default base URL, and the `OhlcRange` capability; unknown `COINGECKO_TIER` values now
+    fail fast at startup, naming the offending value.
+  - **F-22** (Medium): Binance `fetch_spot` stored a single 1-minute kline's volume in the
+    `volume_24h` field (~3 orders of magnitude undercount) and derived price from the kline
+    close. Fixed: price (`lastPrice`), `volume_24h`, and bid/ask now all come from
+    `GET /api/v3/ticker/24hr`, routed through the shared `transport::paced()`/`get_json()`
+    frame — never a kline.
+  - **F-23** (Medium): `Decimal::from_str` cannot parse scientific notation (e.g.
+    `"1.23e-5"`), so one exotic upstream number poisoned an entire page. Fixed:
+    `decimal_from_number` — the single Decimal-only monetary parse core every provider
+    `serde_json::Number` conversion routes through — falls back to
+    `Decimal::from_scientific` (never `f64`, REQ-PROV-012). Optional fields that still fail
+    to parse degrade to `None` with a `warn!` log; required fields hard-fail.
+  - **F-24** (Medium): derivatives-ticker lookup matched by case-insensitive prefix, so a
+    query for `"BTC"` could bind `"BTCDOM"`, `"BTCUP"`, or `"BTCST"` instead of the intended
+    contract. Fixed with `select_deriv_ticker` — boundary-aware symbol matching (exact,
+    separator, or quote-currency boundary), preference for the queried venue, and a
+    deterministic tie-break on highest open interest (never upstream response order).
+  - **F-25** (Low): Binance `fetch_ohlc`'s `limit` was computed from the raw requested
+    interval rather than the snapped one, so a between-band interval could request the wrong
+    candle count. Fixed: `kline_limit` now divides by the snapped interval.
+  - **F-26** (Low): `chain_fetch_ohlc` reported the generic "empty provider chain" message
+    for a non-empty chain where every member lacked the capability. Fixed with a new
+    `ProviderError::NoCapableProvider(Capability)` variant naming the missing capability;
+    the true empty-chain case is unchanged.
+  - **F-27** (Low): normalization degradations (unparseable `max_supply`, missing
+    `last_updated`) were silently swallowed. Fixed: both now degrade gracefully
+    (`max_supply` → `None`, `last_updated` → `Utc::now()`) with a `warn!` log recording the
+    original value — behavior-preserving, observability-only.
+  - **F-28** (Low): search/tickers/derivatives normalization paths deep-cloned
+    `serde_json::Value` arrays. Fixed: iteration is now by-reference throughout
+    `coingecko.rs` (verified via `grep -c '.as_array().cloned()'` == 0).
+
+  11 requirements-mapped acceptance criteria (AC-PROV-065/067/068/072/074/076/077/079/080/081
+  + the quality gate AC-PROV-QG), covering REQ-PROV-065..081. Sandbox-verifiable ACs (pure
+  `coingecko_range_snap_interval`/`decimal_from_number`/`select_deriv_ticker`/`kline_limit`
+  cores, tier matrix + fail-fast + wiremock header checks, migration-file shape test, `fmt`/
+  `clippy -D warnings`, 652 tests passed) are PASS with evidence. 4 net-new DB-gated tests
+  (`#[ignore]`, `--test-threads=1`) — three exercising the shipped `0021` migration body
+  (no-op on canonical rows, idempotent daily→1d rewrite, shadowed-duplicate drop without PK
+  violation) and one exercising the Binance 24hr-ticker spot path end-to-end through the
+  pacer — were **not executed** in this environment (no live Postgres available); deferred to
+  a live-Postgres verification pass. No new migration beyond `0021`, no new dependency, no
+  `f64` in any monetary path, `candles_agg::interval_to_seconds` (the canonical-stamp
+  vocabulary anchor) unchanged.
+
 - **SPEC-PROV-002** — Provider transport hardening & pacer compliance
   (`src/providers/{transport(new),coingecko,binance,bitstamp,mod}.rs`, `src/pacer/mod.rs`,
   `src/config.rs`, `src/main.rs`):

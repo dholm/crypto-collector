@@ -2,7 +2,7 @@
 id: SPEC-PROV-003
 title: "Provider Data Correctness & Tier Configuration"
 version: "0.1.0"
-status: in-progress
+status: implemented
 created: 2026-07-24
 updated: 2026-07-24
 author: manager-spec

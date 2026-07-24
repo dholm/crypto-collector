@@ -1,8 +1,8 @@
 # SPEC-PROV-003 — Progress
 
-Lifecycle: plan → run → sync. Status: **in-progress** (all 7 milestones implemented +
-committed to `main`; sandbox gates green; DB-gated behaviour tests deferred to the
-live-Postgres verify run; sync/close pending).
+Lifecycle: plan → run → sync. Status: **implemented** (held — all 7 milestones implemented +
+committed to `main`; sandbox gates green; sync-phase closed; 4 DB-gated tests deferred to a
+live-Postgres verify run before a `completed` close).
 
 ## §E.1 Plan-phase Audit-Ready Signal
 
@@ -109,4 +109,37 @@ push_state: not-pushed              # orchestrator owns push + live-DB verify + 
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — owned by manager-docs>_
+```yaml
+sync_complete_at: 2026-07-24
+sync_commit_sha: PENDING-BACKFILL   # this commit's own SHA; backfilled by a follow-up chore commit (SPEC-PROV-002 precedent)
+sync_status: pass-with-debt          # sync-auditor PASS-WITH-DEBT ~= 0.91; held at implemented, not completed
+sync_auditor_verdict: "PASS-WITH-DEBT ~= 0.91 (4-dim: Func 92 / Sec 90 / Craft 88 / Consist 93)"
+changelog_entry_position: "Unreleased > Fixed, immediately above the SPEC-PROV-002 entry"
+frontmatter_status_transitions:
+  spec_md: "in-progress -> implemented"
+  plan_md: "no frontmatter block (narrative doc, no status field)"
+  acceptance_md: "no frontmatter block (narrative doc, no status field)"
+  progress_md: "in-progress -> implemented (prose status line, §E.1 header)"
+mx_tags_validated: true              # @MX:ANCHOR x3 (config::Tier, coingecko_range_snap_interval, decimal_from_number) + @MX:NOTE x2 (Binance fetch_spot, CoinGecko fetch_derivatives) — all present, well-formed, @MX:REASON + @MX:SPEC populated; no new tags required
+db_gated_debt:
+  deferred_tests: 4
+  tests:
+    - tests/db_integration.rs::scenario_02_migration_0021_is_noop_on_canonical_rows
+    - tests/db_integration.rs::scenario_02_migration_0021_rewrites_daily_to_1d_idempotently
+    - tests/db_integration.rs::scenario_02_migration_0021_drops_shadowed_duplicate_without_pk_violation
+    - src/providers/binance.rs::fetch_spot_uses_24hr_ticker_price_volume_and_bid_ask
+  run_command: "DATABASE_URL=... cargo test -- --ignored --test-threads=1"
+  reason: "no sandbox Postgres available; destructive migration/DB tests must not run against production"
+future_spec_note: "sync-auditor F2 — Binance volume_24h is base-asset volume while CoinGecko total_volume is quote-currency; a possible cross-source unit mismatch to reconcile in a later SPEC (not a defect in this SPEC; both are spec-compliant per their own upstream contracts)"
+b12_self_test_a: "grep -c 'SPEC-PROV-003' CHANGELOG.md == 0 before emission (parallel-session dup guard)"
+b12_self_test_b: "acceptance.md AC row count == 11 (AC-PROV-065/067/068/072/074/076/077/079/080/081 + AC-PROV-QG); CHANGELOG entry references the same 11"
+b12_self_test_c: "every file path in the CHANGELOG entry verified via ls before commit"
+canary_compliance_check:
+  applicable: false
+  reason: "SPEC-PROV-003 does not define a forward-looking policy that its own sync tests"
+```
+
+Held at `implemented`, not `completed`, mirroring the SPEC-PROV-002 precedent: 4 DB-gated
+tests are `#[ignore]` and were not executed (no sandbox Postgres; the migration tests are
+destructive and must not run against production). A `completed` close follows a live-Postgres
+verification pass running `DATABASE_URL=... cargo test -- --ignored --test-threads=1`.
