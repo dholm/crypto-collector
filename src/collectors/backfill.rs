@@ -1497,6 +1497,10 @@ mod tests {
     }
 
     // ── DB-gated integration tests ─────────────────────────────────────────────
+    // These MUST run with `--test-threads=1`. `claim_backfill_chunk` selects the
+    // globally-oldest pending chunk (`ORDER BY created_at LIMIT 1 FOR UPDATE SKIP
+    // LOCKED`), so tests running concurrently against the shared DB would steal each
+    // other's pending rows and flake. See CLAUDE.md § Integration Tests.
 
     /// REQ-SCHED-021/022/024/026: claim → cursor advance → complete cycle.
     #[tokio::test]
@@ -1789,8 +1793,10 @@ mod tests {
         let max_attempts = 5;
         let coin_id = "test-f01-page-walk";
 
-        // Fresh job + chunk (no tracked_coins row needed — this drives the claim/release SQL
-        // wrappers directly, not process_chunk).
+        // Fresh tracked_coin + job + chunk. `backfill_jobs.coin_id` has an FK to
+        // `tracked_coins(coin_id)`, so the parent row MUST exist before the job INSERT even
+        // though this test drives the claim/release SQL wrappers directly (not process_chunk).
+        // FK-safe order — delete: chunks → jobs → tracked_coins; insert: tracked_coins → job → chunk.
         sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
             .bind(coin_id)
             .execute(&pool)
@@ -1801,6 +1807,19 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pre-cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup tracked_coins");
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+             VALUES ($1, 'TF01W', 'Test F01 Page Walk', 'active', now())",
+        )
+        .bind(coin_id)
+        .execute(&pool)
+        .await
+        .expect("insert tracked coin");
         let job_id: i64 = sqlx::query_scalar(
             "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
              VALUES ($1, 'ohlc_1d', 'pending', now(), now()) RETURNING id",
@@ -1865,7 +1884,7 @@ mod tests {
             "a page-count of releases must not fail a chunk (F-01, AC-SCHED-060a)"
         );
 
-        // Cleanup.
+        // Cleanup — FK-safe order: chunks → jobs → tracked_coins.
         sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
             .bind(coin_id)
             .execute(&pool)
@@ -1876,6 +1895,11 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup tracked_coins");
     }
 
     /// AC-SCHED-060c / REQ-SCHED-060.3: genuine failures still bound retries — after
@@ -1888,6 +1912,9 @@ mod tests {
         let max_attempts = 3;
         let coin_id = "test-f01-bound";
 
+        // `backfill_jobs.coin_id` has an FK to `tracked_coins(coin_id)`, so the parent row MUST
+        // exist before the job INSERT even though this test drives the claim/fail SQL wrappers
+        // directly. FK-safe order — delete: chunks → jobs → tracked_coins; insert: tracked_coins → job → chunk.
         sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
             .bind(coin_id)
             .execute(&pool)
@@ -1898,6 +1925,19 @@ mod tests {
             .execute(&pool)
             .await
             .expect("pre-cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("pre-cleanup tracked_coins");
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at) \
+             VALUES ($1, 'TF01B', 'Test F01 Bound Retries', 'active', now())",
+        )
+        .bind(coin_id)
+        .execute(&pool)
+        .await
+        .expect("insert tracked coin");
         let job_id: i64 = sqlx::query_scalar(
             "INSERT INTO backfill_jobs (coin_id, dataset, status, requested_at, updated_at) \
              VALUES ($1, 'ohlc_1d', 'pending', now(), now()) RETURNING id",
@@ -1939,6 +1979,7 @@ mod tests {
             "max_attempts genuine failures must mark the chunk failed (REQ-SCHED-060.3)"
         );
 
+        // Cleanup — FK-safe order: chunks → jobs → tracked_coins.
         sqlx::query("DELETE FROM backfill_chunks WHERE coin_id = $1")
             .bind(coin_id)
             .execute(&pool)
@@ -1949,5 +1990,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup jobs");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup tracked_coins");
     }
 }

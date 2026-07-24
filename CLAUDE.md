@@ -90,8 +90,10 @@ Tests in `tests/` fall into two groups:
 cargo test --test model_serde
 cargo test --test migration_files
 
-# Requires a live PostgreSQL instance — marked #[ignore], must opt in
-DATABASE_URL=postgres://... cargo test -- --ignored   # db_integration tests
+# Requires a live PostgreSQL instance — marked #[ignore], must opt in.
+# Use --test-threads=1: the DB-gated tests share a global claim queue
+# (claim_* selects the globally-oldest pending row), so they MUST run serially.
+DATABASE_URL=postgres://... cargo test -- --ignored --test-threads=1   # db_integration tests
 ```
 
 ---

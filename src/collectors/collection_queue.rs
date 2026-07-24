@@ -1225,6 +1225,10 @@ mod tests {
     }
 
     // ── DB-gated integration tests (require live DATABASE_URL) ────────────────
+    // These MUST run with `--test-threads=1`. `claim_queue_item` selects the
+    // globally-oldest pending item (`ORDER BY enqueued_at LIMIT 1 FOR UPDATE SKIP
+    // LOCKED`), so tests running concurrently against the shared DB would steal each
+    // other's pending rows and flake. See CLAUDE.md § Integration Tests.
 
     /// Scenario 6/7 / REQ-SCHED-010/011/012/013: claim, heartbeat, complete cycle.
     #[tokio::test]
