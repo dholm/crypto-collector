@@ -918,12 +918,34 @@ mod tests {
         crate::db::connect(&url).await.expect("connect + migrate")
     }
 
+    /// Seed the parent `tracked_coins` row required by the `coin_candles.coin_id` FK
+    /// (`coin_candles_coin_id_fkey1`). MUST run before any `coin_candles` insert for `coin`,
+    /// mirroring the existing self-seeding DB tests (e.g. `api::quotes`, `api::cycle_overlay`).
+    async fn seed_tracked_coin(pool: &PgPool, coin: &str) {
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status) \
+             VALUES ($1, 'TST', 'Test', 'active') \
+             ON CONFLICT (coin_id) DO NOTHING",
+        )
+        .bind(coin)
+        .execute(pool)
+        .await
+        .expect("seed tracked_coins parent");
+    }
+
+    /// Tear down in FK order: children (`coin_candles`) before the parent (`tracked_coins`),
+    /// else the parent DELETE violates `coin_candles_coin_id_fkey1`.
     async fn cleanup_coin(pool: &PgPool, coin: &str) {
         sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
             .bind(coin)
             .execute(pool)
             .await
             .expect("cleanup coin_candles");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin)
+            .execute(pool)
+            .await
+            .expect("cleanup tracked_coins");
     }
 
     /// Seed a complete day of uniform 5m source candles `[day_start, day_start+DAY)` at `price`
@@ -1024,6 +1046,7 @@ mod tests {
         let pool = db_pool().await;
         let coin = "test-candle002-mixed";
         cleanup_coin(&pool, coin).await;
+        seed_tracked_coin(&pool, coin).await;
 
         let day0 = 0i64; // epoch Thursday → week-aligned, so no spurious backward repair fires
         let day1 = DAY;
@@ -1080,6 +1103,7 @@ mod tests {
         let pool = db_pool().await;
         let coin = "test-candle002-collision";
         cleanup_coin(&pool, coin).await;
+        seed_tracked_coin(&pool, coin).await;
 
         let day0 = 0i64;
         seed_full_5m_day(&pool, coin, day0, dec!(100)).await; // emits a 1d bucket at day0
@@ -1113,6 +1137,7 @@ mod tests {
         let pool = db_pool().await;
         let coin = "test-candle002-repair";
         cleanup_coin(&pool, coin).await;
+        seed_tracked_coin(&pool, coin).await;
 
         // Initial source: two adjacent complete days deep in history.
         let late_a = 20 * DAY;
