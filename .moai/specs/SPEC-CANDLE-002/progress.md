@@ -30,14 +30,20 @@ Plan-phase artifacts complete: `spec.md`, `plan.md`, `acceptance.md`, `progress.
 ## §E.2 Run-phase Evidence
 
 TDD RED→GREEN→REFACTOR (brownfield). Commits: `9a96d22` (M1 RED F-09 + draft→in-progress),
-`247e9b4` (M2 GREEN F-09), `7805800` (M3 F-07/F-08), `30cc987` (DB-gated fixture parent-seed fix).
+`247e9b4` (M2 GREEN F-09), `7805800` (M3 F-07/F-08), `30cc987` (DB-gated fixture parent-seed fix),
+`b287979` (sync-audit remediation — F1 1d backward-repair termination + F2 native-survival DB test).
 Plan artifacts: `3c0b978`.
 
-All three DB-gated (`#[ignore]`) scenarios were run green against a live Postgres 16 (ephemeral
-container) with `--ignored --test-threads=1` → `test result: ok. 3 passed; 0 failed`. The initial
-run failed at fixture setup (missing `tracked_coins` parent → FK `coin_candles_coin_id_fkey1`); the
-fix (`30cc987`) seeds the parent and tears down in FK order — production F-07/F-08 SQL was confirmed
-correct, no logic change. Pure scenarios + the full offline gate also green.
+Four DB-gated (`#[ignore]`) scenarios run green against a live Postgres 16 (ephemeral container)
+with `--ignored --test-threads=1` → `test result: ok. 4 passed; 0 failed`. The first DB run failed
+at fixture setup (missing `tracked_coins` parent → FK `coin_candles_coin_id_fkey1`); the fix
+(`30cc987`) seeds the parent and tears down in FK order — production F-07/F-08 SQL confirmed correct,
+no logic change. Sync-audit remediation (`b287979`): F1 — `backward_repair_window` trigger made
+target-interval-aware (day bucket for 1d, week bucket for 1w) so the 1d pass self-terminates instead
+of re-firing every recompute (walk start stays week-aligned for the memory bound); plan.md §3
+self-termination claim corrected. F2 — added `db_native_row_without_source_in_window_survives_reconcile`
+(native row at a no-source ts inside the window must survive the reconcile DELETE). Pure suite: 12
+rollup + 10 projection tests green. Full offline gate also green.
 
 | AC | Scenario | Kind | Status | Verification (actual output) |
 |----|----------|------|--------|------------------------------|
@@ -58,7 +64,7 @@ Invariants:
 
 ```yaml
 run_complete_at: 2026-07-24
-run_commit_sha: 30cc987            # final run-phase code commit; milestones 9a96d22, 247e9b4, 7805800, 30cc987
+run_commit_sha: b287979            # final run-phase code commit; milestones 9a96d22, 247e9b4, 7805800, 30cc987, b287979 (F1/F2 sync-audit remediation)
 run_status: pass                   # all 5 ACs verified: pure + quality gate green; 3 DB-gated scenarios run green vs live Postgres 16 (3 passed, 0 failed)
 ac_pass_count: 5                   # AC-CANDLE-050/052/055/058 + AC-CANDLE-QG all verified
 ac_fail_count: 0
