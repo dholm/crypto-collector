@@ -23,6 +23,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use super::transport;
+use crate::config::Tier;
 use crate::pacer::LocalThrottle;
 
 /// CoinGecko client configuration.
@@ -30,37 +31,39 @@ use crate::pacer::LocalThrottle;
 pub struct CoinGeckoConfig {
     /// Base URL (e.g. `https://api.coingecko.com` for Demo).
     pub base_url: String,
-    /// API key (optional for Demo, required for Pro).
+    /// API key (optional for Demo, required for paid Pro-API tiers).
     pub api_key: Option<String>,
-    /// Tier: `"demo"` or `"pro"`.
-    pub tier: String,
+    /// Parsed subscription tier — the single authority for header + base URL + capability
+    /// (SPEC-PROV-003 F-21).
+    pub tier: Tier,
 }
 
 impl CoinGeckoConfig {
     /// Build config from environment variables (production entry point).
+    ///
+    /// Fail-fast on an unknown `COINGECKO_TIER` (REQ-PROV-069): a misconfigured tier
+    /// aborts startup with a message naming the offending value rather than silently
+    /// defaulting to Demo.
     pub fn from_env() -> Self {
+        let tier =
+            Tier::from_env().unwrap_or_else(|e| panic!("COINGECKO_TIER misconfiguration: {e}"));
         Self {
             base_url: crate::config::coingecko_base_url(),
             api_key: crate::config::coingecko_api_key(),
-            tier: crate::config::coingecko_tier(),
+            tier,
         }
     }
 
-    /// API key header name for the configured tier (REQ-PROV-011).
+    /// API key header name for the configured tier — delegates to the [`Tier`] authority
+    /// (REQ-PROV-070).
     pub fn key_header_name(&self) -> &'static str {
-        if self.tier == "pro" {
-            "x-cg-pro-api-key"
-        } else {
-            "x-cg-demo-api-key"
-        }
+        self.tier.key_header_name()
     }
 
-    /// Whether this tier supports the range-bounded OHLC endpoint `/ohlc/range` (Analyst+).
+    /// Whether this tier supports the range-bounded OHLC endpoint `/ohlc/range` — delegates
+    /// to the [`Tier`] authority (every paid tier; REQ-PROV-071).
     pub fn supports_ohlc_range(&self) -> bool {
-        matches!(
-            self.tier.as_str(),
-            "analyst" | "lite" | "enterprise" | "pro"
-        )
+        self.tier.supports_ohlc_range()
     }
 }
 
@@ -182,9 +185,9 @@ impl CoinGeckoClient {
         &self.config.base_url
     }
 
-    /// True if this client targets the Demo base URL.
+    /// True if this client targets the Demo tier.
     pub fn is_demo(&self) -> bool {
-        self.config.tier == "demo"
+        self.config.tier == Tier::Demo
     }
 
     /// True if this client's configured tier supports the `/ohlc/range` endpoint
@@ -1030,7 +1033,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://api.coingecko.com".to_string(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         assert_eq!(client.base_url(), "https://api.coingecko.com");
@@ -1043,7 +1046,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://pro-api.coingecko.com".to_string(),
             api_key: Some("test-key".to_string()),
-            tier: "pro".to_string(),
+            tier: Tier::Pro,
         };
         let client = CoinGeckoClient::new(cfg);
         assert_eq!(client.base_url(), "https://pro-api.coingecko.com");
@@ -1056,7 +1059,7 @@ mod tests {
         // Env not set → demo defaults
         if std::env::var("COINGECKO_TIER").is_err() {
             let cfg = CoinGeckoConfig::from_env();
-            assert_eq!(cfg.tier, "demo");
+            assert_eq!(cfg.tier, Tier::Demo);
             assert_eq!(cfg.base_url, "https://api.coingecko.com");
         }
     }
@@ -1284,7 +1287,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://api.coingecko.com".to_string(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         assert!(
             !cfg.supports_ohlc_range(),
@@ -1297,7 +1300,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://pro-api.coingecko.com".to_string(),
             api_key: Some("key".to_string()),
-            tier: "analyst".to_string(),
+            tier: Tier::Analyst,
         };
         assert!(
             cfg.supports_ohlc_range(),
@@ -1315,7 +1318,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://api.coingecko.com".to_string(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let provider = CoinGeckoProvider::new(cfg, pool);
         assert!(!provider.supports(Capability::OhlcRange));
@@ -1329,7 +1332,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://pro-api.coingecko.com".to_string(),
             api_key: Some("key".to_string()),
-            tier: "analyst".to_string(),
+            tier: Tier::Analyst,
         };
         let provider = CoinGeckoProvider::new(cfg, pool);
         assert!(provider.supports(Capability::OhlcRange));
@@ -1343,7 +1346,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "https://api.coingecko.com".to_string(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let provider = CoinGeckoProvider::new(cfg, pool);
         let market = MarketQuery {
@@ -1418,7 +1421,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: Some("key".to_string()),
-            tier: "analyst".to_string(),
+            tier: Tier::Analyst,
         };
         let client = CoinGeckoClient::new(cfg);
 
@@ -1451,7 +1454,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "analyst".to_string(),
+            tier: Tier::Analyst,
         };
         let client = CoinGeckoClient::new(cfg);
         let start = Utc::now() - chrono::Duration::days(1);
@@ -1575,7 +1578,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let markets = client
@@ -1610,7 +1613,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         // Use a 4h interval (14400 s) → snaps to "4h" band → days clamped to 7 (within 2..=30)
@@ -1641,7 +1644,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let result = client.fetch_markets(&["bitcoin"], "usd").await;
@@ -1685,7 +1688,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let tickers = client.fetch_derivatives_tickers().await.expect("fetch");
@@ -1712,7 +1715,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: Some("test-demo-key".to_string()),
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let result = client.fetch_markets(&[], "usd").await;
@@ -1737,11 +1740,50 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: Some("test-pro-key".to_string()),
-            tier: "pro".to_string(),
+            tier: Tier::Pro,
         };
         let client = CoinGeckoClient::new(cfg);
         let result = client.fetch_markets(&[], "usd").await;
         assert!(result.is_ok(), "pro key header must be sent");
+    }
+
+    /// Scenario 3 top-line (AC-PROV-068, REQ-PROV-068/070): `COINGECKO_TIER=analyst` — a
+    /// PAID tier — sends the Pro API-key header (`x-cg-pro-api-key`), NOT the demo header,
+    /// and the analyst tier reports the pro default base URL + range capability. Before
+    /// F-21 the analyst tier sent the demo header (`x-cg-demo-api-key`) — this test is the
+    /// regression guard for that silent misconfiguration.
+    #[tokio::test]
+    async fn analyst_tier_sends_pro_key_header_and_reports_pro_host_and_range() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // The mock only responds when the PRO key header is present — a demo-header
+        // request (the F-21 bug) would miss the mock and the request would fail.
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/markets"))
+            .and(header_exists("x-cg-pro-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: Some("test-analyst-key".to_string()),
+            tier: Tier::Analyst,
+        };
+        // The tier authority reports the pro host + range capability (base URL asserted
+        // via the pure Tier matrix; here it is exercised end-to-end for the header).
+        assert_eq!(cfg.tier.default_base_url(), "https://pro-api.coingecko.com");
+        assert!(cfg.supports_ohlc_range());
+
+        let client = CoinGeckoClient::new(cfg);
+        let result = client.fetch_markets(&[], "usd").await;
+        assert!(
+            result.is_ok(),
+            "analyst (paid) tier must send the x-cg-pro-api-key header"
+        );
     }
 
     // ── Scenario 16 (REQ-PROV-005): search_coins sends demo key and parses coins array ──
@@ -1775,7 +1817,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: Some("test-demo-key".to_string()),
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -1796,7 +1838,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: "http://127.0.0.1:1".to_string(), // unreachable
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client.search_coins("", 10).await.expect("empty q");
@@ -1825,7 +1867,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -1858,7 +1900,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let result = client.search_coins("bitcoin", 10).await;
@@ -1894,7 +1936,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client.search_coins("bitcoin", 2).await.expect("search");
@@ -1978,7 +2020,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: Some("test-demo-key".to_string()),
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -2042,7 +2084,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -2098,7 +2140,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -2158,7 +2200,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -2190,7 +2232,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let results = client
@@ -2222,7 +2264,7 @@ mod tests {
         let cfg = CoinGeckoConfig {
             base_url: server.uri(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: Tier::Demo,
         };
         let client = CoinGeckoClient::new(cfg);
         let result = client.fetch_coin_tickers("bitcoin", 10).await;

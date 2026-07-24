@@ -154,10 +154,98 @@ pub fn provider_names() -> Vec<String> {
         .collect()
 }
 
-/// CoinGecko tier: `"demo"` or `"pro"` (default: `"demo"`).
+/// CoinGecko subscription tier — the SINGLE authority for every tier-dependent request
+/// decision: the API-key header, the default base URL, and the range capability
+/// (SPEC-PROV-003 F-21).
 ///
-/// Env var: `COINGECKO_TIER`.
-/// Determines base URL and API key header (REQ-PROV-011, research §2.3).
+/// Every paid CoinGecko plan is a Pro-API plan (`pro-api.coingecko.com` +
+/// `x-cg-pro-api-key`), so `is_paid()` is the ONE predicate all three decisions derive
+/// from. Before this enum, three tier decisions lived in two files with two divergent
+/// string sets — `key_header_name` treated only `"pro"` as paid while
+/// `supports_ohlc_range` accepted `analyst|lite|enterprise|pro` — so
+/// `COINGECKO_TIER=analyst` (a paid plan) sent the demo header to the demo host while
+/// enabling the range capability, silently corrupting the data path.
+///
+// @MX:ANCHOR: [AUTO] Tier — the single CoinGecko tier-decision authority
+// @MX:REASON: is_paid() drives the API-key header, the default base URL, AND the range
+//             capability; no tier decision may be made outside this enum. F-21 existed
+//             because three tier decisions lived in two files with two divergent tier sets,
+//             so COINGECKO_TIER=analyst sent the demo header to the demo host while
+//             enabling the range capability (silent data-path misconfiguration).
+// @MX:SPEC: SPEC-PROV-003 REQ-PROV-068 REQ-PROV-069 REQ-PROV-070 REQ-PROV-071
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Demo,
+    Analyst,
+    Lite,
+    Pro,
+    Enterprise,
+}
+
+impl Tier {
+    /// Parse a raw `COINGECKO_TIER` value (case-insensitive, whitespace-trimmed).
+    ///
+    /// Fail-fast on an unrecognised value, naming the offending value — the system MUST
+    /// NOT silently default (REQ-PROV-069, matching the `build_chain` fail-fast philosophy).
+    pub fn parse(raw: &str) -> anyhow::Result<Tier> {
+        match raw.trim().to_lowercase().as_str() {
+            "demo" => Ok(Tier::Demo),
+            "analyst" => Ok(Tier::Analyst),
+            "lite" => Ok(Tier::Lite),
+            "pro" => Ok(Tier::Pro),
+            "enterprise" => Ok(Tier::Enterprise),
+            other => Err(anyhow::anyhow!(
+                "unknown CoinGecko tier: {other:?}. Valid tiers: demo, analyst, lite, pro, enterprise"
+            )),
+        }
+    }
+
+    /// Parse the tier from the `COINGECKO_TIER` environment variable. Unset (or empty)
+    /// defaults to `Demo`; any other unrecognised value fails fast (REQ-PROV-068/069).
+    pub fn from_env() -> anyhow::Result<Tier> {
+        match std::env::var("COINGECKO_TIER") {
+            Ok(v) if !v.trim().is_empty() => Tier::parse(&v),
+            _ => Ok(Tier::Demo),
+        }
+    }
+
+    /// True for every paid (Pro-API) plan; false only for Demo. Drives the header, the
+    /// default base URL, and the range capability (REQ-PROV-070/071).
+    pub fn is_paid(self) -> bool {
+        !matches!(self, Tier::Demo)
+    }
+
+    /// API-key header name: the Pro header for every paid tier, the Demo header for Demo
+    /// (REQ-PROV-070).
+    pub fn key_header_name(self) -> &'static str {
+        if self.is_paid() {
+            "x-cg-pro-api-key"
+        } else {
+            "x-cg-demo-api-key"
+        }
+    }
+
+    /// Default base URL (before any `COINGECKO_BASE_URL` override): the Pro host for every
+    /// paid tier, the public host for Demo (REQ-PROV-070).
+    pub fn default_base_url(self) -> &'static str {
+        if self.is_paid() {
+            "https://pro-api.coingecko.com"
+        } else {
+            "https://api.coingecko.com"
+        }
+    }
+
+    /// Whether this tier can serve the range-bounded `/ohlc/range` endpoint: every paid
+    /// tier can, Demo cannot (REQ-PROV-071).
+    pub fn supports_ohlc_range(self) -> bool {
+        self.is_paid()
+    }
+}
+
+/// CoinGecko tier as a raw lowercased string (default: `"demo"`).
+///
+/// Env var: `COINGECKO_TIER`. Retained for backward compatibility; the parsed [`Tier`]
+/// enum (via [`Tier::from_env`]) is the authoritative tier-decision source (F-21).
 pub fn coingecko_tier() -> String {
     std::env::var("COINGECKO_TIER")
         .unwrap_or_else(|_| "demo".to_string())
@@ -166,17 +254,19 @@ pub fn coingecko_tier() -> String {
 
 /// CoinGecko base URL.
 ///
-/// Env var: `COINGECKO_BASE_URL` (overrides tier default).
-/// Demo default: `https://api.coingecko.com`
-/// Pro default: `https://pro-api.coingecko.com`
+/// Env var: `COINGECKO_BASE_URL` (overrides the tier default verbatim). Otherwise the
+/// default derives from the parsed tier's `is_paid()` (single authority, F-21): the Pro
+/// host for every paid tier, the public host for Demo. An unknown `COINGECKO_TIER` fails
+/// fast at startup (`CoinGeckoConfig::from_env` / `Tier::from_env`) before this is
+/// reached; the Demo fallback below only guards the infallible `String` return.
 pub fn coingecko_base_url() -> String {
     if let Ok(url) = std::env::var("COINGECKO_BASE_URL") {
         return url;
     }
-    match coingecko_tier().as_str() {
-        "pro" => "https://pro-api.coingecko.com".to_string(),
-        _ => "https://api.coingecko.com".to_string(),
-    }
+    Tier::from_env()
+        .unwrap_or(Tier::Demo)
+        .default_base_url()
+        .to_string()
 }
 
 /// CoinGecko API key.
@@ -709,6 +799,58 @@ mod tests {
         {
             assert_eq!(coingecko_base_url(), "https://api.coingecko.com");
         }
+    }
+
+    // ── SPEC-PROV-003 M1: typed CoinGecko Tier (F-21, REQ-PROV-068/069/070/071) ──
+
+    #[test]
+    fn tier_parse_recognises_all_five_tiers_case_insensitively() {
+        assert_eq!(Tier::parse("demo").unwrap(), Tier::Demo);
+        assert_eq!(Tier::parse("analyst").unwrap(), Tier::Analyst);
+        assert_eq!(Tier::parse("lite").unwrap(), Tier::Lite);
+        assert_eq!(Tier::parse("pro").unwrap(), Tier::Pro);
+        assert_eq!(Tier::parse("enterprise").unwrap(), Tier::Enterprise);
+        // Case-insensitive + whitespace-trimmed.
+        assert_eq!(Tier::parse("  ANALYST ").unwrap(), Tier::Analyst);
+    }
+
+    #[test]
+    fn tier_parse_unknown_fails_fast_naming_the_value() {
+        // REQ-PROV-069: an unknown tier fails with a clear error NAMING the value — never
+        // a silent default.
+        let err = Tier::parse("platinum").expect_err("unknown tier must fail-fast");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("platinum"),
+            "error must name the offending value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn tier_is_paid_true_for_paid_false_for_demo() {
+        assert!(!Tier::Demo.is_paid());
+        assert!(Tier::Analyst.is_paid());
+        assert!(Tier::Lite.is_paid());
+        assert!(Tier::Pro.is_paid());
+        assert!(Tier::Enterprise.is_paid());
+    }
+
+    #[test]
+    fn tier_matrix_header_base_url_and_range_capability() {
+        // Every paid tier: pro header + pro host + range enabled (REQ-PROV-070/071).
+        for tier in [Tier::Analyst, Tier::Lite, Tier::Pro, Tier::Enterprise] {
+            assert_eq!(tier.key_header_name(), "x-cg-pro-api-key", "{tier:?}");
+            assert_eq!(
+                tier.default_base_url(),
+                "https://pro-api.coingecko.com",
+                "{tier:?}"
+            );
+            assert!(tier.supports_ohlc_range(), "{tier:?}");
+        }
+        // Demo: demo header + public host + range disabled (REQ-PROV-070/071).
+        assert_eq!(Tier::Demo.key_header_name(), "x-cg-demo-api-key");
+        assert_eq!(Tier::Demo.default_base_url(), "https://api.coingecko.com");
+        assert!(!Tier::Demo.supports_ohlc_range());
     }
 
     #[test]

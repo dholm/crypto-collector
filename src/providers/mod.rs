@@ -634,7 +634,7 @@ mod tests {
         CoinGeckoConfig {
             base_url: "https://api.coingecko.com".to_string(),
             api_key: None,
-            tier: "demo".to_string(),
+            tier: crate::config::Tier::Demo,
         }
     }
 
