@@ -11,6 +11,21 @@
 //!   `("coin","rollup")` collection-queue dispatch arm (REQ-CANDLE-024).
 //! - [`materialize_from_source`] / [`reconcile_window`]: pure, hermetically testable core
 //!   logic (no SQL, no clock reads) — this is what the reproduction-first unit tests exercise.
+//!
+//! Data-integrity hardening (SPEC-CANDLE-002):
+//! - **Source-filter invariant (REQ-CANDLE-050/051):** the incremental reconcile reads its
+//!   `previously_materialized` set AND issues its per-`ts` DELETE scoped to
+//!   `source LIKE 'rollup:%'` only — the same filter `recompute_start`'s `MAX(ts)` query
+//!   carries. Native provider rows (any non-`rollup:*` `source`) are never read as
+//!   materialized and never deleted. Combined with the native-wins upsert
+//!   ([`batched_upsert_candles`], REQ-CANDLE-052) this is a three-layer defense: a derived
+//!   materializer can never destroy or overwrite the native rows it derives from.
+//! - **Source low-watermark history repair (REQ-CANDLE-054..057):** the reconcile is no
+//!   longer strictly forward-only. After the forward recompute it compares the source
+//!   `MIN(ts)` against the earliest materialized `rollup:*` bucket ([`backward_repair_window`],
+//!   query-derived — no migration); when source history precedes materialization it runs a
+//!   bounded, week-aligned backward pass ([`materialize_window_walk`], the same memory-bounded
+//!   walk the full-history backfill uses).
 
 use std::collections::HashSet;
 
@@ -97,6 +112,31 @@ pub fn reconcile_window(
     (emitted.to_vec(), deletes)
 }
 
+/// Pure decision core for the F-08 source low-watermark history repair
+/// (SPEC-CANDLE-002 REQ-CANDLE-054/055): given the source interval's low-watermark
+/// (`source_min_ts` = `MIN(ts)` of the source rows) and the earliest already-materialized
+/// `rollup:*` bucket (`earliest_materialized_ts`), return the bounded backward window
+/// `[week-aligned(source_min), earliest_materialized)` to repair, or `None` when the source
+/// does not precede existing materialization.
+///
+/// Week-aligning the start (via `bucket_start(_, WEEK_SECS)`) reuses the same chunk boundary
+/// the backfill/repair walk uses, so no `1d`/`1w` bucket straddles a chunk edge. The pass is
+/// self-terminating for aligned/`1w` cases: once the earliest materialized bucket has moved
+/// back to the source low-watermark bucket, the next call returns `None`; any residual overlap
+/// re-materializes identical `rollup:*` buckets idempotently (native-wins protects any native
+/// row). This is the AC-CANDLE-055 pure-test target — DB-free by construction.
+pub fn backward_repair_window(
+    source_min_ts: DateTime<Utc>,
+    earliest_materialized_ts: DateTime<Utc>,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = bucket_start(source_min_ts, WEEK_SECS);
+    if start < earliest_materialized_ts {
+        Some((start, earliest_materialized_ts))
+    } else {
+        None
+    }
+}
+
 // ── Batched, partition-safe insert (REQ-CANDLE-043) ───────────────────────────────────────
 
 /// Batched upsert of rollup rows, avoiding the per-row transaction + `pg_notify` overhead of
@@ -104,13 +144,23 @@ pub fn reconcile_window(
 /// `(coin_id, vs_currency, interval, ts)` conflict target, so parity and idempotency with the
 /// row-at-a-time path are unaffected.
 ///
+// @MX:ANCHOR: [AUTO] batched_upsert_candles native-wins collision contract — the
+//             `ON CONFLICT ... DO UPDATE ... WHERE coin_candles.source LIKE 'rollup:%'` guard
+//             upgrades ONLY a prior rollup row; a colliding native provider row is left
+//             byte-identical (the WHERE is false → the conflict is a no-op). Every write path
+//             (forward recompute, full backfill, backward repair) routes through here, so this
+//             is the single enforcement point of Decision D1.
+// @MX:REASON: fan_in >= 3 (backfill/repair walk, incremental recompute, DB tests) AND a
+//             data-integrity invariant: a derived materializer MUST NOT overwrite genuine
+//             provider data. Removing the WHERE re-opens the F-07 native-row-destruction path.
+// @MX:SPEC: SPEC-CANDLE-002 REQ-CANDLE-052
 // @MX:NOTE: [AUTO] batched_upsert_candles — must not fork candles_agg.rs folding; must
 //           preserve volume null-propagation. The batch is a single UNNEST-based INSERT (one
 //           round trip, one tx) rather than N single-row upserts — do not revert to a per-row
 //           loop for historical backfill sizes (thousands of `1d` + hundreds of `1w` rows per
 //           coin). coin_candles is a plain table since migration 0020, so no partition-ensure
 //           step is needed for `ts` values outside any static range.
-// @MX:SPEC: SPEC-CANDLE-001 REQ-CANDLE-013 REQ-CANDLE-040 REQ-CANDLE-043
+// @MX:SPEC: SPEC-CANDLE-001 REQ-CANDLE-013 REQ-CANDLE-040 REQ-CANDLE-043 SPEC-CANDLE-002 REQ-CANDLE-052
 pub async fn batched_upsert_candles(
     pool: &PgPool,
     candles: &[CoinCandle],
@@ -144,7 +194,8 @@ pub async fn batched_upsert_candles(
             low    = EXCLUDED.low, \
             close  = EXCLUDED.close, \
             volume = EXCLUDED.volume, \
-            source = EXCLUDED.source",
+            source = EXCLUDED.source \
+         WHERE coin_candles.source LIKE 'rollup:%'",
     )
     .bind(&coin_ids)
     .bind(&vs_currencies)
@@ -164,11 +215,22 @@ pub async fn batched_upsert_candles(
 
 // ── DB orchestration ───────────────────────────────────────────────────────────────────────
 
-/// Full-history backfill (REQ-CANDLE-010/011/012/013): walk `[earliest .. now]` in
-/// week-aligned windows, loading only each window's source rows before folding, so the
-/// per-window row count stays bounded regardless of total history length.
+/// Walk `[window_start, ceiling]` in week-aligned `BACKFILL_CHUNK_WEEKS`-wide chunks,
+/// loading only each window's source rows before folding + upserting — the shared
+/// memory-bounded walk (REQ-CANDLE-011/012) reused by BOTH the full-history backfill and the
+/// F-08 backward-repair pass (SPEC-CANDLE-002 REQ-CANDLE-056). `window_start` MUST already be
+/// week-aligned (`bucket_start(_, WEEK_SECS)`), so no `1d`/`1w` bucket straddles a chunk edge.
+///
+// @MX:WARN: [AUTO] materialize_window_walk — memory-bounded: each iteration loads exactly one
+//           week-aligned chunk of source rows, never the full source series. The backward-repair
+//           range can span years, so widening the window or fetching the whole range at once
+//           would OOM-kill the pod.
+// @MX:REASON: OOM prevention — a coin's full candle history is ~1M rows; loading it into the
+//             256 Mi pod OOM-kills it. The chunked walk is the invariant that keeps per-window
+//             memory flat regardless of how deep the repaired history reaches.
+// @MX:SPEC: SPEC-CANDLE-001 REQ-CANDLE-011 REQ-CANDLE-012 SPEC-CANDLE-002 REQ-CANDLE-055 REQ-CANDLE-056
 #[allow(clippy::too_many_arguments)]
-async fn backfill_target(
+async fn materialize_window_walk(
     pool: &PgPool,
     coin_id: &str,
     vs_currency: &str,
@@ -177,25 +239,13 @@ async fn backfill_target(
     source_interval: &str,
     source_secs: i64,
     now: DateTime<Utc>,
+    mut window_start: DateTime<Utc>,
+    ceiling: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let earliest: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT MIN(ts) FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3",
-    )
-    .bind(coin_id)
-    .bind(vs_currency)
-    .bind(source_interval)
-    .fetch_one(pool)
-    .await?;
-
-    let Some(earliest) = earliest else {
-        return Ok(());
-    };
-
     let chunk_secs = WEEK_SECS * BACKFILL_CHUNK_WEEKS;
-    let mut window_start = bucket_start(earliest, WEEK_SECS);
-    let now_epoch = now.timestamp();
+    let ceiling_epoch = ceiling.timestamp();
 
-    while window_start.timestamp() <= now_epoch {
+    while window_start.timestamp() <= ceiling_epoch {
         let window_end = window_start + Duration::seconds(chunk_secs);
 
         let source_rows: Vec<CoinCandle> = sqlx::query_as(
@@ -231,11 +281,66 @@ async fn backfill_target(
     Ok(())
 }
 
-/// Forward-only incremental recompute (REQ-CANDLE-020/021/022/023): reload source only from
-/// the max-materialized bucket forward, re-upsert every bucket `aggregate_candles` emits for
-/// the window, and delete any previously-materialized bucket the reconcile no longer emits.
-/// First run for a coin/interval with no materialized rows falls back to a full backfill
-/// (REQ-CANDLE-010).
+/// Full-history backfill (REQ-CANDLE-010/011/012/013): walk `[earliest .. now]` in
+/// week-aligned windows via [`materialize_window_walk`], loading only each window's source
+/// rows before folding, so the per-window row count stays bounded regardless of total history
+/// length.
+#[allow(clippy::too_many_arguments)]
+async fn backfill_target(
+    pool: &PgPool,
+    coin_id: &str,
+    vs_currency: &str,
+    target_interval: &str,
+    target_secs: i64,
+    source_interval: &str,
+    source_secs: i64,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let earliest: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MIN(ts) FROM coin_candles WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3",
+    )
+    .bind(coin_id)
+    .bind(vs_currency)
+    .bind(source_interval)
+    .fetch_one(pool)
+    .await?;
+
+    let Some(earliest) = earliest else {
+        return Ok(());
+    };
+
+    materialize_window_walk(
+        pool,
+        coin_id,
+        vs_currency,
+        target_interval,
+        target_secs,
+        source_interval,
+        source_secs,
+        now,
+        bucket_start(earliest, WEEK_SECS),
+        now,
+    )
+    .await
+}
+
+/// Incremental recompute (REQ-CANDLE-020/021/022/023): reload source only from the
+/// max-materialized bucket forward, re-upsert every bucket `aggregate_candles` emits for the
+/// window, and delete any previously-materialized bucket the reconcile no longer emits. First
+/// run for a coin/interval with no materialized rows falls back to a full backfill
+/// (REQ-CANDLE-010). After the forward pass it runs the F-08 backward repair when source
+/// history precedes the earliest materialized bucket (SPEC-CANDLE-002 REQ-CANDLE-054/055).
+///
+// @MX:ANCHOR: [AUTO] incremental_recompute_target source-filter invariant — the reconcile's
+//             `previously_materialized` read AND its per-`ts` DELETE are BOTH scoped to
+//             `source LIKE 'rollup:%'`, the same filter `recompute_start`'s `MAX(ts)` query
+//             carries. Native provider rows are never read as materialized (so never enter the
+//             reconcile's delete set) and never deleted. `reconcile_window` stays pure — the
+//             domain narrowing happens at these SQL boundaries.
+// @MX:REASON: data-loss prevention — without both filters a native `1d` row in the recompute
+//             window is treated as a stale rollup bucket and destroyed (the F-07 defect). This
+//             is a fan_in / invariant contract: every rollup reconcile passes through here.
+// @MX:SPEC: SPEC-CANDLE-002 REQ-CANDLE-050 REQ-CANDLE-051 REQ-CANDLE-053 REQ-CANDLE-054 REQ-CANDLE-055
 #[allow(clippy::too_many_arguments)]
 async fn incremental_recompute_target(
     pool: &PgPool,
@@ -271,10 +376,16 @@ async fn incremental_recompute_target(
         .await;
     };
 
+    // REQ-CANDLE-050: scope the previously-materialized read to rollup rows only — the same
+    // `source LIKE 'rollup:%'` filter the `MAX(ts)` query above carries. A native provider row
+    // in `[recompute_start, now]` must NOT be seen as materialized (else the reconcile would
+    // delete it as a non-emitted bucket). `reconcile_window` stays pure; this SQL narrows its
+    // input domain to rollup-owned rows.
     let previously_materialized: Vec<CoinCandle> = sqlx::query_as(
         "SELECT coin_id, vs_currency, interval, ts, open, high, low, close, volume, source \
          FROM coin_candles \
-         WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND ts >= $4",
+         WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND ts >= $4 \
+           AND source LIKE 'rollup:%'",
     )
     .bind(coin_id)
     .bind(vs_currency)
@@ -311,9 +422,13 @@ async fn incremental_recompute_target(
     }
 
     for ts in deletes {
+        // REQ-CANDLE-051: belt-and-suspenders — even though `previously_materialized` is now
+        // rollup-only (so `deletes` can only carry rollup `ts`), scope the DELETE to
+        // `source LIKE 'rollup:%'` so a native row sharing a `ts` can never be removed.
         sqlx::query(
             "DELETE FROM coin_candles \
-             WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND ts = $4",
+             WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND ts = $4 \
+               AND source LIKE 'rollup:%'",
         )
         .bind(coin_id)
         .bind(vs_currency)
@@ -321,6 +436,57 @@ async fn incremental_recompute_target(
         .bind(ts)
         .execute(pool)
         .await?;
+    }
+
+    // ── F-08 source low-watermark history repair (SPEC-CANDLE-002 REQ-CANDLE-054..057) ──
+    // The forward recompute above only walks `[recompute_start, now]`, so source rows that
+    // arrived BEHIND the earliest materialized bucket (a deep backfill completing after the
+    // rollup already ran) are never materialized. Query the source low-watermark and the
+    // earliest materialized `rollup:*` bucket (both cheap indexed `MIN(ts)` lookups — no new
+    // migration/column, Decision D2); when the source precedes materialization, walk the gap
+    // via the same memory-bounded week-aligned pass the backfill uses.
+    let source_min: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MIN(ts) FROM coin_candles \
+         WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3",
+    )
+    .bind(coin_id)
+    .bind(vs_currency)
+    .bind(source_interval)
+    .fetch_one(pool)
+    .await?;
+
+    let earliest_materialized: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT MIN(ts) FROM coin_candles \
+         WHERE coin_id = $1 AND vs_currency = $2 AND interval = $3 AND source LIKE 'rollup:%'",
+    )
+    .bind(coin_id)
+    .bind(vs_currency)
+    .bind(target_interval)
+    .fetch_one(pool)
+    .await?;
+
+    if let (Some(source_min), Some(earliest_materialized)) = (source_min, earliest_materialized) {
+        if let Some((repair_start, repair_end)) =
+            backward_repair_window(source_min, earliest_materialized)
+        {
+            // Accept the idempotent overshoot (plan §3 option a): reuse the bounded walk with
+            // `ceiling = earliest_materialized`. The final chunk may re-fold buckets at/after
+            // the exclusive end, but those are already `rollup:*` rows so re-materializing them
+            // is idempotent, and native-wins protects any native row regardless.
+            materialize_window_walk(
+                pool,
+                coin_id,
+                vs_currency,
+                target_interval,
+                target_secs,
+                source_interval,
+                source_secs,
+                now,
+                repair_start,
+                repair_end,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -646,5 +812,355 @@ mod tests {
         let (upserts, deletes) = reconcile_window(&previously_materialized, &emitted);
         assert_eq!(upserts.len(), 1);
         assert!(deletes.is_empty());
+    }
+
+    // ── F-07 characterization (SPEC-CANDLE-002, pure): reconcile over a rollup-only slice ──
+    // REQ-CANDLE-050/053. The source filter is applied at the SQL SELECT that feeds
+    // `reconcile_window`, so the pure core is unchanged and DB-free. Confirm it still deletes a
+    // dropped rollup bucket and keeps parity within the rollup-owned subset when its input
+    // slice contains only `rollup:*` rows (a native row would never reach it post-filter).
+    #[test]
+    fn reconcile_window_over_rollup_only_slice_deletes_dropped_rollup_bucket() {
+        let kept = CoinCandle {
+            source: "rollup:5m".into(),
+            ..make_5m(
+                ts_epoch(0),
+                dec!(1),
+                dec!(2),
+                dec!(1),
+                dec!(2),
+                Some(dec!(1)),
+            )
+        };
+        let dropped = CoinCandle {
+            source: "rollup:5m".into(),
+            ..make_5m(
+                ts_epoch(86_400),
+                dec!(1),
+                dec!(2),
+                dec!(1),
+                dec!(2),
+                Some(dec!(1)),
+            )
+        };
+        let previously_materialized = vec![kept.clone(), dropped];
+        // `dropped` closed incomplete → no longer emitted; `kept` still emitted.
+        let emitted = vec![kept];
+
+        let (upserts, deletes) = reconcile_window(&previously_materialized, &emitted);
+        assert_eq!(
+            upserts.len(),
+            1,
+            "emitted set unchanged by the rollup-only narrowing"
+        );
+        assert_eq!(
+            deletes,
+            vec![ts_epoch(86_400)],
+            "REQ-CANDLE-053: dropped rollup bucket still deleted — parity within the rollup subset"
+        );
+    }
+
+    // ── F-08 backward-repair pure decision core (SPEC-CANDLE-002, pure) ─────────────────────
+    // AC-CANDLE-055 pure portion. Returns Some (week-aligned start) when the source
+    // low-watermark precedes the earliest materialized bucket; None otherwise.
+    #[test]
+    fn backward_repair_window_some_when_source_precedes_earliest() {
+        let source_min = ts_epoch(10 * 86_400);
+        let earliest_materialized = ts_epoch(20 * 86_400);
+
+        let (start, end) = backward_repair_window(source_min, earliest_materialized)
+            .expect("source precedes earliest materialized → Some");
+
+        assert_eq!(
+            start,
+            bucket_start(source_min, WEEK_SECS),
+            "start must be week-aligned to source_min's bucket"
+        );
+        assert!(
+            start <= source_min,
+            "week-aligned start is never after source_min"
+        );
+        assert_eq!(
+            end, earliest_materialized,
+            "end is the earliest materialized bucket (exclusive walk ceiling)"
+        );
+        assert!(start < end);
+    }
+
+    #[test]
+    fn backward_repair_window_none_when_watermark_not_before_earliest() {
+        // earliest materialized already at the source low-watermark's week bucket (epoch 0
+        // Thursday): week-aligned(source_min) == 0 is NOT < 0 → None (self-terminating).
+        let earliest_materialized = ts_epoch(0);
+        let source_min_same_week = ts_epoch(3 * 86_400); // < WEEK_SECS → same bucket as epoch 0
+        assert!(
+            backward_repair_window(source_min_same_week, earliest_materialized).is_none(),
+            "no source before the earliest materialized bucket → None"
+        );
+
+        // Source strictly AHEAD of materialization (materialized history is older) → None.
+        let earliest2 = ts_epoch(5 * 86_400);
+        let source2 = ts_epoch(40 * 86_400);
+        assert!(backward_repair_window(source2, earliest2).is_none());
+    }
+
+    // ── DB-gated integration tests (SPEC-CANDLE-002) ───────────────────────────────────────
+    // These MUST run with `--test-threads=1`: like the rest of this repo's DB-gated suite they
+    // share the live `coin_candles` table (seeded with throwaway coin_ids + explicit cleanup),
+    // and concurrent runs would interleave rows. Run:
+    //   DATABASE_URL=postgres://... cargo test -p crypto-collector -- --ignored --test-threads=1
+    // (per CLAUDE.md § Integration Tests).
+
+    const DAY: i64 = 86_400;
+
+    async fn db_pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL required for DB-gated tests");
+        crate::db::connect(&url).await.expect("connect + migrate")
+    }
+
+    async fn cleanup_coin(pool: &PgPool, coin: &str) {
+        sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
+            .bind(coin)
+            .execute(pool)
+            .await
+            .expect("cleanup coin_candles");
+    }
+
+    /// Seed a complete day of uniform 5m source candles `[day_start, day_start+DAY)` at `price`
+    /// (288 rows) so the day's `1d` bucket is complete and emitted.
+    async fn seed_full_5m_day(
+        pool: &PgPool,
+        coin: &str,
+        day_start: i64,
+        price: rust_decimal::Decimal,
+    ) {
+        sqlx::query(
+            "INSERT INTO coin_candles \
+                (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source) \
+             SELECT $1, 'usd', '5m', to_timestamp(gs), $2, $2, $2, $2, 1, 'binance' \
+             FROM generate_series($3::bigint, $3::bigint + 86400 - 300, 300) AS gs \
+             ON CONFLICT (coin_id, vs_currency, interval, ts) DO NOTHING",
+        )
+        .bind(coin)
+        .bind(price)
+        .bind(day_start)
+        .execute(pool)
+        .await
+        .expect("seed full 5m day");
+    }
+
+    /// Insert (or reset) a single `1d` row at `ts` with the given `source` and uniform OHLC.
+    async fn insert_1d(
+        pool: &PgPool,
+        coin: &str,
+        ts: i64,
+        price: rust_decimal::Decimal,
+        source: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO coin_candles \
+                (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source) \
+             VALUES ($1, 'usd', '1d', to_timestamp($2), $3, $3, $3, $3, 42, $4) \
+             ON CONFLICT (coin_id, vs_currency, interval, ts) \
+             DO UPDATE SET source = EXCLUDED.source, close = EXCLUDED.close, \
+                           open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low",
+        )
+        .bind(coin)
+        .bind(ts)
+        .bind(price)
+        .bind(source)
+        .execute(pool)
+        .await
+        .expect("insert 1d");
+    }
+
+    async fn fetch_1d(
+        pool: &PgPool,
+        coin: &str,
+        ts: i64,
+    ) -> Option<(String, rust_decimal::Decimal)> {
+        sqlx::query_as::<_, (String, rust_decimal::Decimal)>(
+            "SELECT source, close FROM coin_candles \
+             WHERE coin_id = $1 AND vs_currency = 'usd' AND interval = '1d' AND ts = to_timestamp($2)",
+        )
+        .bind(coin)
+        .bind(ts)
+        .fetch_optional(pool)
+        .await
+        .expect("fetch 1d")
+    }
+
+    async fn count_1d(pool: &PgPool, coin: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM coin_candles \
+             WHERE coin_id = $1 AND vs_currency = 'usd' AND interval = '1d'",
+        )
+        .bind(coin)
+        .fetch_one(pool)
+        .await
+        .expect("count 1d")
+    }
+
+    async fn min_rollup_1d_ts(pool: &PgPool, coin: &str) -> DateTime<Utc> {
+        sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT MIN(ts) FROM coin_candles \
+             WHERE coin_id = $1 AND vs_currency = 'usd' AND interval = '1d' AND source LIKE 'rollup:%'",
+        )
+        .bind(coin)
+        .fetch_one(pool)
+        .await
+        .expect("min rollup 1d ts")
+    }
+
+    fn far_future() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_000_000_000, 0).unwrap()
+    }
+
+    // AC-CANDLE-050 (REQ-CANDLE-050/051/053): a recompute window holding BOTH a native `1d` row
+    // and rollup rows leaves the native row byte-identical while the rollup subset reconciles.
+    #[tokio::test]
+    #[ignore]
+    async fn db_mixed_source_preserves_native_and_reconciles_rollup() {
+        let pool = db_pool().await;
+        let coin = "test-candle002-mixed";
+        cleanup_coin(&pool, coin).await;
+
+        let day0 = 0i64; // epoch Thursday → week-aligned, so no spurious backward repair fires
+        let day1 = DAY;
+
+        seed_full_5m_day(&pool, coin, day0, dec!(100)).await;
+        seed_full_5m_day(&pool, coin, day1, dec!(200)).await;
+        // Pre-existing rollup 1d row at day0 forces the incremental/reconcile path (max_bucket
+        // Some) rather than the first-run backfill path. Its close (999) must be reconciled away.
+        insert_1d(&pool, coin, day0, dec!(999), "rollup:5m").await;
+        // Native provider 1d row at day1 — an emitted rollup bucket targets this exact ts.
+        insert_1d(&pool, coin, day1, dec!(12345), "bitstamp").await;
+
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("reconcile cycle");
+
+        let native = fetch_1d(&pool, coin, day1)
+            .await
+            .expect("native day1 row present");
+        assert_eq!(
+            native.0, "bitstamp",
+            "native source preserved (not relabeled to rollup)"
+        );
+        assert_eq!(
+            native.1,
+            dec!(12345),
+            "native close preserved (never overwritten)"
+        );
+
+        let rollup = fetch_1d(&pool, coin, day0)
+            .await
+            .expect("rollup day0 row present");
+        assert_eq!(rollup.0, "rollup:5m");
+        assert_eq!(
+            rollup.1,
+            dec!(100),
+            "rollup day0 reconciled to the folded close"
+        );
+
+        assert_eq!(
+            count_1d(&pool, coin).await,
+            2,
+            "exactly two 1d rows — native day1 neither deleted nor duplicated"
+        );
+
+        cleanup_coin(&pool, coin).await;
+    }
+
+    // AC-CANDLE-052 (REQ-CANDLE-052): an emitted rollup bucket colliding with a native row at the
+    // same PK is a no-op — native wins.
+    #[tokio::test]
+    #[ignore]
+    async fn db_collision_native_wins() {
+        let pool = db_pool().await;
+        let coin = "test-candle002-collision";
+        cleanup_coin(&pool, coin).await;
+
+        let day0 = 0i64;
+        seed_full_5m_day(&pool, coin, day0, dec!(100)).await; // emits a 1d bucket at day0
+        insert_1d(&pool, coin, day0, dec!(54321), "coingecko").await; // native at that exact ts
+
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("materialize");
+
+        let row = fetch_1d(&pool, coin, day0).await.expect("day0 row present");
+        assert_eq!(row.0, "coingecko", "native source preserved on collision");
+        assert_eq!(
+            row.1,
+            dec!(54321),
+            "native OHLCV not overwritten by the rollup value"
+        );
+        assert_eq!(
+            count_1d(&pool, coin).await,
+            1,
+            "no duplicate rollup row created"
+        );
+
+        cleanup_coin(&pool, coin).await;
+    }
+
+    // AC-CANDLE-055 (REQ-CANDLE-054/055/056/057): source arriving behind the earliest materialized
+    // bucket triggers a bounded backward pass that extends the series; a re-run is idempotent.
+    #[tokio::test]
+    #[ignore]
+    async fn db_history_repair_backward_pass_is_idempotent() {
+        let pool = db_pool().await;
+        let coin = "test-candle002-repair";
+        cleanup_coin(&pool, coin).await;
+
+        // Initial source: two adjacent complete days deep in history.
+        let late_a = 20 * DAY;
+        let late_b = 21 * DAY;
+        seed_full_5m_day(&pool, coin, late_a, dec!(300)).await;
+        seed_full_5m_day(&pool, coin, late_b, dec!(310)).await;
+
+        // First run: no rollup rows → backfill materializes late_a/late_b (no backward repair yet).
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("initial materialize");
+        assert!(
+            fetch_1d(&pool, coin, late_a).await.is_some(),
+            "late_a materialized"
+        );
+        let earliest_before = min_rollup_1d_ts(&pool, coin).await;
+
+        // Deep backfill completes AFTER the rollup: insert source BEHIND the earliest bucket.
+        let early_a = 4 * DAY;
+        let early_b = 5 * DAY;
+        seed_full_5m_day(&pool, coin, early_a, dec!(50)).await;
+        seed_full_5m_day(&pool, coin, early_b, dec!(60)).await;
+
+        // Second run: forward recompute (no change) + backward repair materializes early history.
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("history-repair run");
+        assert!(
+            fetch_1d(&pool, coin, early_a).await.is_some(),
+            "early_a materialized by the bounded backward pass"
+        );
+        let earliest_after = min_rollup_1d_ts(&pool, coin).await;
+        assert!(
+            earliest_after < earliest_before,
+            "earliest materialized bucket moved back to cover the backfilled history"
+        );
+
+        // Third run: idempotent / self-terminating — no further change to the row set.
+        let count_before_rerun = count_1d(&pool, coin).await;
+        incremental_recompute_target(&pool, coin, "usd", "1d", DAY, "5m", 300, far_future())
+            .await
+            .expect("idempotent re-run");
+        assert_eq!(
+            count_1d(&pool, coin).await,
+            count_before_rerun,
+            "re-running the rollup produced no further change (idempotent)"
+        );
+
+        cleanup_coin(&pool, coin).await;
     }
 }

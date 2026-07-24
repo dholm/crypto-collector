@@ -530,7 +530,9 @@ pub fn project_composite(
         .iter()
         .filter(|&(date, &close)| {
             if close <= Decimal::ZERO {
-                warn!("cycle_projection: dropping non-positive close {close} at {date} from the fit");
+                warn!(
+                    "cycle_projection: dropping non-positive close {close} at {date} from the fit"
+                );
                 false
             } else {
                 true
