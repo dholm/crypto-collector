@@ -906,3 +906,170 @@ async fn scenario_15_live_poller_contract_columns_and_index() {
         "tracked_markets must have partial index on last_polled_at WHERE status='active' (REQ-DB-005)"
     );
 }
+
+// ── SPEC-PROV-003 M3: F-20 interval-stamp cleanup migration 0021 (REQ-PROV-067) ──
+//
+// DB-gated + INFORMATIONAL (AC Scenario 2): these exercise the SHIPPED migration body
+// (migrations/0021_*.sql, executed via sqlx::raw_sql) against seeded data. The migration
+// already ran at connect()-time on the live DB; here we re-run its idempotent statements
+// on purpose-seeded rows to prove the no-op / rewrite / collision-safe behaviour.
+//
+// FK discipline: coin_candles.coin_id REFERENCES tracked_coins(coin_id) ON DELETE CASCADE,
+// so each test seeds the parent tracked_coins row FIRST (ON CONFLICT DO NOTHING) and tears
+// down children (coin_candles) before the parent (tracked_coins). Unique coin_id per test;
+// run with --test-threads=1 (the migration DELETE/UPDATE are global over interval).
+
+/// Read the shipped 0021 migration body and execute it against the DB.
+///
+/// Split into individual statements (on `;`) so each runs via the parameter-free
+/// `sqlx::query` path (`raw_sql` requires a `&'static str`). This exercises the ACTUAL
+/// shipped migration body — no duplicated SQL — so a drift between the file and the test
+/// is impossible.
+async fn run_0021_canonicalise(pool: &PgPool) {
+    // sqlx's query API requires a `&'static str` (injection-safety); leak the file-read
+    // body so the ACTUAL shipped migration runs verbatim (test-only, short-lived process).
+    let sql: &'static str = Box::leak(
+        std::fs::read_to_string("migrations/0021_coingecko_range_interval_canonicalise.sql")
+            .expect("read migrations/0021_coingecko_range_interval_canonicalise.sql")
+            .into_boxed_str(),
+    );
+    for statement in sql.split(';') {
+        if statement.trim().is_empty() {
+            continue;
+        }
+        sqlx::query(statement)
+            .execute(pool)
+            .await
+            .expect("0021 canonicalise migration must never raise (collision-safe)");
+    }
+}
+
+async fn seed_coin(pool: &PgPool, coin_id: &str) {
+    sqlx::query(
+        "INSERT INTO tracked_coins (coin_id, symbol, name, status)
+         VALUES ($1, 'TST', 'F20 Test', 'active')
+         ON CONFLICT (coin_id) DO NOTHING",
+    )
+    .bind(coin_id)
+    .execute(pool)
+    .await
+    .expect("seed parent tracked_coins (FK)");
+}
+
+async fn seed_candle(
+    pool: &PgPool,
+    coin_id: &str,
+    interval: &str,
+    ts: chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO coin_candles (coin_id, vs_currency, interval, ts, open, high, low, close, source)
+         VALUES ($1, 'usd', $2, $3, 1, 2, 0.5, 1.5, 'coingecko')
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(coin_id)
+    .bind(interval)
+    .bind(ts)
+    .execute(pool)
+    .await
+    .expect("seed coin_candle");
+}
+
+async fn intervals_for(pool: &PgPool, coin_id: &str) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT interval FROM coin_candles WHERE coin_id = $1 ORDER BY interval",
+    )
+    .bind(coin_id)
+    .fetch_all(pool)
+    .await
+    .expect("select intervals")
+}
+
+async fn teardown_coin(pool: &PgPool, coin_id: &str) {
+    // Child before parent (FK): delete coin_candles, then tracked_coins.
+    sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
+        .bind(coin_id)
+        .execute(pool)
+        .await
+        .expect("teardown coin_candles");
+    sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+        .bind(coin_id)
+        .execute(pool)
+        .await
+        .expect("teardown tracked_coins");
+}
+
+/// Zero daily/hourly rows: the migration is a no-op — a canonical '1d' row is untouched.
+#[tokio::test]
+#[ignore]
+async fn scenario_02_migration_0021_is_noop_on_canonical_rows() {
+    let pool = setup().await;
+    let coin_id = "test-f20-noop";
+    let ts = chrono::Utc::now();
+    teardown_coin(&pool, coin_id).await; // pristine start
+    seed_coin(&pool, coin_id).await;
+    seed_candle(&pool, coin_id, "1d", ts).await;
+
+    run_0021_canonicalise(&pool).await;
+
+    assert_eq!(
+        intervals_for(&pool, coin_id).await,
+        vec!["1d".to_string()],
+        "migration must not touch already-canonical rows (no-op on zero daily/hourly)"
+    );
+    teardown_coin(&pool, coin_id).await;
+}
+
+/// A seeded 'daily' row (no canonical twin) is rewritten to '1d'; a second run is idempotent.
+#[tokio::test]
+#[ignore]
+async fn scenario_02_migration_0021_rewrites_daily_to_1d_idempotently() {
+    let pool = setup().await;
+    let coin_id = "test-f20-rewrite";
+    let ts = chrono::Utc::now();
+    teardown_coin(&pool, coin_id).await;
+    seed_coin(&pool, coin_id).await;
+    seed_candle(&pool, coin_id, "daily", ts).await;
+    seed_candle(&pool, coin_id, "hourly", ts + chrono::Duration::hours(1)).await;
+
+    run_0021_canonicalise(&pool).await;
+    let mut got = intervals_for(&pool, coin_id).await;
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["1d".to_string(), "1h".to_string()],
+        "'daily'->'1d' and 'hourly'->'1h' with no shadowing twin"
+    );
+
+    // Idempotent: a second run finds no daily/hourly rows and changes nothing.
+    run_0021_canonicalise(&pool).await;
+    let mut again = intervals_for(&pool, coin_id).await;
+    again.sort();
+    assert_eq!(again, vec!["1d".to_string(), "1h".to_string()]);
+    teardown_coin(&pool, coin_id).await;
+}
+
+/// Collision: a 'daily' row AND its canonical '1d' twin share (coin_id, vs_currency, ts).
+/// The migration drops the 'daily' duplicate and completes WITHOUT a unique-violation.
+#[tokio::test]
+#[ignore]
+async fn scenario_02_migration_0021_drops_shadowed_duplicate_without_pk_violation() {
+    let pool = setup().await;
+    let coin_id = "test-f20-collision";
+    let ts = chrono::Utc::now();
+    teardown_coin(&pool, coin_id).await;
+    seed_coin(&pool, coin_id).await;
+    // Both rows at the SAME (coin_id, vs_currency, ts) — distinct only by interval.
+    seed_candle(&pool, coin_id, "1d", ts).await; // canonical twin (correct data)
+    seed_candle(&pool, coin_id, "daily", ts).await; // shadowed non-canonical duplicate
+
+    // Must not raise a PK unique-violation (run_0021_canonicalise .expect()s success).
+    run_0021_canonicalise(&pool).await;
+
+    assert_eq!(
+        intervals_for(&pool, coin_id).await,
+        vec!["1d".to_string()],
+        "the shadowed 'daily' duplicate is dropped; the canonical '1d' twin survives"
+    );
+    teardown_coin(&pool, coin_id).await;
+}

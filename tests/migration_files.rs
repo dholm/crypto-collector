@@ -441,3 +441,57 @@ fn all_migrations_use_if_not_exists() {
         }
     }
 }
+
+// ── SPEC-PROV-003 M3: interval-stamp cleanup migration 0021 (F-20, REQ-PROV-067) ──
+
+/// Scenario 2 (AC-PROV-067): the F-20 cleanup migration exists and ships the idempotent,
+/// **collision-safe** DELETE-shadowed-duplicate-then-UPDATE form — NOT the bare single
+/// UPDATE. Because `interval` is part of the coin_candles PRIMARY KEY, a plain UPDATE
+/// could raise a unique-violation (→ failed startup migration → service-down); this test
+/// is the regression guard that the shipped body drops the shadowed non-canonical
+/// duplicate before rewriting.
+#[test]
+fn coingecko_range_interval_migration_is_collision_safe() {
+    let path = "migrations/0021_coingecko_range_interval_canonicalise.sql";
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|_| panic!("Missing required migration file: {path}"));
+    let lc = raw.to_lowercase();
+
+    // Collision-safe form: it DELETEs the shadowed duplicate guarded by an EXISTS check on
+    // the canonical twin, THEN UPDATEs the remainder.
+    assert!(
+        lc.contains("delete from coin_candles"),
+        "0021 must DELETE shadowed non-canonical duplicates (collision-safe form)"
+    );
+    assert!(
+        lc.contains("exists"),
+        "0021 must guard the DELETE with an EXISTS check on the canonical twin"
+    );
+    assert!(
+        lc.contains("update coin_candles"),
+        "0021 must UPDATE the remaining non-canonical rows to their canonical form"
+    );
+
+    // Canonicalisation mapping: 'daily' -> '1d' and 'hourly' -> '1h'.
+    assert!(
+        lc.contains("'daily'") && lc.contains("'1d'"),
+        "0021 maps daily -> 1d"
+    );
+    assert!(
+        lc.contains("'hourly'") && lc.contains("'1h'"),
+        "0021 maps hourly -> 1h"
+    );
+
+    // The DELETE must precede the UPDATE (shadowed-duplicate removed before the rewrite),
+    // otherwise the UPDATE could still collide on the PK.
+    let delete_at = lc
+        .find("delete from coin_candles")
+        .expect("DELETE present (asserted above)");
+    let update_at = lc
+        .find("update coin_candles")
+        .expect("UPDATE present (asserted above)");
+    assert!(
+        delete_at < update_at,
+        "0021 must DELETE the shadowed duplicate BEFORE the UPDATE (collision order)"
+    );
+}
