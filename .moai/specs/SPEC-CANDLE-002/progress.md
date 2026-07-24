@@ -1,6 +1,6 @@
 # SPEC-CANDLE-002 — Progress
 
-Lifecycle: plan → run → sync. Status: **draft** (plan-phase artifacts authored).
+Lifecycle: plan → run → sync. Status: **in-progress** (run-phase, TDD RED→GREEN→REFACTOR).
 
 ## §E.1 Plan-phase Audit-Ready Signal
 

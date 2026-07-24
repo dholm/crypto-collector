@@ -778,4 +778,56 @@ mod tests {
             with_anchors.spine_b
         );
     }
+
+    // ── F-09 non-positive projection guard (SPEC-CANDLE-002, pure) ──────────────────
+    // AC-CANDLE-058. The two sub-cases exercise the two guard points in their required
+    // order: `current_price` is derived from the UNFILTERED series, so the
+    // REQ-CANDLE-059 `current_price <= 0` guard MUST run BEFORE the interior
+    // `close <= 0` filter (plan.md §4). Both fail (panic on log10 of a non-positive
+    // argument) against pre-fix code, proving they test the defect.
+
+    // Sub-case 4a (REQ-CANDLE-058/060): a positive last (today) close with an interior
+    // zero and an interior negative close → fit over the positive subset, no panic, and
+    // the current_price guard is NOT triggered (today anchors continuity).
+    #[test]
+    fn projection_filters_interior_nonpositive_closes_without_panic() {
+        let start = d(2019, 1, 1);
+        let days = CYCLE_DAYS + 400;
+        let mut daily = synthetic(start, days, |i| dec!(5000) + Decimal::from(i) * dec!(12));
+        // Interior non-positive closes (well inside the series; first/last untouched).
+        daily[100].1 = Decimal::ZERO; // interior close == 0
+        daily[150].1 = dec!(-42); // interior close < 0
+
+        let projected = project_composite(&daily, &[], false);
+
+        // log10 was never reached with a non-positive argument (no panic), and a fit is
+        // still produced over the positive subset.
+        assert!(
+            !projected.is_empty(),
+            "a fit over the positive subset must still be produced (interior rows dropped)"
+        );
+    }
+
+    // Sub-case 4b (REQ-CANDLE-059): the derived `current_price` (last/today close) is 0
+    // WITH positive history preceding it → graceful empty, never a panic. This is the
+    // direct regression against the ordering defect: if the interior filter ran first it
+    // would drop today's zero row, shift `today` to the last positive day, make
+    // current_price positive, and defeat the guard — so a non-empty result here means the
+    // guard became dead code.
+    #[test]
+    fn projection_current_price_guard_fires_before_interior_filter() {
+        let start = d(2019, 1, 1);
+        let days = CYCLE_DAYS + 400;
+        let mut daily = synthetic(start, days, |i| dec!(5000) + Decimal::from(i) * dec!(12));
+        let last = daily.len() - 1;
+        daily[last].1 = Decimal::ZERO; // today's close == 0, positive history precedes it
+
+        let projected = project_composite(&daily, &[], false);
+
+        assert!(
+            projected.is_empty(),
+            "current_price <= 0 must yield a graceful empty projection, and the guard must \
+             be reachable despite the positive history preceding the bad last row"
+        );
+    }
 }

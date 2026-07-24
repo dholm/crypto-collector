@@ -2,7 +2,7 @@
 id: SPEC-CANDLE-002
 title: "Materializer & Projection Data Integrity"
 version: "0.1.0"
-status: draft
+status: in-progress
 created: 2026-07-24
 updated: 2026-07-24
 author: manager-spec
