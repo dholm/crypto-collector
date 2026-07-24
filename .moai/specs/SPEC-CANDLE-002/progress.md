@@ -174,7 +174,7 @@ debt_closure_evidence: "F1 target-interval-aware trigger + F2 native-survival DB
 remediation_commit: b287979
 remediation_evidence_commit: 63d7dae
 run_commit_sha: b287979
-sync_commit_sha: pending-backfill-this-commit   # self-referential — backfilled in a follow-up commit per spec-frontmatter-schema.md § SHA placeholder backfill exemption (D3)
+sync_commit_sha: e71d9baae255af614405636640c589d6c08bd89c
 frontmatter_status_transitions:
   in-progress_to_implemented_to_completed: sync-commit (this commit)
 mx_validation: pass — all plan.md § MX Tag Targets present and well-formed, no additions needed
