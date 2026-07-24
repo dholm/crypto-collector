@@ -8,6 +8,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **SPEC-PROV-002** — Provider transport hardening & pacer compliance
+  (`src/providers/{transport(new),coingecko,binance,bitstamp,mod}.rs`, `src/pacer/mod.rs`,
+  `src/config.rs`, `src/main.rs`):
+  - **F-10** (High): `search_coins`/`fetch_coin_tickers` bypassed the pacer entirely and
+    swallowed HTTP 429 without ever signalling cooldown, so a burst against these
+    user-facing endpoints could trip the very 429s the pacer exists to prevent while the
+    fleet never backed off. Fixed: both routes now go through the same throttle +
+    `acquire_slot` prelude as every other provider method, and a 429 calls
+    `signal_cooldown` before the result degrades to empty (`Ok(vec![])`, degradation now
+    covers all upstream error kinds).
+  - **F-11** (High): no provider `reqwest::Client` (CoinGecko, Binance, Bitstamp) had a
+    total-request or connect timeout, so a black-holed upstream could hang a worker
+    indefinitely after the pacer already charged a credit. Fixed with a single shared
+    `transport::build_client()` constructor applying `.timeout()` (default 30 s) and
+    `.connect_timeout()` (default 10 s), env-tunable via `PROVIDER_HTTP_TIMEOUT_SECS` /
+    `PROVIDER_HTTP_CONNECT_TIMEOUT_SECS` (zero/unparseable guarded back to the default —
+    a client can never be built unbounded).
+  - **F-12** (Medium): `ProviderError::is_transient` classified every `Http{..}` status —
+    including permanent 4xx like 401/404 — as transient, so SPEC-SCHED-001 worker retry
+    logic spun on permanent failures. Fixed: transient only for `408 | 425 | 429 |
+    500..=599`; `RateLimited`/`Network` unchanged.
+  - **F-13** (Medium): `acquire_slot` silently clamped its reserved wait to 60 s, so under
+    backlog a request could fire before its own reservation — converting overload into
+    exactly the burst the pacer prevents. Fixed: the full computed wait is honoured (no
+    truncation); backlog beyond the former 60 s ceiling is now surfaced via `warn!` +
+    a new `pacer_backlog_wait_exceeded_total{provider}` counter (observability only, no
+    behavior change).
+  - **F-14** (Medium, the proven drift source): the request/429/parse scaffolding was
+    duplicated across ~10 endpoint methods in `coingecko.rs`/`binance.rs` — the exact drift
+    that produced F-10. Extracted into two shared helpers in a new `src/providers/transport.rs`:
+    `paced()` (throttle + `acquire_slot` prelude + 429→`signal_cooldown` postlude) and
+    `get_json()` (429→`RateLimited`, non-success→`Http{status,body}`, decode→`Parse`). All
+    CoinGecko/Binance/Bitstamp endpoints migrated onto these mechanically; behavior
+    preserved under existing wiremock coverage.
+  - **F-15** (Medium): nothing verified at startup that every provider chain member had an
+    `upstream_request_pacer` row — a missing row surfaced only as a runtime error on the
+    first fetch. Fixed: a `missing_pacer_rows()` check runs after migrations succeed and
+    before readiness flips, failing startup with a message naming the missing member(s)
+    (DB-down-at-startup resilience preserved — the check is unreachable until migrations
+    report success).
+  - **F-17** (Low): `signal_cooldown` set `cooldown_until` unconditionally, so a later,
+    shorter signal could truncate an earlier, longer one. Fixed with
+    `GREATEST(COALESCE(cooldown_until, 'epoch'), $2)` — monotonic, never shortens.
+  - **F-18** (Low): the blocked-path fallback in `acquire_slot` mislabeled a lapsed-block
+    race (row present, block already lapsed) as `NotFound`. Fixed with a new
+    `AcquireSlotError::Contended` variant, extracted into a pure `classify_blocked` core;
+    `NotFound` is now reserved for a genuinely-absent row.
+  - **F-19** (Informational): no provider client sent a `User-Agent`. Fixed — the shared
+    `build_client()` attaches `crypto-collector/<CARGO_PKG_VERSION>` to all three clients.
+
+  15 requirements (REQ-PROV-050..064) across 6 scenarios (AC-PROV-050/053/055/058/060/063)
+  plus the quality gate (AC-PROV-QG). Sandbox-verifiable ACs (pure `sleep_plan` /
+  `is_transient` / `classify_blocked` cores, timeout wiremock test, migration onto the
+  shared helpers, no new dependency, `fmt`/`clippy -D warnings`) are PASS with evidence.
+  4 net-new DB-gated tests (`#[ignore]`, `--test-threads=1`) covering the slot/cooldown
+  advance (F-10), monotonic cooldown (F-17), `Contended`/`NotFound` DB half (F-18), and
+  startup pacer-row validation (F-15) were **not executed** in this environment (no live
+  Postgres available) — deferred to a live-Postgres verification pass. No new migration,
+  no new dependency, no `f64` in any monetary path, `Provider` trait public surface
+  unchanged.
+
 - **SPEC-CANDLE-002** — Materializer & projection data integrity hardening
   (`src/collectors/rollup.rs`, `src/collectors/cycle_projection.rs`):
   - **F-07** (High): the rollup reconcile path (`incremental_recompute_target`) could delete or

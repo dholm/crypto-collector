@@ -118,6 +118,13 @@ where
 /// endpoint (e.g. `"markets parse error: ..."`). Endpoints that special-case a status
 /// (e.g. Bitstamp's `404 → Ok(vec![])`) MUST handle it at the call site BEFORE delegating
 /// the generic tail here (REQ-PROV-051).
+///
+// @MX:ANCHOR: [AUTO] get_json — the shared response epilogue (429/status/parse mapping)
+// @MX:REASON: Drift prevention — every CoinGecko/Binance/Bitstamp endpoint (fan_in >= 3)
+//             maps its HTTP response through this single epilogue, so the 429/non-success/
+//             decode-failure classification cannot silently diverge per endpoint again
+//             (the copy-pasted-epilogue half of F-14, alongside `paced`'s prelude half).
+// @MX:SPEC: SPEC-PROV-002 REQ-PROV-051 REQ-PROV-052
 pub async fn get_json<T: DeserializeOwned>(
     resp: reqwest::Response,
     ctx: &str,

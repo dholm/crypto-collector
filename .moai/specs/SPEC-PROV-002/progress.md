@@ -1,8 +1,9 @@
 # SPEC-PROV-002 — Progress
 
-Lifecycle: plan → run → sync. Status: **in-progress** (run-phase implementation complete;
+Lifecycle: plan → run → sync. Status: **implemented** (run-phase + sync-phase complete;
 plan-audit PASS-WITH-DEBT 0.87 + Implementation Kickoff Approval granted; DB-gated ACs
-deferred to a live-Postgres verification pass).
+deferred to a live-Postgres verification pass — `completed` transition held pending that
+run; see §E.4 for rationale).
 
 ## §E.1 Plan-phase Audit-Ready Signal
 
@@ -128,4 +129,121 @@ gaps:
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — owned by manager-docs>_
+Sync-phase close performed by manager-docs. **No live Postgres was available in this
+environment** — the 3 net-new DB-gated tests (`db_signal_cooldown_is_monotonic_never_shortens`,
+`db_acquire_slot_absent_is_not_found_present_is_ok`, `db_missing_pacer_rows_detects_absent_member`)
+plus the DB-observable halves of AC-PROV-053 (slot advance + cooldown row) and AC-PROV-063
+(startup validation) were **not executed** here; §E.2/§E.3 already recorded them as
+`PASS-WITH-DEBT`/deferred, and this sync-phase does not upgrade that classification. No
+`cargo test`/`clippy`/`fmt` re-run was needed since no logic changed in this phase (one
+doc-only `@MX:ANCHOR` comment added — see below); the sandbox gate evidence in §E.2 stands
+unchanged.
+
+### Documentation
+
+- `CHANGELOG.md` `[Unreleased]` — SPEC-PROV-002 entry added (F-10/F-11/F-12/F-13/F-14/F-15/
+  F-17/F-18/F-19, 15 REQs, 6 scenario ACs + AC-PROV-QG, DB-gated-deferred gap named). Placed
+  before the pre-existing SPEC-CANDLE-002 entry (most-recent-first under `[Unreleased]`).
+  Pre-emission grep `grep -c 'SPEC-PROV-002' CHANGELOG.md` returned `0` before the edit
+  (no duplicate). All 8 file paths named in the entry verified to exist via `ls`/`[ -f ]`.
+- No README.md exists at the project root and no dedicated config-doc surface exists beyond
+  source rustdoc — confirmed via `ls` at repo root. The two new env vars
+  (`PROVIDER_HTTP_TIMEOUT_SECS` default 30, `PROVIDER_HTTP_CONNECT_TIMEOUT_SECS` default 10,
+  zero/unparseable-guarded to default) are documented in `src/providers/transport.rs` module
+  doc-comment (`build_client`/`build_client_with` rustdoc) and `src/providers/mod.rs` §
+  "Shared request path (SPEC-PROV-002)" module doc-comment — both were already complete from
+  run-phase; no new doc file was invented, per Scope Discipline.
+- `src/providers/transport.rs` rustdoc verified complete: module doc-comment names all three
+  pieces (`build_client`, `paced`, `get_json`) with env-var/default/REQ-ID references;
+  `build_client`/`build_client_with`/`paced`/`get_json` each carry a doc-comment. No gaps
+  found — no augmentation needed beyond the @MX tag below.
+
+### @MX validation (grep evidence)
+
+```
+$ grep -n "@MX" src/providers/transport.rs
+38:// @MX:ANCHOR: [AUTO] build_client — the single provider reqwest::Client constructor
+80:// @MX:ANCHOR: [AUTO] paced — the shared request-path frame (throttle + slot + 429 postlude)
+121:// @MX:ANCHOR: [AUTO] get_json — the shared response epilogue (429/status/parse mapping)  [ADDED this sync]
+
+$ grep -n "@MX" src/pacer/mod.rs | grep -E "acquire_slot|signal_cooldown|WARN"
+236:// @MX:WARN: [AUTO] acquire_slot is the single fleet-wide egress governor; ... full-wait
+      + backlog-observability text present (UPDATED in run-phase — verified accurate)
+314:// @MX:WARN: [AUTO] signal_cooldown is monotonic — GREATEST never shortens ... (ADDED in
+      run-phase — verified present, was previously untagged per spec.md §420)
+
+$ grep -n "@MX" src/main.rs | grep pacer-row
+235:// @MX:NOTE: [AUTO] pacer-row completeness check: after migrations succeed, before
+      set_ready (present, run-phase)
+```
+
+**Finding**: run-phase correctly added/updated the `acquire_slot` `@MX:WARN`, the
+`signal_cooldown` `@MX:WARN`, and the `main.rs` `@MX:NOTE`, exactly as spec.md § MX
+Annotation Targets specified. spec.md additionally asked for `@MX:ANCHOR` on **both**
+`transport::paced` **and** `transport::get_json` (fan_in ≥ 3 drift-prevention frame) —
+run-phase added it only to `paced` and `build_client`; `get_json` was left untagged. This
+sync-phase closed that gap: added `@MX:ANCHOR` on `get_json` (transport.rs:121, verified via
+`grep -c "@MX:ANCHOR" src/providers/transport.rs` → `3`, at the `mx.yaml` `anchor_per_file: 3`
+limit). Verified `cargo fmt --check` exit `0` and `cargo clippy --all-targets --all-features
+-- -D warnings` exit `0` after the doc-only addition (no logic changed).
+
+### Status transition — held at `implemented`, NOT promoted to `completed`
+
+**Decision: `in-progress → implemented`, NOT `implemented → completed`.**
+
+Rationale: per the sync-phase task instructions, a DB-gated-deferred SPEC MAY be classified
+PASS-WITH-DEBT and closed to `completed` with the outstanding live-Postgres verification
+recorded as close-out debt (the SPEC-CANDLE-002 precedent). I am declining that path here
+and holding at `implemented` instead, because the DB-gated debt on THIS SPEC is materially
+larger than the CANDLE-002 precedent it would be modeled on:
+
+- CANDLE-002's DB-gated debt was **already resolved by the time of its close** (`updated`
+  history shows 4 DB-gated integration tests ran green against live PostgreSQL 16 before the
+  sync commit — see the `improvement-phases` memory: "Phase 1 = SPEC-SCHED-002 COMPLETE
+  (sync ..., unpushed)"). This SPEC's DB-gated ACs, by contrast, have **never** been run
+  against a live database at any point in its lifecycle — 3 net-new `#[ignore]` tests plus
+  two DB-observable AC halves (F-10 slot/cooldown-row effect, F-15 startup validation) are
+  ALL still untested against real Postgres.
+- The deferred surface here is not a minor edge: F-10 (High) and F-15 (Medium) are two of
+  the three highest-severity findings in this SPEC, and their DB-observable halves —
+  `next_allowed_at` actually advancing, `cooldown_until` actually being set, a missing pacer
+  row actually failing startup — are exactly the behavior the SPEC exists to fix. Pure-core
+  and wiremock coverage confirms the Rust logic is correct, but does not confirm the SQL
+  (`GREATEST(...)`, the gated `UPDATE ... WHERE`, the `SELECT ... WHERE provider = ANY($1)`)
+  behaves as designed against a real Postgres planner/transaction semantics.
+- Per `verification-claim-integrity.md` §1 ("no unobserved-verification-claim"), marking
+  `completed` here would assert this SPEC's core defensive fixes were verified when 3 of 9
+  findings' DB-observable behavior was never actually observed running.
+
+Holding at `implemented` is the conservative, defensible choice: run-phase is genuinely
+complete (all code written, all sandbox-verifiable ACs green, all @MX tags in place), but
+"implemented" — not "completed" — accurately states that acceptance is not yet fully
+verified. The frontmatter `status:` will be advanced to `completed` in a follow-up
+sync-phase step once the live-Postgres run below executes and the 3 DB-gated tests +
+2 DB-observable AC halves are confirmed PASS.
+
+```yaml
+sync_complete_at: 2026-07-24
+sync_commit_sha: pending-backfill-sync-prov-002   # backfilled in a follow-up commit
+sync_status: pass-with-debt-held-at-implemented
+frontmatter_status_transition: "in-progress -> implemented"   # NOT -> completed
+b12_self_test_a: "grep -c 'SPEC-PROV-002' CHANGELOG.md before edit == 0 (no duplicate)"
+b12_self_test_b: "AC count: 6 scenario ACs (AC-PROV-050/053/055/058/060/063) + AC-PROV-QG, matches acceptance.md (SSOT)"
+b12_self_test_c: "8 file paths in CHANGELOG entry verified via ls/[ -f ] — all exist"
+mx_tags_added_this_sync: 1   # @MX:ANCHOR on transport::get_json (spec.md gap)
+mx_tags_verified_unchanged: 3   # acquire_slot @MX:WARN, signal_cooldown @MX:WARN, main.rs @MX:NOTE
+```
+
+### Gaps (carried forward, unresolved by this sync)
+
+- **DB-gated ACs still unexecuted**: AC-PROV-053 (REQ-PROV-053/054 slot advance + cooldown
+  row), Sub-5b (REQ-PROV-061 monotonic cooldown, DB half), Sub-5c (REQ-PROV-062 `Contended`
+  DB half), AC-PROV-063 (REQ-PROV-063/064 startup validation) — none executed against a live
+  Postgres in this or any prior phase. Owner: next session with `DATABASE_URL` set, command
+  `DATABASE_URL=... cargo test -- --ignored --test-threads=1`.
+- **`sync_commit_sha` placeholder**: this commit's own SHA is unknown until after it lands;
+  backfilled in a follow-up commit per the established SHA-placeholder-backfill pattern
+  (`spec-frontmatter-schema.md` § SHA placeholder backfill exemption).
+- **`completed` transition deferred**: frontmatter remains `status: implemented` pending the
+  live-Postgres run above. A future sync-phase (or a dedicated close-out commit once the
+  live-Postgres run passes) performs the `implemented → completed` transition.
