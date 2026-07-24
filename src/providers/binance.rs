@@ -18,7 +18,8 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::pacer::{self, LocalThrottle};
+use super::transport;
+use crate::pacer::LocalThrottle;
 
 const BINANCE_BASE_URL: &str = "https://api.binance.com";
 
@@ -30,10 +31,7 @@ pub struct BinanceClient {
 
 impl BinanceClient {
     pub fn new(base_url: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .gzip(true)
-            .build()
-            .expect("reqwest client");
+        let client = transport::build_client();
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| BINANCE_BASE_URL.to_string()),
@@ -61,18 +59,7 @@ impl BinanceClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        resp.json::<Vec<Value>>()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("klines parse error: {e}")))
+        transport::get_json::<Vec<Value>>(resp, "klines").await
     }
 
     /// `GET /api/v3/klines?symbol={symbol}&interval={interval}&startTime={ms}&endTime={ms}&limit={limit}`
@@ -104,18 +91,7 @@ impl BinanceClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        resp.json::<Vec<Value>>()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("klines range parse error: {e}")))
+        transport::get_json::<Vec<Value>>(resp, "klines range").await
     }
 }
 
@@ -280,20 +256,10 @@ impl Provider for BinanceProvider {
         // Fetch the single latest 1m kline and use close price as spot
         let symbol = Self::ticker_symbol(market);
 
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "binance")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let klines = match self.client.fetch_klines(&symbol, "1m", 1).await {
-            Ok(k) => k,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("binance");
-                let _ = pacer::signal_cooldown(&self.pool, "binance", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
+            self.client.fetch_klines(&symbol, "1m", 1)
+        })
+        .await?;
 
         let kline = klines
             .into_iter()
@@ -326,20 +292,10 @@ impl Provider for BinanceProvider {
         let snapped_secs = interval_secs.max(1);
         let limit = ((days as i64 * 86_400) / snapped_secs).clamp(1, 1000) as u32;
 
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "binance")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let klines = match self.client.fetch_klines(&symbol, interval, limit).await {
-            Ok(k) => k,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("binance");
-                let _ = pacer::signal_cooldown(&self.pool, "binance", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
+            self.client.fetch_klines(&symbol, interval, limit)
+        })
+        .await?;
 
         klines
             .iter()
@@ -363,30 +319,16 @@ impl Provider for BinanceProvider {
         let symbol = Self::ticker_symbol(market);
         let interval = secs_to_kline_interval(interval_secs);
 
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "binance")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let klines = match self
-            .client
-            .fetch_klines_range(
+        let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
+            self.client.fetch_klines_range(
                 &symbol,
                 interval,
                 start.timestamp_millis(),
                 end.timestamp_millis(),
                 1000,
             )
-            .await
-        {
-            Ok(k) => k,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("binance");
-                let _ = pacer::signal_cooldown(&self.pool, "binance", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        })
+        .await?;
 
         klines
             .iter()

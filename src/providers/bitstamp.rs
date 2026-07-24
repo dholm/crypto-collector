@@ -26,7 +26,8 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::pacer::{self, LocalThrottle};
+use super::transport;
+use crate::pacer::LocalThrottle;
 
 const BITSTAMP_BASE_URL: &str = "https://www.bitstamp.net";
 
@@ -66,10 +67,7 @@ pub struct BitstampClient {
 
 impl BitstampClient {
     pub fn new(base_url: Option<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .gzip(true)
-            .build()
-            .expect("reqwest client");
+        let client = transport::build_client();
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| BITSTAMP_BASE_URL.to_string()),
@@ -105,24 +103,15 @@ impl BitstampClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
         // An unknown pair returns 404 — a permanent "no data" for this market, not a
-        // transient failure; surface it as an empty page so the chain falls through.
-        if status == 404 {
+        // transient failure; surface it as an empty page so the chain falls through. This
+        // status special-case is handled at the call site BEFORE delegating the generic
+        // 429/non-success/parse epilogue to the shared `get_json` (REQ-PROV-051).
+        if resp.status().as_u16() == 404 {
             return Ok(vec![]);
         }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
 
-        let envelope = resp
-            .json::<OhlcEnvelope>()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("bitstamp ohlc parse error: {e}")))?;
+        let envelope: OhlcEnvelope = transport::get_json(resp, "bitstamp ohlc").await?;
         Ok(envelope.data.ohlc)
     }
 }
@@ -241,19 +230,6 @@ impl BitstampProvider {
             market.vs_currency.to_lowercase()
         )
     }
-
-    async fn acquire(&self) -> Result<(), ProviderError> {
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "bitstamp")
-            .await
-            .map_err(ProviderError::Pacer)
-    }
-
-    /// Map a rate-limit error into a fleet-wide cooldown signal, mirroring Binance.
-    async fn signal_rate_limit(&self) {
-        let cooldown_ms = crate::config::pacer_cooldown_ms("bitstamp");
-        let _ = pacer::signal_cooldown(&self.pool, "bitstamp", cooldown_ms).await;
-    }
 }
 
 #[async_trait]
@@ -280,15 +256,10 @@ impl Provider for BitstampProvider {
         let (step, interval) = snap_to_bitstamp_step(interval_secs);
         let limit = (((days as i64) * 86_400 / step).max(1)).min(BITSTAMP_PAGE_LIMIT as i64) as u32;
 
-        self.acquire().await?;
-        let rows = match self.client.fetch_ohlc(&pair, step, limit, None, None).await {
-            Ok(r) => r,
-            Err(ProviderError::RateLimited) => {
-                self.signal_rate_limit().await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        let rows = transport::paced(&self.pool, &self.local_throttle, "bitstamp", || {
+            self.client.fetch_ohlc(&pair, step, limit, None, None)
+        })
+        .await?;
 
         rows.iter()
             .map(|r| normalise_row(r, market.market_id, interval, &market.vs_currency))
@@ -320,25 +291,16 @@ impl Provider for BitstampProvider {
             BITSTAMP_PAGE_LIMIT,
         );
 
-        self.acquire().await?;
-        let rows = match self
-            .client
-            .fetch_ohlc(
+        let rows = transport::paced(&self.pool, &self.local_throttle, "bitstamp", || {
+            self.client.fetch_ohlc(
                 &pair,
                 step,
                 BITSTAMP_PAGE_LIMIT,
                 Some(start.timestamp()),
                 Some(page_end),
             )
-            .await
-        {
-            Ok(r) => r,
-            Err(ProviderError::RateLimited) => {
-                self.signal_rate_limit().await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        })
+        .await?;
 
         rows.iter()
             .map(|r| normalise_row(r, market.market_id, interval, &market.vs_currency))

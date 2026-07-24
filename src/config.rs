@@ -200,6 +200,50 @@ pub fn pacer_cooldown_ms(provider: &str) -> u64 {
         .unwrap_or(500)
 }
 
+// ── SPEC-PROV-002 provider HTTP client timeouts (REQ-PROV-055/056/057) ────────
+
+/// Total-request timeout (seconds) applied to every provider `reqwest::Client`.
+///
+/// Env var: `PROVIDER_HTTP_TIMEOUT_SECS`. Default: 30 s.
+///
+/// A **strictly-positive** value is guaranteed (REQ-PROV-056): an unset, unparseable,
+/// **or explicit `0`** value falls back to the default rather than building a
+/// `Duration::from_secs(0)` (unbounded) client. See `resolve_timeout_secs`.
+pub fn provider_http_timeout_secs() -> u64 {
+    resolve_timeout_secs("PROVIDER_HTTP_TIMEOUT_SECS", 30)
+}
+
+/// Connect-phase timeout (seconds) applied to every provider `reqwest::Client`.
+///
+/// Env var: `PROVIDER_HTTP_CONNECT_TIMEOUT_SECS`. Default: 10 s (shorter than the total
+/// timeout so a black-holed DNS/TCP connect fails fast). Strictly-positive guaranteed —
+/// same zero-guard as `provider_http_timeout_secs` (REQ-PROV-056/057).
+pub fn provider_http_connect_timeout_secs() -> u64 {
+    resolve_timeout_secs("PROVIDER_HTTP_CONNECT_TIMEOUT_SECS", 10)
+}
+
+/// Resolve an env-configured timeout to a **strictly-positive** seconds value (REQ-PROV-057).
+///
+/// This is NOT a bare `parse_env_u64`: the plain parse returns `0` for an explicit
+/// `="0"` (a valid `u64` parse), which would build a `Duration::from_secs(0)` (unbounded)
+/// client and violate REQ-PROV-056. This guard coerces a resolved `0` (from `="0"`, an
+/// unparseable value, or an unset var) back to the default so a zero-duration timeout can
+/// never reach the client builder.
+fn resolve_timeout_secs(var: &str, default: u64) -> u64 {
+    resolve_positive_secs(std::env::var(var).ok().as_deref(), default)
+}
+
+/// Pure zero-guard core for `resolve_timeout_secs` (REQ-PROV-057, unit-testable, no env).
+///
+/// `raw` is the raw env value (or `None` when unset). A missing, unparseable, or `0`
+/// value yields `default`; any strictly-positive parse passes through.
+fn resolve_positive_secs(raw: Option<&str>, default: u64) -> u64 {
+    match raw.and_then(|s| s.trim().parse::<u64>().ok()) {
+        Some(v) if v > 0 => v,
+        _ => default,
+    }
+}
+
 // ── SPEC-SCHED-001 scheduling knobs (OR-SCHED-1 resolved) ────────────────────
 
 /// Stable per-replica identifier used in `claimed_by` for lease fencing.
@@ -672,6 +716,49 @@ mod tests {
         let key = "PACER_TESTPROVIDER_COOLDOWN_MS";
         if std::env::var(key).is_err() {
             assert_eq!(pacer_cooldown_ms("testprovider"), 500);
+        }
+    }
+
+    // ── SPEC-PROV-002 zero-guarded timeout resolution (REQ-PROV-056/057) ──────
+
+    /// AC-PROV-055 Edge-Case: unset / explicit "0" / unparseable all fall back to the
+    /// default (never a zero-duration timeout); a positive value passes through.
+    #[test]
+    fn resolve_positive_secs_guards_zero_and_unparseable_to_default() {
+        // Unset (None) → default.
+        assert_eq!(resolve_positive_secs(None, 30), 30);
+        // Explicit "0" → default (NOT zero — this is the REQ-PROV-056 guard).
+        assert_eq!(resolve_positive_secs(Some("0"), 30), 30);
+        // Unparseable → default.
+        assert_eq!(resolve_positive_secs(Some("garbage"), 30), 30);
+        // Negative (unparseable as u64) → default.
+        assert_eq!(resolve_positive_secs(Some("-5"), 30), 30);
+        // Whitespace-only → default.
+        assert_eq!(resolve_positive_secs(Some("   "), 30), 30);
+        // Strictly-positive → passes through.
+        assert_eq!(resolve_positive_secs(Some("45"), 30), 45);
+        assert_eq!(resolve_positive_secs(Some("1"), 30), 1);
+        // Different default is honoured.
+        assert_eq!(resolve_positive_secs(None, 10), 10);
+        assert_eq!(resolve_positive_secs(Some("0"), 10), 10);
+    }
+
+    #[test]
+    fn resolve_timeout_secs_unset_var_is_default() {
+        // A var name guaranteed absent resolves to the default (REQ-PROV-057).
+        assert_eq!(
+            resolve_timeout_secs("PROVIDER_HTTP_TIMEOUT_SECS_DEFINITELY_UNSET_XYZ", 30),
+            30
+        );
+    }
+
+    #[test]
+    fn provider_http_timeout_defaults_are_30_and_10() {
+        if std::env::var("PROVIDER_HTTP_TIMEOUT_SECS").is_err() {
+            assert_eq!(provider_http_timeout_secs(), 30);
+        }
+        if std::env::var("PROVIDER_HTTP_CONNECT_TIMEOUT_SECS").is_err() {
+            assert_eq!(provider_http_connect_timeout_secs(), 10);
         }
     }
 

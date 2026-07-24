@@ -2,6 +2,18 @@
 //!
 //! The chain is ordered (declared order = fallback priority) and fail-fast on unknown names.
 //! Mirrors `ticker-collector`'s `providers/mod.rs::build_chain` pattern (research §2.5).
+//!
+//! ## Shared request path (SPEC-PROV-002)
+//!
+//! Every provider endpoint routes through the [`transport`] module — the single
+//! request-path frame that removes the per-endpoint duplication which produced this class
+//! of drift (F-14). [`transport::build_client`] is the ONLY place a provider
+//! `reqwest::Client` is constructed: it applies a total-request timeout (default 30 s,
+//! `PROVIDER_HTTP_TIMEOUT_SECS`), a shorter connect timeout (default 10 s,
+//! `PROVIDER_HTTP_CONNECT_TIMEOUT_SECS`), and a `User-Agent`, so no client can hang a
+//! worker indefinitely (F-11/F-19). [`transport::paced`] wraps every call with the
+//! throttle + `pacer::acquire_slot` prelude and the 429 → `pacer::signal_cooldown`
+//! postlude; [`transport::get_json`] is the shared response epilogue.
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -17,6 +29,7 @@ pub mod bitstamp;
 pub mod coinbase;
 pub mod coingecko;
 pub mod kraken;
+pub mod transport;
 
 pub use binance::BinanceProvider;
 pub use bitstamp::BitstampProvider;
@@ -195,11 +208,20 @@ pub enum ProviderError {
 
 impl ProviderError {
     /// True for transient errors (retry may succeed). False for permanent errors.
+    ///
+    /// SPEC-SCHED-001 worker retry logic consumes this classification, so a permanent
+    /// client error (a 4xx other than `408|425|429`) MUST NOT be classified transient —
+    /// otherwise the workers spin retrying a request that can never succeed (F-12).
+    ///
+    /// `Http { status }` is transient only for `408 | 425 | 429 | 500..=599` (timeouts,
+    /// too-early, rate-limit, and all 5xx). `RateLimited` and `Network` remain transient
+    /// unchanged (REQ-PROV-058/059).
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            ProviderError::RateLimited | ProviderError::Network(_) | ProviderError::Http { .. }
-        )
+        match self {
+            ProviderError::RateLimited | ProviderError::Network(_) => true,
+            ProviderError::Http { status, .. } => matches!(status, 408 | 425 | 429 | 500..=599),
+            _ => false,
+        }
     }
 }
 
@@ -563,6 +585,43 @@ pub async fn chain_fetch_ohlc_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Scenario 4 (REQ-PROV-058/059): transient classification matrix (pure) ──
+
+    #[test]
+    fn is_transient_status_matrix() {
+        // Transient: request-timeout (408), too-early (425), rate-limit (429), all 5xx.
+        for status in [408u16, 425, 429, 500, 502, 503, 504, 599] {
+            let e = ProviderError::Http {
+                status,
+                body: String::new(),
+            };
+            assert!(
+                e.is_transient(),
+                "HTTP {status} must be classified transient"
+            );
+        }
+        // Permanent: 4xx other than 408/425/429 (REQ-PROV-059). This FAILS against the
+        // pre-fix code where every `Http { .. }` (incl. 404) was transient — RED-first.
+        for status in [400u16, 401, 403, 404, 409, 410, 422] {
+            let e = ProviderError::Http {
+                status,
+                body: String::new(),
+            };
+            assert!(
+                !e.is_transient(),
+                "permanent HTTP {status} must NOT be classified transient"
+            );
+        }
+        // RateLimited stays transient unchanged. (Network(_) shares the same match arm —
+        // `RateLimited | Network(_) => true` — so it is covered by construction; a
+        // `reqwest::Error` has no public constructor to assert it directly here.)
+        assert!(ProviderError::RateLimited.is_transient());
+        // Non-HTTP permanent errors are not transient.
+        assert!(!ProviderError::CreditExhausted.is_transient());
+        assert!(!ProviderError::Parse("x".to_string()).is_transient());
+        assert!(!ProviderError::NotSupported(Capability::Spot).is_transient());
+    }
 
     fn test_pool() -> PgPool {
         // Lazy pool: parses URL but does not connect. Providers' name() never touches the DB.

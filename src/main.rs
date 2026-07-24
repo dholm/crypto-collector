@@ -226,6 +226,37 @@ async fn main() -> Result<()> {
     );
     info!("crypto-collector: provider chain = {:?}", provider_names);
 
+    // ── Step 8a: Verify every chain member has an upstream_request_pacer row ───
+    // Runs AFTER migrate_with_retry reports success (Step 7) — so the DB is confirmed
+    // reachable and the lazy-pool / DB-down / migration-retry resilience is untouched — and
+    // BEFORE readiness flips (Step 10). A missing row otherwise surfaces only as an error on
+    // every fetch at runtime (F-15); catch it at startup and fail readiness naming the member.
+    //
+    // @MX:NOTE: [AUTO] pacer-row completeness check: after migrations succeed, before set_ready;
+    //           a missing row fails readiness naming the member without breaking DB-down resilience.
+    // @MX:SPEC: SPEC-PROV-002 REQ-PROV-063 REQ-PROV-064
+    match crypto_collector::pacer::missing_pacer_rows(&pool, &provider_names).await {
+        Ok(missing) if missing.is_empty() => {}
+        Ok(missing) => {
+            // Same fail-fast shape as `build_chain`: a single best-effort startup alarm
+            // (one attempt, zero retries), then exit non-zero. This returns BEFORE Step 10
+            // `set_ready`, so readiness never flips (REQ-PROV-064).
+            if let Some(client) = crypto_collector::alarm::AlarmClient::from_config() {
+                let spec = crypto_collector::alarm::catalog::to_alarm_spec(
+                    &crypto_collector::alarm::Condition::StartupConfigError,
+                );
+                client.raise_once(&spec).await;
+            }
+            return Err(anyhow::anyhow!(
+                "provider(s) missing upstream_request_pacer row: {missing:?} — add pacer rows before starting"
+            ));
+        }
+        Err(e) => {
+            return Err(e).context("failed to verify upstream_request_pacer rows at startup");
+        }
+    }
+    info!("crypto-collector: pacer-row validation passed for all chain members");
+
     // ── Step 8b: Once-per-coin startup historical backfill (idempotent) ───────
     // Enqueues a `candles` backfill job per tracked coin with a multi-year lookback
     // window; `ON CONFLICT (coin_id, dataset) DO NOTHING` means re-deploys never

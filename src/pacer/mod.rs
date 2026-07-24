@@ -127,8 +127,94 @@ pub enum AcquireSlotError {
     #[error("provider '{0}' not found in upstream_request_pacer")]
     NotFound(String),
 
+    /// The gated UPDATE matched no row, but the diagnostic re-SELECT found the row present
+    /// and neither the cooldown gate nor the credit gate explains the block — the block
+    /// lapsed between the UPDATE and the re-SELECT (a race). Transient-by-nature: a retry
+    /// would likely succeed. Reserved distinctly from `NotFound` (F-18/REQ-PROV-062, D4).
+    #[error("provider '{0}' pacer row was contended (block lapsed mid-check); retry")]
+    Contended(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
+}
+
+// ── Pure honesty cores (F-13, F-18 — testable without DB) ────────────────────
+
+/// Former `.clamp(0, 60_000)` ceiling — now an **observability threshold**, not a
+/// truncation. A computed wait beyond this is still slept in full; the threshold only
+/// gates the `warn!` + backlog metric (SPEC-PROV-002 D3).
+const PACER_BACKLOG_WARN_MS: i64 = 60_000;
+
+/// Decide how long `acquire_slot` sleeps after its atomic reservation, and whether the
+/// wait exceeded the observability threshold (REQ-PROV-060, pure, DB-free).
+///
+/// The atomic UPDATE already advanced `next_allowed_at`, so the reservation is
+/// authoritative — firing before it is the defect the old `.clamp(0, 60_000)` introduced.
+/// This therefore returns the **full** wait (no truncation); the boolean is set when the
+/// wait exceeds `PACER_BACKLOG_WARN_MS` so the caller can `warn!` + increment a backlog
+/// metric for observability WITHOUT changing how long it sleeps. A non-positive wait
+/// returns `(ZERO, false)`.
+pub fn sleep_plan(next_at: DateTime<Utc>, now: DateTime<Utc>) -> (StdDuration, bool) {
+    let wait = next_at.signed_duration_since(now);
+    let ms = wait.num_milliseconds();
+    if ms <= 0 {
+        return (StdDuration::ZERO, false);
+    }
+    // Full wait, never truncated (the reservation is authoritative).
+    (
+        StdDuration::from_millis(ms as u64),
+        ms > PACER_BACKLOG_WARN_MS,
+    )
+}
+
+/// Classify a blocked `acquire_slot` from the diagnostic re-SELECT (REQ-PROV-062, D4, pure).
+///
+/// The gated UPDATE returned no row; this maps the diagnostic re-SELECT `(cooldown_until,
+/// credit_limit, credits_used)` to the honest error:
+/// - `None` (row genuinely absent) → `NotFound`;
+/// - active cooldown (`cooldown_until > now`) → `Cooldown`;
+/// - credit gate reached (`credits_used >= credit_limit`) → `CreditExhausted`;
+/// - row present but neither gate explains the block (a lapsed-block race) → `Contended`,
+///   NOT `NotFound` (which is reserved for the genuinely-absent row).
+fn classify_blocked(
+    provider: &str,
+    row: Option<(Option<DateTime<Utc>>, Option<i64>, i64)>,
+    now: DateTime<Utc>,
+) -> AcquireSlotError {
+    match row {
+        None => AcquireSlotError::NotFound(provider.to_string()),
+        Some((cooldown_until, credit_limit, credits_used)) => {
+            if let Some(until) = cooldown_until {
+                if until > now {
+                    return AcquireSlotError::Cooldown(provider.to_string(), until);
+                }
+            }
+            if credit_limit.is_some_and(|lim| credits_used >= lim) {
+                return AcquireSlotError::CreditExhausted(provider.to_string());
+            }
+            // Row exists, both gates clear — the block lapsed between the UPDATE and this
+            // re-SELECT. An honest "retry would have succeeded" label, not a misleading
+            // NotFound (F-18).
+            AcquireSlotError::Contended(provider.to_string())
+        }
+    }
+}
+
+/// Emit the backlog observability signal (`warn!` + counter) when a pacer wait exceeds the
+/// threshold. The sleep itself is NOT affected — this is observability only (REQ-PROV-060,
+/// D2). Split out so the metric increment is unit-observable with a local recorder.
+fn record_backlog_wait(provider: &str, wait: StdDuration) {
+    tracing::warn!(
+        provider = provider,
+        wait_secs = wait.as_secs(),
+        threshold_ms = PACER_BACKLOG_WARN_MS,
+        "pacer acquire_slot wait exceeds the backlog threshold; sleeping the full reserved wait (no truncation)"
+    );
+    metrics::counter!(
+        "pacer_backlog_wait_exceeded_total",
+        "provider" => provider.to_string(),
+    )
+    .increment(1);
 }
 
 /// Acquire one egress slot from `upstream_request_pacer` and sleep until the allowed instant.
@@ -147,11 +233,16 @@ pub enum AcquireSlotError {
 /// - `Err(AcquireSlotError::Cooldown)` — fleet-wide cooldown active.
 /// - `Err(AcquireSlotError::CreditExhausted)` — monthly credit limit reached.
 ///
-// @MX:WARN: [AUTO] acquire_slot is the single fleet-wide egress governor; every outbound HTTP call routes through it
+// @MX:WARN: [AUTO] acquire_slot is the single fleet-wide egress governor; the standard
+//           enforcement point is providers::transport::paced, which wraps this call.
 // @MX:REASON: Bypassing acquire_slot risks 429 flood, upstream account bans, and monthly credit exhaustion.
 //             REQ-PROV-040: ALL outbound calls acquire before HTTP. REQ-PROV-045: no second pacing mechanism.
 //             Sleep MUST occur OUTSIDE the transaction (see ticker-collector pacer.rs @MX:WARN).
-// @MX:SPEC: SPEC-PROV-001 REQ-PROV-040/041/043/044/045
+//             The reservation advances next_allowed_at atomically, so the sleep honours the
+//             FULL computed wait (no 60 s truncation) — firing before the reserved slot is
+//             exactly the burst the pacer prevents (F-13). Backlog beyond the former ceiling
+//             is surfaced via warn! + pacer_backlog_wait_exceeded_total, NOT truncated.
+// @MX:SPEC: SPEC-PROV-001 REQ-PROV-040/041/043/044/045 SPEC-PROV-002 REQ-PROV-060 REQ-PROV-062
 pub async fn acquire_slot(pool: &PgPool, provider: &str) -> Result<(), AcquireSlotError> {
     // Step 1: reset credit window if the monthly interval has elapsed (REQ-PROV-044).
     reset_credit_window_if_needed(pool, provider).await?;
@@ -180,17 +271,23 @@ pub async fn acquire_slot(pool: &PgPool, provider: &str) -> Result<(), AcquireSl
 
     match next_allowed_at {
         Some(next_at) => {
-            // Step 3: sleep OUTSIDE the transaction until the slot opens.
-            let now = Utc::now();
-            let wait = next_at.signed_duration_since(now);
-            if wait > Duration::zero() {
-                let ms = wait.num_milliseconds().clamp(0, 60_000) as u64;
-                tokio::time::sleep(StdDuration::from_millis(ms)).await;
+            // Step 3: sleep OUTSIDE the transaction until the slot opens. The reservation
+            // already advanced next_allowed_at, so sleep the FULL computed wait — never
+            // truncate (F-13). Backlog beyond the former ceiling is surfaced for
+            // observability but does not change how long we sleep (D3).
+            let (dur, backlog_exceeded) = sleep_plan(next_at, Utc::now());
+            if backlog_exceeded {
+                record_backlog_wait(provider, dur);
+            }
+            if !dur.is_zero() {
+                tokio::time::sleep(dur).await;
             }
             Ok(())
         }
         None => {
-            // Determine why: cooldown or credit exhaustion
+            // Diagnose why the gated UPDATE matched no row. A genuinely-absent row is
+            // NotFound; a present row whose block lapsed mid-check is Contended, not a
+            // misleading NotFound (F-18/REQ-PROV-062).
             let row: Option<(Option<DateTime<Utc>>, Option<i64>, i64)> = sqlx::query_as(
                 "SELECT cooldown_until, credit_limit, credits_used \
                  FROM upstream_request_pacer WHERE provider = $1",
@@ -199,22 +296,7 @@ pub async fn acquire_slot(pool: &PgPool, provider: &str) -> Result<(), AcquireSl
             .fetch_optional(pool)
             .await?;
 
-            match row {
-                None => Err(AcquireSlotError::NotFound(provider.to_string())),
-                Some((cooldown_until, credit_limit, credits_used)) => {
-                    let now = Utc::now();
-                    if let Some(until) = cooldown_until {
-                        if until > now {
-                            return Err(AcquireSlotError::Cooldown(provider.to_string(), until));
-                        }
-                    }
-                    if credit_limit.is_some_and(|lim| credits_used >= lim) {
-                        return Err(AcquireSlotError::CreditExhausted(provider.to_string()));
-                    }
-                    // Fallback — pacer row exists but condition is unclear; treat as NotFound
-                    Err(AcquireSlotError::NotFound(provider.to_string()))
-                }
-            }
+            Err(classify_blocked(provider, row, Utc::now()))
         }
     }
 }
@@ -223,6 +305,18 @@ pub async fn acquire_slot(pool: &PgPool, provider: &str) -> Result<(), AcquireSl
 ///
 /// All replicas reading `upstream_request_pacer` will see `cooldown_until` and withhold
 /// requests until it expires. `acquire_slot` checks this atomically.
+///
+/// The cooldown is **monotonic** — `GREATEST(COALESCE(cooldown_until,'epoch'), $2)` — so a
+/// later, shorter signal (multi-replica races, operator-set cooldowns) can never truncate
+/// an earlier, longer one (F-17/REQ-PROV-061). A NULL existing cooldown coalesces to epoch
+/// so the first signal always applies.
+///
+// @MX:WARN: [AUTO] signal_cooldown is monotonic — GREATEST never shortens an existing cooldown
+// @MX:REASON: A shortened cooldown reopens the very 429 window the cooldown exists to close;
+//             a later, shorter signal (a stale replica, or an operator-set longer cooldown)
+//             must NOT truncate a longer one. GREATEST(COALESCE(cooldown_until,'epoch'),$2)
+//             enforces this at the SQL layer for every replica (F-17).
+// @MX:SPEC: SPEC-PROV-002 REQ-PROV-061
 pub async fn signal_cooldown(
     pool: &PgPool,
     provider: &str,
@@ -231,7 +325,8 @@ pub async fn signal_cooldown(
     let cooldown_until = Utc::now() + Duration::milliseconds(cooldown_ms as i64);
     sqlx::query(
         "UPDATE upstream_request_pacer \
-         SET cooldown_until = $2, updated_at = now() \
+         SET cooldown_until = GREATEST(COALESCE(cooldown_until, 'epoch'::timestamptz), $2), \
+             updated_at = now() \
          WHERE provider = $1",
     )
     .bind(provider)
@@ -239,6 +334,29 @@ pub async fn signal_cooldown(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Return the chain members that have **no** `upstream_request_pacer` row (REQ-PROV-063).
+///
+/// `SELECT provider FROM upstream_request_pacer WHERE provider = ANY($1)` returns the
+/// present members; the missing set is the requested names minus the present ones. Called
+/// once at startup (`main.rs` Step 8) AFTER migrations succeed — a non-empty result fails
+/// readiness naming the missing member (REQ-PROV-064). A missing row otherwise surfaces
+/// only as an error on every fetch at runtime (F-15).
+pub async fn missing_pacer_rows(
+    pool: &PgPool,
+    providers: &[String],
+) -> Result<Vec<String>, sqlx::Error> {
+    let present: Vec<String> =
+        sqlx::query_scalar("SELECT provider FROM upstream_request_pacer WHERE provider = ANY($1)")
+            .bind(providers)
+            .fetch_all(pool)
+            .await?;
+    Ok(providers
+        .iter()
+        .filter(|p| !present.contains(p))
+        .cloned()
+        .collect())
 }
 
 /// Reset the monthly credit window if the 1-month interval has elapsed (REQ-PROV-044).
@@ -392,6 +510,116 @@ mod tests {
             start.elapsed() >= StdDuration::from_millis(40),
             "local throttle must space calls by min_gap, got {:?}",
             start.elapsed()
+        );
+    }
+
+    // ── sleep_plan pure core (Scenario 5a / REQ-PROV-060) ───────────────────
+
+    #[test]
+    fn sleep_plan_wait_beyond_ceiling_is_full_not_truncated() {
+        let now = ts(12, 0, 0);
+        // 120 s wait — twice the former 60 s clamp ceiling.
+        let next = now + Duration::seconds(120);
+        let (dur, exceeded) = sleep_plan(next, now);
+        // FULL wait (no truncation to 60_000 ms) — FAILS against the pre-fix clamp. RED-first.
+        assert_eq!(dur, StdDuration::from_millis(120_000));
+        assert!(
+            exceeded,
+            "a wait beyond the ceiling must set backlog_exceeded"
+        );
+    }
+
+    #[test]
+    fn sleep_plan_wait_within_ceiling_is_wait_and_not_exceeded() {
+        let now = ts(12, 0, 0);
+        let next = now + Duration::seconds(30);
+        let (dur, exceeded) = sleep_plan(next, now);
+        assert_eq!(dur, StdDuration::from_millis(30_000));
+        assert!(!exceeded);
+    }
+
+    #[test]
+    fn sleep_plan_exactly_ceiling_is_not_exceeded() {
+        let now = ts(12, 0, 0);
+        let next = now + Duration::milliseconds(60_000);
+        let (dur, exceeded) = sleep_plan(next, now);
+        assert_eq!(dur, StdDuration::from_millis(60_000));
+        // Exactly at the ceiling is NOT "exceeded" (strict `>`), so no spurious warn/metric.
+        assert!(!exceeded);
+    }
+
+    #[test]
+    fn sleep_plan_nonpositive_wait_is_zero() {
+        let now = ts(12, 0, 0);
+        let next = now - Duration::seconds(5); // slot already open
+        let (dur, exceeded) = sleep_plan(next, now);
+        assert_eq!(dur, StdDuration::ZERO);
+        assert!(!exceeded);
+    }
+
+    // ── classify_blocked pure core (D1 / Scenario 5c / REQ-PROV-062) ────────
+
+    #[test]
+    fn classify_blocked_absent_row_is_not_found() {
+        let e = classify_blocked("coingecko", None, ts(12, 0, 0));
+        assert!(
+            matches!(e, AcquireSlotError::NotFound(ref p) if p == "coingecko"),
+            "a genuinely-absent row must be NotFound, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn classify_blocked_lapsed_block_row_is_contended() {
+        let now = ts(12, 0, 0);
+        // Row present; cooldown expired (past); credits below limit → neither gate explains
+        // the block → the block lapsed mid-check → Contended (NOT NotFound).
+        let past = ts(11, 0, 0);
+        let e = classify_blocked("coingecko", Some((Some(past), Some(100), 5)), now);
+        assert!(
+            matches!(e, AcquireSlotError::Contended(ref p) if p == "coingecko"),
+            "a present-but-lapsed-block row must be Contended, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn classify_blocked_active_cooldown_is_cooldown() {
+        let now = ts(12, 0, 0);
+        let future = ts(12, 5, 0);
+        let e = classify_blocked("binance", Some((Some(future), None, 0)), now);
+        assert!(matches!(e, AcquireSlotError::Cooldown(_, _)), "got {e:?}");
+    }
+
+    #[test]
+    fn classify_blocked_credit_exhausted() {
+        let now = ts(12, 0, 0);
+        let e = classify_blocked("kraken", Some((None, Some(100), 100)), now);
+        assert!(
+            matches!(e, AcquireSlotError::CreditExhausted(_)),
+            "got {e:?}"
+        );
+    }
+
+    // ── record_backlog_wait metric increment (D2 / REQ-PROV-060) ────────────
+
+    /// The backlog observability signal increments `pacer_backlog_wait_exceeded_total`
+    /// labelled by provider. Uses a test-local recorder (no global install), mirroring the
+    /// `metrics` module's test harness.
+    #[test]
+    fn record_backlog_wait_increments_provider_labelled_counter() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            record_backlog_wait("coingecko", StdDuration::from_secs(90));
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("pacer_backlog_wait_exceeded_total"),
+            "backlog metric must be emitted, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"provider="coingecko""#),
+            "backlog metric must carry the provider label, got:\n{rendered}"
         );
     }
 
@@ -587,6 +815,120 @@ mod tests {
         assert!(
             age < Duration::minutes(1),
             "credit_window_start must be reset to now, age={age:?}"
+        );
+    }
+
+    /// Scenario 5b (REQ-PROV-061): a later, shorter cooldown must NOT shorten an existing
+    /// longer one (GREATEST); a first signal against a NULL cooldown always applies.
+    #[tokio::test]
+    #[ignore]
+    async fn db_signal_cooldown_is_monotonic_never_shortens() {
+        let pool = setup_db().await;
+
+        // Start from NULL so the first signal always applies (COALESCE(..,'epoch')).
+        sqlx::query(
+            "UPDATE upstream_request_pacer SET cooldown_until = NULL WHERE provider = 'coinbase'",
+        )
+        .execute(&pool)
+        .await
+        .expect("clear");
+
+        // First signal: a long (1 h) cooldown applies against the NULL baseline.
+        signal_cooldown(&pool, "coinbase", 3_600_000)
+            .await
+            .expect("long signal");
+        let long: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT cooldown_until FROM upstream_request_pacer WHERE provider = 'coinbase'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read long");
+        assert!(long.is_some(), "first signal against NULL must apply");
+
+        // Second signal: a SHORT (1 s) cooldown must NOT truncate the existing long one.
+        signal_cooldown(&pool, "coinbase", 1_000)
+            .await
+            .expect("short signal");
+        let after: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT cooldown_until FROM upstream_request_pacer WHERE provider = 'coinbase'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read after");
+
+        assert_eq!(
+            after, long,
+            "a later, shorter cooldown must leave the existing longer cooldown in place (GREATEST)"
+        );
+
+        // Restore.
+        sqlx::query(
+            "UPDATE upstream_request_pacer SET cooldown_until = NULL WHERE provider = 'coinbase'",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore");
+    }
+
+    /// Scenario 5c (REQ-PROV-062, DB half): a genuinely-absent provider returns NotFound;
+    /// a present, unblocked row returns Ok (NotFound is reserved for the absent case). The
+    /// Contended positive path is race-timing-sensitive and is covered deterministically by
+    /// the pure `classify_blocked_lapsed_block_row_is_contended` test above.
+    #[tokio::test]
+    #[ignore]
+    async fn db_acquire_slot_absent_is_not_found_present_is_ok() {
+        let pool = setup_db().await;
+
+        // Absent provider name → NotFound.
+        let absent = acquire_slot(&pool, "definitely_absent_provider_zzz").await;
+        assert!(
+            matches!(absent, Err(AcquireSlotError::NotFound(_))),
+            "an absent pacer row must be NotFound, got {absent:?}"
+        );
+
+        // Present, unblocked row → Ok (never NotFound / Contended).
+        sqlx::query(
+            "UPDATE upstream_request_pacer \
+             SET cooldown_until = NULL, credits_used = 0, next_allowed_at = now() \
+             WHERE provider = 'coingecko'",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset coingecko");
+        let present = acquire_slot(&pool, "coingecko").await;
+        assert!(
+            present.is_ok(),
+            "a present, unblocked row must acquire Ok (NotFound is reserved for absent rows), got {present:?}"
+        );
+    }
+
+    /// Scenario 6 (REQ-PROV-063/064): a chain member without a pacer row is reported in the
+    /// missing set; a chain whose members all have rows returns empty.
+    #[tokio::test]
+    #[ignore]
+    async fn db_missing_pacer_rows_detects_absent_member() {
+        let pool = setup_db().await;
+
+        let names = vec![
+            "coingecko".to_string(),
+            "definitely_absent_provider_zzz".to_string(),
+        ];
+        let missing = missing_pacer_rows(&pool, &names)
+            .await
+            .expect("missing_pacer_rows");
+        assert_eq!(
+            missing,
+            vec!["definitely_absent_provider_zzz".to_string()],
+            "the absent member must be reported in the missing set"
+        );
+
+        let present_only = vec!["coingecko".to_string()];
+        let none_missing = missing_pacer_rows(&pool, &present_only)
+            .await
+            .expect("missing_pacer_rows");
+        assert!(
+            none_missing.is_empty(),
+            "a chain whose members all have pacer rows returns an empty missing set"
         );
     }
 }

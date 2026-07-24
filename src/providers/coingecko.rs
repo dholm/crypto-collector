@@ -22,7 +22,8 @@ use sqlx::PgPool;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::pacer::{self, LocalThrottle};
+use super::transport;
+use crate::pacer::LocalThrottle;
 
 /// CoinGecko client configuration.
 #[derive(Debug, Clone)]
@@ -157,10 +158,7 @@ pub struct CoinGeckoClient {
 
 impl CoinGeckoClient {
     pub fn new(config: CoinGeckoConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .gzip(true)
-            .build()
-            .expect("reqwest client");
+        let client = transport::build_client();
         Self { client, config }
     }
 
@@ -217,19 +215,7 @@ impl CoinGeckoClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        let items: Vec<CgMarketItem> = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("markets parse error: {e}")))?;
+        let items: Vec<CgMarketItem> = transport::get_json(resp, "markets").await?;
 
         items
             .into_iter()
@@ -262,19 +248,7 @@ impl CoinGeckoClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        let raw: Vec<Value> = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("ohlc parse error: {e}")))?;
+        let raw: Vec<Value> = transport::get_json(resp, "ohlc").await?;
 
         raw.iter()
             .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
@@ -324,19 +298,7 @@ impl CoinGeckoClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        let raw: Vec<Value> = resp
-            .json()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("ohlc/range parse error: {e}")))?;
+        let raw: Vec<Value> = transport::get_json(resp, "ohlc/range").await?;
 
         raw.iter()
             .map(|v| normalise_ohlc_item(v, market_id, vs_currency, interval))
@@ -357,18 +319,7 @@ impl CoinGeckoClient {
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        resp.json::<CgCoinDetail>()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("coin detail parse error: {e}")))
+        transport::get_json::<CgCoinDetail>(resp, "coin detail").await
     }
 
     /// `GET /api/v3/search` — search coins by name / symbol (SPEC-PROV-001 REQ-PROV-005).
@@ -395,10 +346,15 @@ impl CoinGeckoClient {
             .await?;
 
         let status = resp.status();
+        // On 429, propagate RateLimited so the shared `paced()` postlude fires
+        // `signal_cooldown` before the trait boundary degrades to empty (F-10/REQ-PROV-054).
+        if status.as_u16() == 429 {
+            return Err(ProviderError::RateLimited);
+        }
         if !status.is_success() {
-            // Non-fatal: degrade to empty on upstream errors (REQ-PROV-005).
-            // Log at WARN so operators can distinguish rate-limit / auth failures
-            // from a genuinely empty result set.
+            // Non-fatal: any OTHER non-success degrades to empty on upstream errors
+            // (REQ-PROV-005). Log at WARN so operators can distinguish auth / server
+            // failures from a genuinely empty result set (no cooldown on non-429).
             let body_text = resp.text().await.unwrap_or_default();
             let body_preview: String = body_text.chars().take(512).collect();
             tracing::warn!(
@@ -459,10 +415,15 @@ impl CoinGeckoClient {
             .await?;
 
         let status = resp.status();
+        // On 429, propagate RateLimited so the shared `paced()` postlude fires
+        // `signal_cooldown` before the trait boundary degrades to empty (F-10/REQ-PROV-054).
+        if status.as_u16() == 429 {
+            return Err(ProviderError::RateLimited);
+        }
         if !status.is_success() {
-            // Non-fatal: degrade to empty on upstream errors (REQ-PROV-005).
-            // Log at WARN so operators can distinguish rate-limit / auth failures
-            // from a genuinely empty result set.
+            // Non-fatal: any OTHER non-success degrades to empty on upstream errors
+            // (REQ-PROV-005). Log at WARN so operators can distinguish auth / server
+            // failures from a genuinely empty result set (no cooldown on non-429).
             let body_text = resp.text().await.unwrap_or_default();
             let body_preview: String = body_text.chars().take(512).collect();
             tracing::warn!(
@@ -525,18 +486,7 @@ impl CoinGeckoClient {
     async fn fetch_derivatives_tickers(&self) -> Result<Vec<CgDerivTicker>, ProviderError> {
         let resp = self.get("/api/v3/derivatives/tickers").send().await?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(ProviderError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Http { status, body });
-        }
-
-        resp.json::<Vec<CgDerivTicker>>()
-            .await
-            .map_err(|e| ProviderError::Parse(format!("derivatives tickers parse error: {e}")))
+        transport::get_json::<Vec<CgDerivTicker>>(resp, "derivatives tickers").await
     }
 }
 
@@ -887,25 +837,14 @@ impl Provider for CoinGeckoProvider {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko spot"))
         })?;
 
-        // Pacer: acquire slot before outbound HTTP (REQ-PROV-040)
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let markets = match self
-            .client
-            .fetch_markets(&[coin_id], &market.vs_currency)
-            .await
-        {
-            Ok(m) => m,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        // Shared request-path frame: throttle + acquire_slot prelude + 429→signal_cooldown
+        // postlude (REQ-PROV-040/050). `ids` is bound outside the closure so its slice
+        // borrow outlives the awaited future.
+        let ids = [coin_id];
+        let markets = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_markets(&ids, &market.vs_currency)
+        })
+        .await?;
 
         let cm = markets
             .into_iter()
@@ -938,31 +877,16 @@ impl Provider for CoinGeckoProvider {
         // relative to "now" only (REQ-PROV-014). For an arbitrary historical range, see
         // `fetch_ohlc_range` (Analyst+ only; gated via `Capability::OhlcRange`).
 
-        // Pacer: acquire slot before outbound HTTP (REQ-PROV-040)
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        match self
-            .client
-            .fetch_ohlc(
+        transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_ohlc(
                 coin_id,
                 &market.vs_currency,
                 days,
                 market.market_id,
                 interval_secs,
             )
-            .await
-        {
-            Ok(c) => Ok(c),
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                Err(ProviderError::RateLimited)
-            }
-            Err(e) => Err(e),
-        }
+        })
+        .await
     }
 
     /// Fetch one page of candles within `[start, end)` via `/ohlc/range` (Analyst+ only).
@@ -986,14 +910,8 @@ impl Provider for CoinGeckoProvider {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC range"))
         })?;
 
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        match self
-            .client
-            .fetch_ohlc_range(
+        transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_ohlc_range(
                 coin_id,
                 &market.vs_currency,
                 start,
@@ -1001,33 +919,16 @@ impl Provider for CoinGeckoProvider {
                 market.market_id,
                 interval_secs,
             )
-            .await
-        {
-            Ok(c) => Ok(c),
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                Err(ProviderError::RateLimited)
-            }
-            Err(e) => Err(e),
-        }
+        })
+        .await
     }
 
     async fn fetch_coin_metadata(&self, coin_id: &str) -> Result<CoinMeta, ProviderError> {
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        match self.client.fetch_coin_detail(coin_id).await {
-            Ok(detail) => Ok(normalise_coin_detail(detail)),
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                Err(ProviderError::RateLimited)
-            }
-            Err(e) => Err(e),
-        }
+        let detail = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_coin_detail(coin_id)
+        })
+        .await?;
+        Ok(normalise_coin_detail(detail))
     }
 
     async fn fetch_coin_market(
@@ -1035,20 +936,11 @@ impl Provider for CoinGeckoProvider {
         coin_id: &str,
         vs_currency: &str,
     ) -> Result<CoinMarket, ProviderError> {
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let markets = match self.client.fetch_markets(&[coin_id], vs_currency).await {
-            Ok(m) => m,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        let ids = [coin_id];
+        let markets = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_markets(&ids, vs_currency)
+        })
+        .await?;
 
         markets
             .into_iter()
@@ -1057,20 +949,10 @@ impl Provider for CoinGeckoProvider {
     }
 
     async fn fetch_derivatives(&self, market: &MarketQuery) -> Result<DerivTick, ProviderError> {
-        self.local_throttle.acquire().await;
-        pacer::acquire_slot(&self.pool, "coingecko")
-            .await
-            .map_err(ProviderError::Pacer)?;
-
-        let tickers = match self.client.fetch_derivatives_tickers().await {
-            Ok(t) => t,
-            Err(ProviderError::RateLimited) => {
-                let cooldown_ms = crate::config::pacer_cooldown_ms("coingecko");
-                let _ = pacer::signal_cooldown(&self.pool, "coingecko", cooldown_ms).await;
-                return Err(ProviderError::RateLimited);
-            }
-            Err(e) => return Err(e),
-        };
+        let tickers = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_derivatives_tickers()
+        })
+        .await?;
 
         // Match ticker by base symbol (case-insensitive prefix match)
         let base_upper = market.base.to_uppercase();
@@ -1094,7 +976,24 @@ impl Provider for CoinGeckoProvider {
         q: &str,
         cap: usize,
     ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-        self.client.search_coins(q, cap).await
+        // Empty query short-circuits with no outbound request → no pacer slot consumed
+        // (the client already guards this; guarding here avoids charging a slot for a no-op).
+        if q.is_empty() {
+            return Ok(vec![]);
+        }
+        // Route through the shared frame so a pacer slot is consumed (REQ-PROV-053) and a
+        // 429 signals cooldown INSIDE paced() before the trait boundary degrades. Then
+        // broaden REQ-PROV-005 degradation: ALL upstream errors (429 / other-HTTP /
+        // Network / pacer Cooldown) degrade to Ok(vec![]) — the API handler already
+        // 200-empties (F-34 out of scope), so this is a trait-contract clarification.
+        match transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.search_coins(q, cap)
+        })
+        .await
+        {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(vec![]),
+        }
     }
 
     async fn fetch_coin_tickers(
@@ -1102,7 +1001,17 @@ impl Provider for CoinGeckoProvider {
         coin_id: &str,
         cap: usize,
     ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-        self.client.fetch_coin_tickers(coin_id, cap).await
+        if coin_id.is_empty() {
+            return Ok(vec![]);
+        }
+        match transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
+            self.client.fetch_coin_tickers(coin_id, cap)
+        })
+        .await
+        {
+            Ok(v) => Ok(v),
+            Err(_) => Ok(vec![]),
+        }
     }
 }
 
@@ -1904,9 +1813,12 @@ mod tests {
 
         let server = MockServer::start().await;
 
+        // A non-429 upstream error (503) still degrades to empty with a WARN and does NOT
+        // signal cooldown (REQ-PROV-005 / Scenario 2 edge-case). The 429 path is now
+        // distinct — see `search_coins_client_429_returns_rate_limited`.
         Mock::given(method("GET"))
             .and(path("/api/v3/search"))
-            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
             .mount(&server)
             .await;
 
@@ -1923,7 +1835,37 @@ mod tests {
 
         assert!(
             results.is_empty(),
-            "non-success upstream must degrade to empty (REQ-PROV-005)"
+            "non-429 non-success upstream must degrade to empty (REQ-PROV-005)"
+        );
+    }
+
+    /// Scenario 2 (REQ-PROV-054): the search CLIENT method now propagates 429 as
+    /// RateLimited (so the shared `paced()` postlude can fire `signal_cooldown`) rather than
+    /// silently degrading to empty. Intended behaviour change from the pre-F-10 client.
+    #[tokio::test]
+    async fn search_coins_client_429_returns_rate_limited() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/search"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let result = client.search_coins("bitcoin", 10).await;
+
+        assert!(
+            matches!(result, Err(ProviderError::RateLimited)),
+            "a 429 must propagate as RateLimited so paced() signals cooldown, got: {result:?}"
         );
     }
 
@@ -2237,9 +2179,11 @@ mod tests {
 
         let server = MockServer::start().await;
 
+        // A non-429 upstream error (503) still degrades to empty (REQ-PROV-005). The 429
+        // path is now distinct — see `fetch_coin_tickers_client_429_returns_rate_limited`.
         Mock::given(method("GET"))
             .and(path("/api/v3/coins/bitcoin/tickers"))
-            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
             .mount(&server)
             .await;
 
@@ -2256,7 +2200,36 @@ mod tests {
 
         assert!(
             results.is_empty(),
-            "non-success upstream must degrade to empty (REQ-PROV-005)"
+            "non-429 non-success upstream must degrade to empty (REQ-PROV-005)"
+        );
+    }
+
+    /// Scenario 2 (REQ-PROV-054): the tickers CLIENT method now propagates 429 as
+    /// RateLimited so the shared `paced()` postlude can fire `signal_cooldown`.
+    #[tokio::test]
+    async fn fetch_coin_tickers_client_429_returns_rate_limited() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/bitcoin/tickers"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let cfg = CoinGeckoConfig {
+            base_url: server.uri(),
+            api_key: None,
+            tier: "demo".to_string(),
+        };
+        let client = CoinGeckoClient::new(cfg);
+        let result = client.fetch_coin_tickers("bitcoin", 10).await;
+
+        assert!(
+            matches!(result, Err(ProviderError::RateLimited)),
+            "a 429 must propagate as RateLimited so paced() signals cooldown, got: {result:?}"
         );
     }
 
