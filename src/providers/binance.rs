@@ -93,6 +93,65 @@ impl BinanceClient {
 
         transport::get_json::<Vec<Value>>(resp, "klines range").await
     }
+
+    /// `GET /api/v3/ticker/24hr?symbol={symbol}` — 24-hour rolling-window statistics for a
+    /// single symbol (SPEC-PROV-003 F-22). Returns the raw JSON object; callers normalise
+    /// it via [`normalise_ticker_24hr`]. This is the honest source for spot price
+    /// (`lastPrice`), real 24-hour `volume`, and bid/ask — replacing the 1m-kline
+    /// approximation (REQ-PROV-072/073).
+    pub async fn fetch_ticker_24hr(&self, symbol: &str) -> Result<Value, ProviderError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v3/ticker/24hr", self.base_url))
+            .query(&[("symbol", symbol)])
+            .send()
+            .await?;
+
+        transport::get_json::<Value>(resp, "ticker 24hr").await
+    }
+}
+
+/// Normalise a Binance `GET /api/v3/ticker/24hr` payload into a `SpotQuote` (F-22).
+///
+/// The spot `price` is the ticker's `lastPrice` (deliberately NOT a 1m-kline close),
+/// `volume_24h` is the real 24-hour base-asset `volume`, and bid/ask come from
+/// `bidPrice`/`askPrice` — all from the SAME payload. A 1-minute kline volume is never
+/// stored in `volume_24h` (REQ-PROV-072/073). All numeric fields are JSON strings parsed
+/// exactly to `Decimal` (no `f64`). The timestamp is the ticker `closeTime` (ms), falling
+/// back to `Utc::now()` when absent.
+fn normalise_ticker_24hr(
+    v: &Value,
+    market_id: i64,
+    vs_currency: &str,
+) -> Result<SpotQuote, ProviderError> {
+    let field = |name: &'static str| -> Result<&Value, ProviderError> {
+        v.get(name)
+            .ok_or_else(|| ProviderError::Parse(format!("24hr ticker missing '{name}'")))
+    };
+
+    // Required: spot price is the ticker lastPrice (REQ-PROV-072).
+    let price = parse_string_decimal(field("lastPrice")?, "lastPrice")?;
+    // Real 24-hour base-asset volume — never a 1m kline volume (REQ-PROV-073).
+    let volume_24h = Some(parse_string_decimal(field("volume")?, "volume")?);
+    let bid = Some(parse_string_decimal(field("bidPrice")?, "bidPrice")?);
+    let ask = Some(parse_string_decimal(field("askPrice")?, "askPrice")?);
+
+    let ts = v
+        .get("closeTime")
+        .and_then(|c| c.as_i64())
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or_else(Utc::now);
+
+    Ok(SpotQuote {
+        market_id,
+        ts,
+        price,
+        bid,
+        ask,
+        volume_24h,
+        vs_currency: vs_currency.to_string(),
+        source: "binance".to_string(),
+    })
 }
 
 /// Normalise one Binance kline (12-element array) into `OhlcCandle`.
@@ -252,32 +311,24 @@ impl Provider for BinanceProvider {
         )
     }
 
+    // @MX:NOTE: [AUTO] Binance spot price (lastPrice), volume_24h, and bid/ask all come from
+    //           GET /api/v3/ticker/24hr — never a 1m kline (F-22). The price source moved off
+    //           the 1m-kline close to the ticker lastPrice deliberately (REQ-PROV-072); a 1m
+    //           volume is never stored in the 24h field (REQ-PROV-073).
+    // @MX:SPEC: SPEC-PROV-003 REQ-PROV-072 REQ-PROV-073
     async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-        // Fetch the single latest 1m kline and use close price as spot
+        // F-22: source the spot price (lastPrice), the real 24-hour volume, and bid/ask from
+        // the 24hr ticker — routed through the shared paced()/get_json() frame. The old path
+        // read a single 1m kline and stored its 1-minute volume in volume_24h (~3 orders of
+        // magnitude low) while taking the price from the 1m close.
         let symbol = Self::ticker_symbol(market);
 
-        let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
-            self.client.fetch_klines(&symbol, "1m", 1)
+        let ticker = transport::paced(&self.pool, &self.local_throttle, "binance", || {
+            self.client.fetch_ticker_24hr(&symbol)
         })
         .await?;
 
-        let kline = klines
-            .into_iter()
-            .next()
-            .ok_or_else(|| ProviderError::Parse("no klines returned for spot".to_string()))?;
-
-        let candle = normalise_kline(&kline, market.market_id, "1m", &market.vs_currency)?;
-
-        Ok(SpotQuote {
-            market_id: market.market_id,
-            ts: candle.ts,
-            price: candle.close,
-            bid: None,
-            ask: None,
-            volume_24h: candle.volume, // 1m volume is not 24h but best approximation from kline
-            vs_currency: candle.vs_currency,
-            source: "binance".to_string(),
-        })
+        normalise_ticker_24hr(&ticker, market.market_id, &market.vs_currency)
     }
 
     async fn fetch_ohlc(
@@ -518,6 +569,123 @@ mod tests {
         assert!(candles[0].ts < candles[1].ts);
         // volumes always Some
         assert!(candles.iter().all(|c| c.volume.is_some()));
+    }
+
+    // ── Scenario 4 (REQ-PROV-072/073): honest Binance spot from the 24hr ticker (F-22) ──
+
+    /// Binance `GET /api/v3/ticker/24hr` single-symbol fixture (all numeric fields are
+    /// JSON strings, matching the real API).
+    fn btc_24hr_ticker_fixture() -> Value {
+        json!({
+            "symbol": "BTCUSDT",
+            "priceChange": "1200.00",
+            "priceChangePercent": "1.28",
+            "weightedAvgPrice": "94800.00",
+            "lastPrice": "95000.10",
+            "bidPrice": "94999.50",
+            "bidQty": "1.5",
+            "askPrice": "95000.70",
+            "askQty": "2.1",
+            "openPrice": "93800.10",
+            "highPrice": "96000.00",
+            "lowPrice": "93000.00",
+            "volume": "1234567.89",
+            "quoteVolume": "117000000000.00",
+            "openTime": 1719733600000i64,
+            "closeTime": 1719820000000i64,
+            "count": 850000
+        })
+    }
+
+    #[test]
+    fn ticker_24hr_normalises_price_from_last_price_and_real_volume_bid_ask() {
+        let fixture = btc_24hr_ticker_fixture();
+        let quote = normalise_ticker_24hr(&fixture, 7, "usdt").expect("normalise");
+
+        // Price is the ticker lastPrice — NOT a 1m-kline close (REQ-PROV-072).
+        assert_eq!(quote.price, dec!(95000.10));
+        // Volume_24h is the real 24-hour base-asset volume — never a 1m kline volume
+        // (REQ-PROV-073).
+        assert_eq!(quote.volume_24h, Some(dec!(1234567.89)));
+        // Bid/ask populated from the same payload (REQ-PROV-072).
+        assert_eq!(quote.bid, Some(dec!(94999.50)));
+        assert_eq!(quote.ask, Some(dec!(95000.70)));
+        assert_eq!(quote.source, "binance");
+        assert_eq!(quote.vs_currency, "usdt");
+        // Timestamp from the ticker closeTime (ms).
+        assert_eq!(quote.ts.timestamp(), 1_719_820_000);
+    }
+
+    #[test]
+    fn ticker_24hr_missing_last_price_hard_fails() {
+        // The required spot price (lastPrice) must hard-fail when absent.
+        let mut fixture = btc_24hr_ticker_fixture();
+        fixture.as_object_mut().unwrap().remove("lastPrice");
+        let result = normalise_ticker_24hr(&fixture, 1, "usdt");
+        assert!(matches!(result, Err(ProviderError::Parse(_))));
+    }
+
+    #[tokio::test]
+    async fn http_ticker_24hr_sends_symbol_param_and_parses() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = btc_24hr_ticker_fixture();
+
+        Mock::given(method("GET"))
+            .and(path("/api/v3/ticker/24hr"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&server)
+            .await;
+
+        let client = BinanceClient::new(Some(server.uri()));
+        let ticker = client
+            .fetch_ticker_24hr("BTCUSDT")
+            .await
+            .expect("fetch_ticker_24hr");
+        let quote = normalise_ticker_24hr(&ticker, 1, "usdt").expect("normalise");
+        assert_eq!(quote.price, dec!(95000.10));
+        assert_eq!(quote.volume_24h, Some(dec!(1234567.89)));
+        assert!(quote.bid.is_some() && quote.ask.is_some());
+    }
+
+    /// Provider-level `fetch_spot` end-to-end goes through `pacer::acquire_slot` (a real DB
+    /// round-trip), so it is DB-gated (`#[ignore]`, run with `DATABASE_URL=... --ignored`),
+    /// mirroring `fetch_ohlc_range_normalises_candles_from_provider`. The no-DB coverage of
+    /// the price/volume/bid/ask contract lives in the pure + client wiremock tests above.
+    #[tokio::test]
+    #[ignore]
+    async fn fetch_spot_uses_24hr_ticker_price_volume_and_bid_ask() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/ticker/24hr"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(btc_24hr_ticker_fixture()))
+            .mount(&server)
+            .await;
+
+        let pool =
+            sqlx::PgPool::connect_lazy("postgres://postgres@localhost/crypto_collector_test")
+                .expect("lazy pool");
+        let provider = BinanceProvider::new(Some(server.uri()), pool);
+
+        let market = MarketQuery {
+            market_id: 7,
+            coin_id: Some("bitcoin".to_string()),
+            base: "BTC".to_string(),
+            quote: "USDT".to_string(),
+            venue: None,
+            vs_currency: "usdt".to_string(),
+        };
+        let quote = provider.fetch_spot(&market).await.expect("fetch_spot");
+        // Price is the ticker lastPrice, not a 1m-kline close.
+        assert_eq!(quote.price, dec!(95000.10));
+        assert_eq!(quote.volume_24h, Some(dec!(1234567.89)));
+        assert!(quote.bid.is_some() && quote.ask.is_some());
     }
 
     // ── secs_to_kline_interval: snap to nearest Binance interval ─────────────
