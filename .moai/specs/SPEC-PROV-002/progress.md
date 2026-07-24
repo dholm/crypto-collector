@@ -224,7 +224,7 @@ sync-phase step once the live-Postgres run below executes and the 3 DB-gated tes
 
 ```yaml
 sync_complete_at: 2026-07-24
-sync_commit_sha: pending-backfill-sync-prov-002   # backfilled in a follow-up commit
+sync_commit_sha: da620a92ed286903bbe449ed9142a40f54e011a8
 sync_status: pass-with-debt-held-at-implemented
 frontmatter_status_transition: "in-progress -> implemented"   # NOT -> completed
 b12_self_test_a: "grep -c 'SPEC-PROV-002' CHANGELOG.md before edit == 0 (no duplicate)"
