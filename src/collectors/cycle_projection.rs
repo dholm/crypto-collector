@@ -20,6 +20,7 @@ use chrono::NaiveDate;
 use rust_decimal::{Decimal, MathematicalOps};
 use rust_decimal_macros::dec;
 use std::collections::BTreeMap;
+use tracing::warn;
 
 use super::cycle_overlay::{assign_cycle_in, projected_halving_dates, OverlayPoint, CYCLE_DAYS};
 
@@ -496,17 +497,52 @@ pub fn project_composite(
     let series: BTreeMap<NaiveDate, Decimal> = daily.iter().copied().collect();
     let today = *series.keys().next_back().expect("checked non-empty above");
     let earliest = *series.keys().next().expect("checked non-empty above");
+    // `today`/`current_price` are derived from the UNFILTERED series (SPEC-CANDLE-002
+    // REQ-CANDLE-059, plan §4): the guard below MUST see today's real close, so the
+    // interior `close <= 0` filter (further down) runs only AFTER this derivation.
     let current_price = series[&today];
+
+    // REQ-CANDLE-059: a non-positive `current_price` (last/today close) would panic
+    // `current_price.log10()` in the continuity anchor below. Guard it here — BEFORE the
+    // interior filter — and degrade gracefully to an empty projection, consistent with
+    // the other `vec![]` degradations. Reachable ONLY because it precedes the filter: if
+    // the filter ran first it would drop today's zero row, shift `today` to the last
+    // positive day, and make this guard dead code.
+    if current_price <= Decimal::ZERO {
+        warn!(
+            "cycle_projection: current_price {current_price} <= 0 for the latest close ({today}); \
+             skipping projection (graceful empty, no panic)"
+        );
+        return vec![];
+    }
 
     // REQ-CYCLE-062: fewer than CYCLE_DAYS days of history → zero points, not an error.
     if (today - earliest).num_days() < CYCLE_DAYS {
         return vec![];
     }
 
-    let Some(model) = fit_model(&series, use_btc_anchors) else {
+    // REQ-CANDLE-058: interior non-positive closes would panic `p.log10()` in the spine
+    // fit and residual bins. Filter them out of the FIT INPUT ONLY (both `fit_model`'s
+    // spine + residual bins and `build_band_grid` see only positive closes); `today` /
+    // `current_price` remain the unfiltered values from above so continuity (g0) still
+    // anchors at today's real price. Each dropped row is surfaced at `warn!`.
+    let fit_series: BTreeMap<NaiveDate, Decimal> = series
+        .iter()
+        .filter(|&(date, &close)| {
+            if close <= Decimal::ZERO {
+                warn!("cycle_projection: dropping non-positive close {close} at {date} from the fit");
+                false
+            } else {
+                true
+            }
+        })
+        .map(|(&d, &p)| (d, p))
+        .collect();
+
+    let Some(model) = fit_model(&fit_series, use_btc_anchors) else {
         return vec![];
     };
-    let bands = build_band_grid(&model, &series);
+    let bands = build_band_grid(&model, &fit_series);
 
     // Continuity: g₀ anchors the path at today's real price.
     let g = genesis();
