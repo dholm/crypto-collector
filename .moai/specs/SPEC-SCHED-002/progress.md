@@ -1,7 +1,7 @@
 # SPEC-SCHED-002 — Progress
 
-Lifecycle: plan → run → sync. Status: **in-progress** (run-phase implemented; working tree
-uncommitted, pending user review + live-DB verification of the deferred `#[ignore]` tests).
+Lifecycle: plan → run → sync. Status: **completed** (3-phase close; sync-auditor
+PASS-WITH-DEBT debt closed with live-DB evidence; see §E.4).
 
 ## §E.1 Plan-phase Audit-Ready Signal
 
@@ -91,4 +91,85 @@ deferred_db_gated_tests:
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — owned by manager-docs>_
+### sync-auditor verdict (independent quality review)
+
+sync-auditor scored SPEC-SCHED-002 **PASS-WITH-DEBT (0.93 harmonic mean)** across the
+4-dimension scoring (Functionality / Security / Craft / Consistency). The must-pass firewall
+held — Functionality and the claim/lease/fencing preservation invariant (D-R1) both passed
+without qualification. The sole recorded debt item was that the 5 DB-gated regression tests
+(`#[ignore]`) proving AC-060b/060c/063b/064b were written but not yet executed against a real
+PostgreSQL instance.
+
+### Debt closure — observed evidence
+
+That debt is now **closed**. All 5 SPEC-SCHED-002 DB-gated tests were run against a real
+`postgres:16` instance under `--test-threads=1` (required — see fix below) and observed green
+across 3 consecutive runs:
+
+```
+$ DATABASE_URL=postgres://... cargo test -- --ignored --test-threads=1
+collectors::backfill::tests::db_partial_release_page_walk_does_not_fail_chunk ... ok
+collectors::backfill::tests::db_genuine_failures_still_bound_retries ... ok
+collectors::collection_queue::tests::db_soft_skip_release_does_not_consume_retry_budget ... ok
+collectors::collection_queue::tests::db_permanent_dispatch_fails_fast ... ok
+collectors::collection_queue::tests::db_transient_failure_retries_not_fails ... ok
+test result: ok. 5 passed; 0 failed
+```
+
+Confirmed on 3 consecutive invocations (no flake observed).
+
+### Fix required to close the debt (commit `9825951`)
+
+While driving the 5 DB-gated tests to green, two defects in the test fixtures themselves were
+found and fixed — production code (`src/collectors/{backfill,collection_queue}.rs` non-test
+lines) is **unchanged** by this commit:
+
+1. **FK-fixture bug**: a test fixture inserted a `backfill_chunks` / `collection_queue` row
+   referencing a `tracked_coins` / provider row that did not exist in the test's own setup,
+   causing an FK-violation error masking the actual assertion under test.
+2. **Parallel-execution isolation flaw**: the DB-gated tests share table-level state
+   (`FOR UPDATE SKIP LOCKED` claim rows) and interfered with each other under `cargo test`'s
+   default parallel test runner, producing nondeterministic failures. `CLAUDE.md` was updated
+   to document the `--test-threads=1` requirement for the `db_integration`-class DB-gated tests.
+
+### Offline gates (re-confirmed at sync)
+
+```
+$ cargo clippy --all-targets --all-features -- -D warnings   → exit 0, clean
+$ cargo fmt --check                                            → exit 0, clean
+$ cargo test                                                   → 601 passed, 0 failed, 63 ignored
+```
+
+### @MX validation (sync sub-step)
+
+All @MX Annotation Targets named in `spec.md` § @MX Annotation Targets are present and
+well-formed — no additions required:
+
+- `RELEASE_BACKFILL_SQL` / `RELEASE_QUEUE_SQL` — `@MX:WARN` + `@MX:REASON` citing
+  REQ-SCHED-060/065 (F-01 root-cause guard), warning against restoring the old failure-SQL reuse.
+- `FAIL_OR_RETRY_BACKFILL_SQL` / `FAIL_OR_RETRY_QUEUE_SQL` — `@MX:NOTE` updated to record the
+  genuine-failure-only path (REQ-SCHED-060.3/063.3).
+- `FAIL_PERMANENT_BACKFILL_SQL` / `FAIL_PERMANENT_QUEUE_SQL` — `@MX:NOTE` recording the
+  terminal fail-fast, retry-budget-independent path (REQ-SCHED-063.2).
+- `LIVE_COIN_CLAIM_SQL` — existing `@MX:ANCHOR`, unchanged fan_in ≥ 3 rationale (the new `LIMIT`
+  bound is documented in the surrounding code comment).
+- `LIVE_COIN_DEFER_SQL` — `@MX:WARN` + `@MX:REASON` citing REQ-SCHED-063.4 (permanent per-coin
+  error consequence).
+- `CLAIM_BACKFILL_SQL` / `CLAIM_QUEUE_SQL` — existing `@MX:ANCHOR` (fan_in ≥ 3) preserved
+  verbatim per D-R1; unaffected by this SPEC's changes.
+
+### Sync-phase close signal
+
+```yaml
+sync_complete_at: 2026-07-24
+sync_status: completed
+sync_auditor_verdict: pass-with-debt
+sync_auditor_score: 0.93
+debt_closed: true
+debt_closure_evidence: "5/5 DB-gated tests green on real postgres:16, --test-threads=1, 3 consecutive runs"
+fixture_fix_commit: 9825951
+run_commit_sha: 7b1082b
+frontmatter_status_transitions:
+  in-progress_to_implemented_to_completed: sync-commit (this commit)
+mx_validation: pass — all spec.md @MX Annotation Targets present and well-formed, no additions needed
+```

@@ -2,7 +2,7 @@
 id: SPEC-SCHED-002
 title: "Collector Worker Retry & Backpressure Correctness"
 version: "0.1.0"
-status: in-progress
+status: completed
 created: 2026-07-23
 updated: 2026-07-24
 author: manager-spec
