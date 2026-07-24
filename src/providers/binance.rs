@@ -241,7 +241,11 @@ fn parse_string_decimal(v: &Value, name: &str) -> Result<Decimal, ProviderError>
 /// 6h=21600, 8h=28800, 12h=43200, 1d=86400, 3d=259200, 1w=604800, 1M=2592000.
 ///
 /// Snapping uses nearest-neighbour by absolute distance (linear, not log-scale).
-pub(crate) fn secs_to_kline_interval(interval_secs: i64) -> &'static str {
+///
+/// Returns a `(snapped_secs, interval_name)` pair (mirroring Bitstamp's
+/// `snap_to_bitstamp_step` `(i64, &'static str)` shape) so callers can compute a lookback
+/// limit against the interval that was actually requested, not the raw input (F-25).
+pub(crate) fn secs_to_kline_interval(interval_secs: i64) -> (i64, &'static str) {
     const INTERVALS: &[(i64, &str)] = &[
         (60, "1m"),
         (180, "3m"),
@@ -262,8 +266,16 @@ pub(crate) fn secs_to_kline_interval(interval_secs: i64) -> &'static str {
     INTERVALS
         .iter()
         .min_by_key(|(s, _)| (interval_secs - s).abs())
-        .map(|(_, name)| *name)
-        .unwrap_or("1h")
+        .map(|(s, name)| (*s, *name))
+        .unwrap_or((3_600, "1h"))
+}
+
+/// Number of klines that fit in `days` of lookback at the SNAPPED interval, clamped to the
+/// Binance per-call maximum (1000). Dividing by the snapped seconds (NOT the raw requested
+/// seconds) keeps the lookback correct for a between-band `interval_secs` (F-25,
+/// REQ-PROV-079).
+fn kline_limit(days: u32, snapped_secs: i64) -> u32 {
+    ((days as i64 * 86_400) / snapped_secs.max(1)).clamp(1, 1000) as u32
 }
 
 // ── BinanceProvider ───────────────────────────────────────────────────────────
@@ -338,10 +350,10 @@ impl Provider for BinanceProvider {
         interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         let symbol = Self::ticker_symbol(market);
-        let interval = secs_to_kline_interval(interval_secs);
-        // Number of candles that fit in the requested lookback window (clamped to API max).
-        let snapped_secs = interval_secs.max(1);
-        let limit = ((days as i64 * 86_400) / snapped_secs).clamp(1, 1000) as u32;
+        // F-25: the limit divides by the SNAPPED seconds returned by the snap, not the raw
+        // interval_secs — so a between-band input gets the right lookback (REQ-PROV-079).
+        let (snapped_secs, interval) = secs_to_kline_interval(interval_secs);
+        let limit = kline_limit(days, snapped_secs);
 
         let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
             self.client.fetch_klines(&symbol, interval, limit)
@@ -368,7 +380,7 @@ impl Provider for BinanceProvider {
         interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
         let symbol = Self::ticker_symbol(market);
-        let interval = secs_to_kline_interval(interval_secs);
+        let (_snapped_secs, interval) = secs_to_kline_interval(interval_secs);
 
         let klines = transport::paced(&self.pool, &self.local_throttle, "binance", || {
             self.client.fetch_klines_range(
@@ -692,35 +704,56 @@ mod tests {
 
     #[test]
     fn snap_exact_intervals_unchanged() {
-        assert_eq!(secs_to_kline_interval(60), "1m");
-        assert_eq!(secs_to_kline_interval(3_600), "1h");
-        assert_eq!(secs_to_kline_interval(14_400), "4h");
-        assert_eq!(secs_to_kline_interval(86_400), "1d");
+        assert_eq!(secs_to_kline_interval(60), (60, "1m"));
+        assert_eq!(secs_to_kline_interval(3_600), (3_600, "1h"));
+        assert_eq!(secs_to_kline_interval(14_400), (14_400, "4h"));
+        assert_eq!(secs_to_kline_interval(86_400), (86_400, "1d"));
     }
 
     #[test]
     fn snap_default_poll_interval_60s_to_1m() {
         // Default global interval (60 s) → nearest Binance interval is 1m
-        assert_eq!(secs_to_kline_interval(60), "1m");
+        assert_eq!(secs_to_kline_interval(60), (60, "1m"));
     }
 
     #[test]
     fn snap_midpoint_between_1m_and_3m_to_lower() {
         // midpoint (60+180)/2 = 120 → distance to 1m is 60, distance to 3m is 60 → ties to 1m
-        assert_eq!(secs_to_kline_interval(120), "1m");
+        assert_eq!(secs_to_kline_interval(120), (60, "1m"));
     }
 
     #[test]
     fn snap_above_midpoint_advances_to_next_interval() {
         // 121 s → closer to 3m (180) than 1m (60) → 3m
-        assert_eq!(secs_to_kline_interval(121), "3m");
+        assert_eq!(secs_to_kline_interval(121), (180, "3m"));
     }
 
     #[test]
     fn snap_large_value_gives_monthly() {
         // 1M = 2592000 s
-        assert_eq!(secs_to_kline_interval(2_592_000), "1M");
-        assert_eq!(secs_to_kline_interval(10_000_000), "1M");
+        assert_eq!(secs_to_kline_interval(2_592_000), (2_592_000, "1M"));
+        assert_eq!(secs_to_kline_interval(10_000_000), (2_592_000, "1M"));
+    }
+
+    /// Scenario 8 (REQ-PROV-079): a between-band `interval_secs` snaps to a different kline
+    /// interval, and the request `limit` divides by the SNAPPED seconds, not the raw input.
+    #[test]
+    fn snap_between_band_limit_divides_by_snapped_secs_not_raw() {
+        // 8000 s snaps to 2h (7200): |8000-7200|=800 < |8000-14400|=6400.
+        let (snapped, name) = secs_to_kline_interval(8_000);
+        assert_eq!((snapped, name), (7_200, "2h"));
+        // limit divides by the SNAPPED 7200 (floor(86400/7200)=12), NOT the raw 8000
+        // (floor(86400/8000)=10) — the F-25 fix (REQ-PROV-079).
+        assert_eq!(kline_limit(1, snapped), 12);
+        assert_ne!(kline_limit(1, snapped), kline_limit(1, 8_000));
+    }
+
+    #[test]
+    fn kline_limit_clamps_to_binance_max_and_floor() {
+        // Clamped to the Binance per-call max of 1000.
+        assert_eq!(kline_limit(3650, 86_400), 1000);
+        // At least 1 even for a tiny window.
+        assert_eq!(kline_limit(0, 86_400), 1);
     }
 
     // ── Provider trait: supports() ────────────────────────────────────────────

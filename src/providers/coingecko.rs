@@ -410,20 +410,22 @@ impl CoinGeckoClient {
             .await
             .map_err(|e| ProviderError::Parse(format!("search parse error: {e}")))?;
 
+        // F-28: iterate the JSON array by reference — no deep-clone before read-only use.
         let coins = body["coins"]
             .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .take(cap)
-            .filter_map(|c| {
-                Some(CoinSearchResult {
-                    coin_id: c["id"].as_str()?.to_string(),
-                    symbol: c["symbol"].as_str()?.to_string(),
-                    name: c["name"].as_str()?.to_string(),
-                })
+            .map(|arr| {
+                arr.iter()
+                    .take(cap)
+                    .filter_map(|c| {
+                        Some(CoinSearchResult {
+                            coin_id: c["id"].as_str()?.to_string(),
+                            symbol: c["symbol"].as_str()?.to_string(),
+                            name: c["name"].as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         Ok(coins)
     }
@@ -479,37 +481,40 @@ impl CoinGeckoClient {
             .await
             .map_err(|e| ProviderError::Parse(format!("tickers parse error: {e}")))?;
 
-        let tickers = body["tickers"].as_array().cloned().unwrap_or_default();
-
         // Parse, filter (stale/anomaly/contract-address), sort by USD volume desc, truncate.
-        let mut results: Vec<(f64, MarketSearchResult)> = tickers
-            .into_iter()
-            .filter_map(|t| {
-                // Require base and target; skip stale, anomaly, or contract-address tickers.
-                let base = t["base"].as_str()?.to_string();
-                let target = t["target"].as_str()?.to_string();
-                let is_stale = t["is_stale"].as_bool().unwrap_or(false);
-                let is_anomaly = t["is_anomaly"].as_bool().unwrap_or(false);
-                if is_stale
-                    || is_anomaly
-                    || is_contract_address(&base)
-                    || is_contract_address(&target)
-                {
-                    return None;
-                }
-                let venue = t["market"]["identifier"].as_str().map(|s| s.to_string());
-                // Treat missing / null converted_volume.usd as 0.0 for ordering.
-                let volume_usd = t["converted_volume"]["usd"].as_f64().unwrap_or(0.0);
-                Some((
-                    volume_usd,
-                    MarketSearchResult {
-                        base,
-                        quote: target,
-                        venue,
-                    },
-                ))
+        // F-28: iterate the JSON array by reference — no deep-clone before read-only use.
+        let mut results: Vec<(f64, MarketSearchResult)> = body["tickers"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        // Require base and target; skip stale, anomaly, or contract-address.
+                        let base = t["base"].as_str()?.to_string();
+                        let target = t["target"].as_str()?.to_string();
+                        let is_stale = t["is_stale"].as_bool().unwrap_or(false);
+                        let is_anomaly = t["is_anomaly"].as_bool().unwrap_or(false);
+                        if is_stale
+                            || is_anomaly
+                            || is_contract_address(&base)
+                            || is_contract_address(&target)
+                        {
+                            return None;
+                        }
+                        let venue = t["market"]["identifier"].as_str().map(|s| s.to_string());
+                        // Treat missing / null converted_volume.usd as 0.0 for ordering.
+                        let volume_usd = t["converted_volume"]["usd"].as_f64().unwrap_or(0.0);
+                        Some((
+                            volume_usd,
+                            MarketSearchResult {
+                                base,
+                                quote: target,
+                                venue,
+                            },
+                        ))
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         // Order by converted_volume.usd descending; NaN treated as equal.
         results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -787,7 +792,20 @@ fn normalise_coin_detail(detail: CgCoinDetail) -> CoinMeta {
         .market_data
         .as_ref()
         .and_then(|md| md.max_supply.as_ref())
-        .and_then(|n| decimal_from_number(n).ok());
+        .and_then(|n| match decimal_from_number(n) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                // F-27: keep the .ok()->None degradation target unchanged, but no longer
+                // silently — align optional-field strictness one way (REQ-PROV-076).
+                tracing::debug!(
+                    coin_id = %detail.id,
+                    value = %n,
+                    error = %e,
+                    "unparseable max_supply; degrading to None"
+                );
+                None
+            }
+        });
 
     CoinMeta {
         coin_id: detail.id,
@@ -1919,6 +1937,31 @@ mod tests {
         assert_eq!(meta.max_supply, Some(dec!(21000000)));
         assert_eq!(meta.genesis_date, NaiveDate::from_str("2009-01-03").ok());
         assert_eq!(meta.homepage.as_deref(), Some("https://bitcoin.org"));
+    }
+
+    /// Scenario 6 (REQ-PROV-076, F-27): an unparseable `max_supply` keeps its `.ok()`->None
+    /// degradation TARGET (it is NOT converted to anything else) while the item survives —
+    /// the change is that the degradation now emits a `debug!` instead of being silent.
+    #[test]
+    fn coin_detail_unparseable_max_supply_degrades_to_none_item_survives() {
+        let detail = CgCoinDetail {
+            id: "overflowcoin".to_string(),
+            symbol: "ovf".to_string(),
+            name: "Overflow".to_string(),
+            categories: None,
+            description: None,
+            links: None,
+            platforms: None,
+            market_data: Some(CgMarketData {
+                // 1e50 overflows Decimal in both from_str and from_scientific.
+                max_supply: Some(serde_json::from_str("1e50").expect("json number")),
+            }),
+            genesis_date: None,
+        };
+        let meta = normalise_coin_detail(detail);
+        // The item survives; max_supply degrades to None (target unchanged).
+        assert_eq!(meta.coin_id, "overflowcoin");
+        assert!(meta.max_supply.is_none());
     }
 
     // ── HTTP tests via wiremock (offline, no real network) ────────────────────

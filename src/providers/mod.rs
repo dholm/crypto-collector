@@ -184,6 +184,13 @@ pub enum ProviderError {
     #[error("capability {0:?} not supported by provider")]
     NotSupported(Capability),
 
+    /// A non-empty provider chain had NO member capable of the requested capability — every
+    /// provider was skipped as `Unsupported` (F-26). Distinct from the genuinely-empty-chain
+    /// case, and never surfaced as the misleading `"empty provider chain"` label
+    /// (REQ-PROV-080).
+    #[error("no provider in the chain supports capability {0:?}")]
+    NoCapableProvider(Capability),
+
     #[error("rate limited (HTTP 429) — cooldown required")]
     RateLimited,
 
@@ -426,7 +433,10 @@ pub async fn chain_fetch_ohlc(
     registry: Option<&crate::alarm::HealthRegistry>,
 ) -> (Result<Vec<OhlcCandle>, ProviderError>, Vec<AttemptRecord>) {
     let mut records = Vec::new();
-    let mut last_err = ProviderError::Other(anyhow!("empty provider chain"));
+    // F-26: track whether any provider was actually attempted (vs skipped as Unsupported) so
+    // a non-empty all-unsupported chain reports "no capable provider" instead of the
+    // misleading "empty provider chain" (REQ-PROV-080). None until a real attempt fails.
+    let mut last_err: Option<ProviderError> = None;
 
     for provider in chain {
         if !provider.supports(Capability::Ohlc) {
@@ -464,7 +474,7 @@ pub async fn chain_fetch_ohlc(
                     capability: Capability::Ohlc,
                     outcome: ProviderOutcome::Failure,
                 });
-                last_err = e;
+                last_err = Some(e);
             }
         }
     }
@@ -472,7 +482,15 @@ pub async fn chain_fetch_ohlc(
     if let Some(reg) = registry {
         reg.observe_chain_records(&records);
     }
-    (Err(last_err), records)
+    // Resolve the error: a real provider failure surfaces as-is; otherwise a non-empty chain
+    // that was entirely Unsupported reports "no capable provider" (F-26, REQ-PROV-080), while
+    // a genuinely-empty chain keeps the "empty provider chain" label.
+    let err = match last_err {
+        Some(e) => e,
+        None if chain.is_empty() => ProviderError::Other(anyhow!("empty provider chain")),
+        None => ProviderError::NoCapableProvider(Capability::Ohlc),
+    };
+    (Err(err), records)
 }
 
 /// Try providers in declared order for `fetch_ohlc_range`; return the first provider
@@ -947,10 +965,33 @@ mod tests {
 
         let chain: Vec<Arc<dyn Provider>> = vec![Arc::new(UnsupportedProvider)];
         let market = stub_market();
-        let (_result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].outcome, ProviderOutcome::Unsupported);
+
+        // F-26 (REQ-PROV-080): a NON-empty chain whose every member is Unsupported reports
+        // "no capable provider" — NOT the misleading "empty provider chain" label.
+        match result {
+            Err(ProviderError::NoCapableProvider(Capability::Ohlc)) => {}
+            other => panic!("expected NoCapableProvider(Ohlc) for a non-empty all-unsupported chain, got: {other:?}"),
+        }
+    }
+
+    /// F-26 (REQ-PROV-080): the genuinely-empty-chain case is preserved — it still reports
+    /// "empty provider chain", distinct from the non-empty all-unsupported case above.
+    #[tokio::test]
+    async fn chain_fetch_ohlc_empty_chain_still_reports_empty() {
+        let chain: Vec<Arc<dyn Provider>> = vec![];
+        let market = stub_market();
+        let (result, records) = chain_fetch_ohlc(&chain, &market, 7, 60, None).await;
+
+        assert!(records.is_empty());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("empty provider chain"),
+            "a genuinely empty chain must still report 'empty provider chain', got: {msg}"
+        );
     }
 
     // ── chain_fetch_ohlc_range: skips non-range providers, returns first success ──
