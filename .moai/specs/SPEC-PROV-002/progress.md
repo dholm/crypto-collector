@@ -94,7 +94,7 @@ sandbox (no live Postgres). Gate exit codes are verbatim from the run below.
 
 ```yaml
 run_complete_at: 2026-07-24
-run_commit_sha: pending-backfill   # self-referential — backfilled post-commit
+run_commit_sha: 380150fac06d543d7139bfc17553789f587d98b9   # feat(SPEC-PROV-002): M1
 run_status: pass-with-debt
 ac_pass_count: 5        # AC-PROV-050, AC-PROV-055, AC-PROV-058, AC-PROV-060, AC-PROV-QG (Sub-5c pure core PASS)
 ac_fail_count: 0
