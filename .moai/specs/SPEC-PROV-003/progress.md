@@ -111,7 +111,7 @@ push_state: not-pushed              # orchestrator owns push + live-DB verify + 
 
 ```yaml
 sync_complete_at: 2026-07-24
-sync_commit_sha: PENDING-BACKFILL   # this commit's own SHA; backfilled by a follow-up chore commit (SPEC-PROV-002 precedent)
+sync_commit_sha: a39f9b572fb02b796c2dae9b37479e20df6a0f04
 sync_status: pass-with-debt          # sync-auditor PASS-WITH-DEBT ~= 0.91; held at implemented, not completed
 sync_auditor_verdict: "PASS-WITH-DEBT ~= 0.91 (4-dim: Func 92 / Sec 90 / Craft 88 / Consist 93)"
 changelog_entry_position: "Unreleased > Fixed, immediately above the SPEC-PROV-002 entry"
