@@ -2,7 +2,7 @@
 id: SPEC-API-005
 title: "API Contract Fixes, Query Bounds & Schema Truth"
 version: "0.1.0"
-status: in-progress
+status: implemented
 created: 2026-07-27
 updated: 2026-07-27
 author: dholm

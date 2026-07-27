@@ -135,4 +135,46 @@ m1_to_mN_commit_strategy: per-milestone (M1..M8, one commit each; direct-to-main
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — populated by manager-docs>_
+```yaml
+sync_complete_at: 2026-07-27
+sync_commit_sha: pending-backfill-sync-commit   # backfilled in a follow-up commit (self-referential-hazard workaround, D3)
+sync_status: implemented-pending-db   # held at `implemented`; NOT advanced to `completed`
+frontmatter_status_transitions:
+  spec_md: in-progress -> implemented
+  plan_md: unchanged (frontmatter status field not tracked on plan.md)
+  acceptance_md: unchanged (frontmatter status field not tracked on acceptance.md)
+  progress_md: this file, §E.4 populated
+changelog_entry_position: CHANGELOG.md [Unreleased] > ### Fixed, first entry (above SPEC-PROV-003)
+mx_validation:
+  anchors_touched: 2   # quotes.rs coin_quotes ts-bound @MX:ANCHOR/@MX:WARN; models/quote.rs CoinCandle @MX:ANCHOR
+  malformed_found: 0
+```
+
+**Held-at-`implemented` rationale**: 10 DB-gated ACs (AC-API-400/401/402/403/404/405/406/407/408/415)
+plus global AC G3 (`tests/db_integration.rs` full-suite run) compile and are correct-by-construction
+(`#[ignore]`-marked) but were **not executed** in this sync session — no live Postgres instance was
+available. This mirrors the SPEC-PROV-002/SPEC-PROV-003 precedent: a SPEC whose non-DB-gated scope
+is fully green (`cargo fmt --check`, `cargo clippy -D warnings`, `cargo test` all exit 0) is held at
+`implemented` rather than advanced to `completed` until the DB-gated ACs are actually run against a
+live database.
+
+**Path to `completed`**: run the DB-gated test suite against a live PostgreSQL instance —
+
+```bash
+DATABASE_URL=postgres://... cargo test -- --ignored --test-threads=1
+```
+
+(the `--test-threads=1` requirement is load-bearing: the DB-gated tests share a global claim queue
+and MUST run serially). On green, advance `spec.md` `status: implemented -> completed`, bump
+`updated:`, and backfill `sync_commit_sha` in this section per the D3 self-referential-hazard
+workaround.
+
+**@MX validation (this sync session)**: verified the two @MX anchors touched by this SPEC —
+(1) `src/api/quotes.rs` — the `coin_quotes` ts-bound `@MX:ANCHOR` (generalized in M1 to cover all
+three readers: `get_latest_quote`, `list_quotes`, `list_latest_quotes`, no exemption) paired with an
+`@MX:WARN` sub-line and an `@MX:SPEC SPEC-API-004 REQ-API-305 SPEC-API-005 REQ-API-404` line — both
+carry `@MX:REASON` per the mandatory-field rule for WARN/ANCHOR; well-formed. (2) `src/models/quote.rs`
+— the `CoinCandle` `@MX:ANCHOR` rewritten in M8 to describe the post-migration-0020 flat-table
+btree+BRIN index contract (contrasted against the still-partitioned `CoinQuote` anchor above it);
+carries `@MX:REASON`; well-formed. 0 malformed tags found. No new `@MX:TODO`/`@MX:DEBT` introduced
+this SPEC that require a ceiling/upgrade sub-line.

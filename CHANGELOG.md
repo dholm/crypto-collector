@@ -8,6 +8,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **SPEC-API-005** — API contract fixes, query bounds & schema truth
+  (`src/api/{quotes,extract,coins,candles,cycle_overlay,websocket,mod}.rs`,
+  `src/models/quote.rs`, `tests/{db_integration,migration_files}.rs`):
+  - **F-29** (D1): `get_latest_quote` and `list_quotes` ignored `vs_currency` on read — every
+    quote read implicitly assumed `usd`, silently returning wrong-currency rows for any other
+    `vs_currency`. Fixed: both handlers now bind `vs_currency` (`.unwrap_or("usd")`, no
+    allow-list — an unrecognised currency matches no rows, a 200 empty page, never a 400)
+    (REQ-API-400/401).
+  - **F-30** (D1/D6): quote reads had no upper-bound-on-staleness contract and no explicit
+    window, violating the codebase's own partition-pruning invariant (coin_quotes is
+    `PARTITION BY RANGE(ts)`, 48 monthly partitions). Fixed: `get_latest_quote` now 404s when
+    the latest quote is older than 48h ("no *current* quote", not "no quote ever"); `list_quotes`
+    defaults to a 48h trailing window anchored on `end` when supplied
+    (`COALESCE($end, now()) - interval '48 hours'`) else `now()` — resolving D1/OR-API5-1 — and
+    a duplicate-`ts`-across-currencies keyset row-loss bug is fixed alongside (REQ-API-402/403).
+  - **F-31** (aggregation reachability): the candle-aggregation fallback path had no `end`
+    bound, so a far-past window could be unreachable, and a cap-hit-but-empty page silently
+    terminated pagination instead of continuing. Fixed: `list_candles` aggregation now carries
+    an explicit `end`-bound and a cap-cursor sourced from the underlying bucket, so a
+    cap-hit-but-empty page continues rather than dropping (REQ-API-405/406).
+  - **F-32** (idempotent registration): concurrent duplicate coin-registration requests could
+    race between the existence check and the insert, risking a 500 or a torn insert/enqueue.
+    Fixed: registration now uses `ON CONFLICT` inside a single transaction — concurrent
+    duplicates yield exactly one 201 + one 200, never a 500, and the insert + collection-queue
+    enqueue are atomic (REQ-API-407/408).
+  - **F-33/F-34** (uniform error bodies + search 503): rejected/malformed extractor input
+    (body/query/path) produced inconsistent, non-JSON error shapes across handlers, and
+    upstream pacer/credit exhaustion during search leaked as a generic 500. Fixed: new
+    `ApiJson`/`ApiQuery`/`ApiPath` `#[derive(FromRequest)]` wrappers (chosen over
+    `axum-extra::WithRejection` — no new dependency, D2) funnel every handler's rejection
+    through a uniform JSON `ApiError` body (`From<{Json,Query,Path}Rejection>`); search now maps
+    pacer-cooldown and credit-exhaustion upstream errors to 503, leaving a true empty result as
+    200 (REQ-API-409/410/411).
+  - **F-35** (`as_of` concurrency ceiling): the cycle-overlay `as_of` recompute path had no
+    concurrency bound — the most plausible self-inflicted DoS vector, since each request
+    re-runs `load_daily_series` + `compute_overlay` + projection over the full series. Fixed: a
+    `tokio::sync::Semaphore` ceiling now bounds concurrent recomputes, released on drop
+    (REQ-API-412).
+  - **F-36** (WebSocket read loop): the WebSocket handler only wrote to clients (broadcast → 
+    socket) and never read from the socket, so a client-initiated `Close` frame was never
+    observed and the server-side stream task leaked. Fixed: `handle_stream` is now a
+    bidirectional `select!` loop — it polls `socket.recv()` (client frames/Close/pong) alongside
+    `rx.recv()` (broadcast payload) and a ping interval, terminating the task on `Close` or
+    socket error (REQ-API-413).
+  - **F-57/F-58** (schema truth): the `CoinCandle` `@MX:ANCHOR` still described the table as
+    monthly-`RANGE`-partitioned after migration `0020_coin_candles_departition.sql` flattened it
+    to a plain table, and `tests/db_integration.rs` retained stale scenarios asserting the
+    removed `live_quotes` table. Fixed: the anchor now documents the flat-table btree+BRIN index
+    contract (contrasted against the still-partitioned `CoinQuote`), and `db_integration.rs` was
+    rewritten to 16 `#[ignore]` scenarios matching current schema — no more asserts against
+    removed tables (REQ-API-414/415).
+  - **F-59** (parameter-parity test): no test enforced that every OpenAPI-documented query
+    parameter had a matching struct field (or vice versa) per operation, so a handler could
+    silently drift from `api/crypto-collector.yaml`. Fixed:
+    `openapi_query_params_have_matching_struct_fields` — verified RED once against a
+    documented-but-unimplemented param, then GREEN (REQ-API-417); `all_migration_files_exist`
+    (`tests/migration_files.rs`) renamed and extended to cover migrations 0001–0021
+    (REQ-API-416).
+
+  18 requirements-mapped acceptance criteria (AC-API-400..417) covering REQ-API-400..417, plus
+  4 global ACs (G1 parameter-parity green, G2 ts-bound grep PASS, G3 db_integration full-suite
+  DEFERRED, G4 fmt/clippy/test PASS). Sandbox-verifiable ACs (AC-API-409/410/411/412/413/414/
+  416/417 + G1/G2/G4) are PASS with evidence — `cargo fmt --check` exit 0, `cargo clippy
+  --all-targets --all-features -- -D warnings` exit 0, `cargo test` exit 0 (661 lib + 12
+  model_serde + 21 migration_files + 8 alarm_docs_parity + 2 backtest_projection passed; 16
+  db_integration `#[ignore]`d). 10 DB-gated ACs (AC-API-400/401/402/403/404/405/406/407/408/415
+  + G3) **compile but were not executed** in this environment (no live Postgres available);
+  deferred to a live-Postgres verification pass (`DATABASE_URL=... cargo test -- --ignored
+  --test-threads=1`). No new endpoint, no new migration, no new dependency, no `f64` in any
+  monetary path, keyset cursors stay opaque/decode-compatible (D10).
+
 - **SPEC-PROV-003** — Provider data correctness & tier configuration
   (`src/config.rs`, `src/providers/{coingecko,binance,mod}.rs`,
   `migrations/0021_coingecko_range_interval_canonicalise.sql`,
