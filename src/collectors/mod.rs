@@ -5,6 +5,21 @@
 //! - `collection_queue`: dispatches candles, metadata, market, and derivative tasks.
 //! - `backfill`: fetches historical OHLC ranges from the `backfill_chunks` table.
 //!
+//! # Shared lease-queue scaffold (SPEC-REFACTOR-001 M3)
+//!
+//! `collection_queue` and `backfill` both run their claim/heartbeat/complete/release
+//! lifecycle through [`lease_worker::run_lease_worker`] — the single parameterized
+//! scaffold that replaced the two prior near-duplicate implementations. The heartbeat
+//! task is stopped via a `tokio::sync::watch` signal, not `abort()` (REQ-REFACTOR-031).
+//!
+//! # Batched candle writes + NOTIFY policy (SPEC-REFACTOR-001 M4)
+//!
+//! Both the `collection_queue` candles-dispatch path and the `backfill` page-write path
+//! write through the shared [`crate::db::batched_upsert_coin_candles`] UNNEST batcher
+//! instead of per-row upserts. The live-poll path still emits one `pg_notify` per event;
+//! the backfill path emits **none**, so historical rows no longer flood the WebSocket
+//! broadcast (REQ-REFACTOR-042, an intended behavior change).
+//!
 //! # Supervision (REQ-SCHED-050/051)
 //!
 //! Each worker runs in its own `tokio::spawn()` for panic isolation. The supervisor

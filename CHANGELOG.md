@@ -6,6 +6,67 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **SPEC-REFACTOR-001** — Phase 7: Batching & structural debt reduction
+  (`src/providers/{mod,coinbase,kraken}.rs`, `src/collectors/{lease_worker,collection_queue,backfill,live_poller,cycle_overlay}.rs`,
+  `src/db/{upserts,candles}.rs`, `src/api/{mod,quotes,metadata,coins,cursor,candles}.rs`,
+  `src/models/interval.rs`, `src/models/query.rs`):
+  a behavior-preserving consolidation of the duplication the project's idiomatic-Rust review
+  identified as "the dominant idiomatic debt and the proven source of every confirmed drift bug",
+  landed in six milestones with **exactly two intended behavior changes**:
+  - **M1 — Provider trait capability-derived defaults (F-50)**: every `Provider` fetch method now
+    has a capability-derived default body (`Err(NotSupported(..))`, or `Ok(vec![])` for the
+    `search_coins`/`fetch_coin_tickers` pair); only `name()`/`supports()` remain mandatory.
+    `coinbase.rs`/`kraken.rs` shed ~450 lines of dead `NotSupported` stubs; trait object-safety
+    preserved (`Arc<dyn Provider>` unchanged).
+  - **M2 — `chain_try` + per-provider pacing (F-53a, F-16 — intended change (a))**: one generic
+    `chain_try<T>(chain, capability, registry, f)` replaces the four duplicated non-OHLC fallback
+    loops (spot / spot_local / coin_metadata / coin_market), owning `HealthRegistry` bookkeeping.
+    **Behavior change**: the pacer slot is now acquired for the provider that actually serves a
+    fallback request, not the first capability-supporting member in the chain — fallback traffic
+    is now honestly paced/charged to the serving provider. The two OHLC chains
+    (`chain_fetch_ohlc{,_range}`) keep their distinct continue-on-empty semantics untouched.
+  - **M3 — Shared lease-queue scaffold (F-53b)**: `collection_queue` and `backfill` now share one
+    parameterized claim/heartbeat/complete/release scaffold; the heartbeat task is stopped via a
+    `tokio::sync::watch` signal instead of `abort()`.
+  - **M4 — Batched writes + NOTIFY policy (F-51 — intended change (b), F-52)**: a shared
+    UNNEST-based batched candle upsert (generalized from `rollup::batched_upsert_candles`) now
+    backs both the live-poll candles dispatch path and the backfill page-write path — live writes
+    now commit per page instead of per row. **Behavior change**: the backfill path emits **no**
+    `pg_notify` (historical rows no longer flood the WebSocket broadcast); the live-poll path is
+    unchanged (one NOTIFY per event). The two UNNEST conflict policies remain distinct: the native
+    write path uses an unconditional `DO UPDATE`, while the rollup path retains its
+    `WHERE coin_candles.source LIKE 'rollup:%'` native-wins guard — the two are never conflated.
+    `recompute_cycle_overlay` now batches its inserts via UNNEST per model group inside the
+    existing single-transaction rebuild.
+  - **M5 — API deduplication (F-53c, F-55)**: one shared `ensure_coin_exists`, one `concat!`
+    -assembled `tracked_coins` column-list const (replacing 5 inlined copies), one generic
+    `paginate<T, K: Serialize>` (replacing three near-duplicate paginators), the two dead
+    `AppState` fields (`http_client`, `coingecko_base_url`) removed, and a shared
+    `#[cfg(test)] AppState::test()` constructor replacing 6+ duplicated test-state builders.
+  - **M6 — Domain typing (F-54, F-56)**: `SUPPORTED_INTERVALS` and `interval_to_seconds` are both
+    removed and fold into a single `ApiInterval` enum covering the full fixed-duration interval
+    vocabulary (API-facing + storage-only), with a **total** `secs()` (no `.expect`, no
+    `Option`-panic path) and an `is_api_facing()` boundary predicate — the public API still
+    returns 400 for a storage-only interval (e.g. `3m`), identical to the prior behavior. The
+    `MarketQuery { market_id: 0 /* dummy */ }` sentinel (4 sites) is replaced by a keyed
+    `CoinKeyed { coin_id, symbol } | MarketKeyed { market_id }` enum, making the dummy
+    unrepresentable. `F-56`: provider chain type is now `Arc<[Arc<dyn Provider>]>`; dead
+    `CgMarketItem.vs_currency` field removed; legacy `coingecko_days_to_interval` helper removed
+    (tests migrated).
+
+  **Operator-relevant consequence**: live candle writes now commit per page rather than per row
+  and the prior per-candle write-duration histogram observation is superseded by the batched
+  write path (no per-row timing sample); backfill writes are silent on the WebSocket channel.
+
+  All 34 acceptance scenarios (AC-REFACTOR-010..083) pass. `cargo fmt --check` exit 0,
+  `cargo clippy --all-targets --all-features -- -D warnings` exit 0, `cargo test` exit 0 (748
+  non-DB-gated tests pass, 100 DB-gated tests remain `#[ignore]`d pending a live-Postgres
+  `--test-threads=1` verification pass — this SPEC is held at `implemented`, not `completed`,
+  per the SPEC-PROV-002/003 / SPEC-API-005 / SPEC-OBS-002 close pattern). No new dependency
+  added; no f64 introduced for monetary values; config remains env-only.
+
 ### Fixed
 
 - **SPEC-OBS-002** — Lifecycle, shutdown & observability integrity
