@@ -116,7 +116,31 @@ baseline_test_delta: "lib 661→681 (+20 tests); bin 8→9 (net: +4 run-phase, �
 
 ## §E.4 Sync-phase Audit-Ready Signal
 
-_<pending sync-phase — owned by manager-docs>_
+```yaml
+sync_complete_at: 2026-07-27
+sync_commit_sha: pending-backfill-obs002-sync
+sync_status: PASS
+b12_self_test_a: "grep -c 'SPEC-OBS-002' CHANGELOG.md → 0 (pre-emission), 1 (post-emission)"
+b12_self_test_b: "acceptance.md AC-ID count (grep -oE '\\*\\*AC-[A-Z]+-[0-9]+\\*\\*|\\*\\*G[0-9]\\*\\*') = 20; CHANGELOG entry cites 20"
+b12_self_test_c: "all 15 file paths + tests/alarm_docs_parity.rs verified via ls before commit — all present"
+changelog_entry_position: "CHANGELOG.md [Unreleased] > Fixed, immediately above the SPEC-API-005 entry"
+frontmatter_status_transitions:
+  spec_md: "in-progress -> completed (single sync commit; updated: unchanged 2026-07-27, same-day close)"
+  plan_md: "no frontmatter block (plan-phase artifact, no status field)"
+  acceptance_md: "no frontmatter block (plan-phase artifact, no status field)"
+  progress_md: "no frontmatter block; this §E.4 entry is the sync-phase signal"
+mx_tag_validation:
+  status: PASS
+  inventory: "metrics/mod.rs QUOTE/CANDLE_INSERT_DURATION_SECONDS consts ANCHOR+REASON+NOTE(rename)+SPEC; collectors/mod.rs run_supervised ANCHOR+REASON+WARN(healthy-reset)+REASON+SPEC; main.rs shutdown sequence ANCHOR+REASON+WARN(3 tasks)+REASON+SPEC, pool.close/telemetry.shutdown WARN+REASON+SPEC; health/mod.rs check_readiness WARN+REASON+SPEC; config.rs Tier ANCHOR (pre-existing) + NOTE(warn-vs-fail-fast split)+SPEC; listener.rs pre-existing WARN+REASON+SPEC (F-39 retry now matches doc); alarm/reconciler.rs pre-existing ANCHOR+REASON + WARN+REASON; telemetry/mod.rs ANCHOR+REASON+SPEC + NOTE(OtelMakeSpan placement)+SPEC(OBS-002 REQ-OBS-074)"
+  gaps: "none — all plan.md §MX targets present and well-formed; every WARN/ANCHOR carries @MX:REASON"
+docs_sync:
+  observability_docs: "no separate metrics-catalogue doc found outside src/ (docs/ has only alarms.md, prediction-research.md — neither references metric names); the src/metrics/mod.rs module-header catalogue (already updated in run-phase, includes the operator-visible rename note) is the canonical catalogue — no additional doc update required"
+canary_compliance_check:
+  applicable: false
+  note: "SPEC-OBS-002 does not define a forward-looking policy that tests its own sync — no canary check applicable"
+```
+
+**Residual (non-blocking, deferred):** AC-OBS-064 and AC-OBS-073 optional DB-gated variants (kill-the-DB-then-start relay retry; live special-character-password connect against real Postgres) remain deferred per project convention (`DATABASE_URL=... cargo test -- --ignored --test-threads=1`). Non-DB-gated primary paths for both PASS; this does not block `completed` per the close-to-completed rationale (all ACs' PRIMARY paths pass, unlike the DB-gated-is-primary precedent in SPEC-PROV-002/003).
 
 ## §F Phase 4 Mode Selection
 

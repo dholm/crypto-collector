@@ -8,6 +8,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **SPEC-OBS-002** — Lifecycle, shutdown & observability integrity
+  (`src/{metrics/mod,db/upserts,db/pool,db/mod,collectors/mod,collectors/live_poller,alarm/registry,alarm/reconciler,main,health/mod,config,listener,telemetry/mod,api/mod}.rs`,
+  `tests/alarm_docs_parity.rs`):
+  - **F-38/F-61 metric-name SSOT + operator-visible rename** (REQ-OBS-060/061): the
+    persistence-latency histograms were *emitted* as `coin_quote_insert_duration_seconds` /
+    `coin_candle_insert_duration_seconds` while being *described* under the canonical
+    `quote_insert_duration_seconds` / `candle_insert_duration_seconds` names — a ghost-metric
+    describe/emit mismatch. Fixed: both names are now shared `pub const`s
+    (`QUOTE_INSERT_DURATION_SECONDS` / `CANDLE_INSERT_DURATION_SECONDS` in `src/metrics/mod.rs`)
+    bound by both `describe_all()` and every emitter, structurally closing the drift; a new
+    describe/emit parity test pins the contract. **Operator-visible**: external Grafana
+    dashboards/alerts keyed on the old `coin_*`-prefixed series MUST be updated to the canonical
+    names above.
+  - **F-49 `tracked_markets` ghost removal** (REQ-OBS-062/074): a vestigial negative test
+    assertion referencing the long-dropped `tracked_markets` table (removed by migration
+    `0011_remove_markets.sql`) was removed; the `tracked_coins` gauge is unchanged.
+  - **F-39/F-46 generic supervisor + capped backoff + relay supervision** (REQ-OBS-063/064/065):
+    four near-duplicate `run_supervised_{live_poller,queue_worker,backfill_worker,reconciler}`
+    functions are replaced by one generic `run_supervised(name, registry, shutdown, make_future)`
+    with exponential backoff (1s initial, 30s cap, 60s healthy-run reset). The cross-replica
+    relay listener's initial-connect failure previously returned permanently; it now retries
+    under the same capped-backoff supervisor.
+  - **F-41/F-47 bounded shutdown drain + airtight shutdown arms** (REQ-OBS-066/067/068): the
+    shutdown drain previously had no timeout — a wedged worker future could block shutdown
+    indefinitely. Fixed: `tokio::time::timeout(drain_secs, supervisor)` bounds the drain, with
+    `pool.close()`/`telemetry::shutdown()` guaranteed on both the drained and timed-out paths;
+    every shutdown-`select!` arm now breaks (rather than hot-spinning) when the shutdown watch
+    sender is dropped without sending `true`. The pre-existing 15s endpoint-removal grace sleep
+    and broadcast-before-drain ordering are preserved.
+  - **F-43/F-44 exact readiness** (REQ-OBS-069/070): readiness previously could flip `ready`
+    before the API listener actually bound, and the 2s readiness cache could serve a stale `200`
+    for up to 2s into a shutdown. Fixed: `set_ready()` now follows `TcpListener::bind` + relay
+    spawn (only `axum::serve` comes after); `check_readiness` consults the shutting-down flag
+    before the cache fast-path, so shutdown-time reads are `503` immediately regardless of cache
+    freshness.
+  - **F-45 config diagnostics** (REQ-OBS-071/072): a present-but-unparseable env var previously
+    silently fell back to its default. Fixed: unparseable values now emit a `tracing::warn!`
+    naming the variable and fallback used; the pacer-cooldown variable (dangerous to mis-set)
+    fails fast instead of silently defaulting.
+  - **F-40 credential-safe DB connection** (REQ-OBS-073): the database connection was assembled
+    via URL-string interpolation from `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USERNAME`/`DB_PASSWORD`,
+    corrupting passwords containing `@ / : # %` or spaces. Fixed: the connection is now built
+    from `sqlx::postgres::PgConnectOptions` set field-by-field (never re-parsed as a URL); the
+    `DATABASE_URL` override path is unchanged.
+  - **F-42/F-48 alarm signal quality** (REQ-ALARM-080/081/082): the Critical
+    `all_providers_down` alarm previously flipped on a single coin's failure among otherwise
+    healthy sweeps. Fixed: it now raises only after the whole provider chain fails continuously
+    for a sustained 180s window, and is not suppressed by a single mid-outage success.
+    `observe_chain_records`'s doc comment was corrected to match its implementation (code is
+    authoritative: it derives only the chain-outcome signal and does not touch the per-provider
+    network-failure streak, which counts only `ProviderError::Network` failures per
+    REQ-ALARM-020); two new parity tests in `tests/alarm_docs_parity.rs` pin the contract. The
+    reconciler ticker now uses `MissedTickBehavior::Skip` (consistent with `live_poller`).
+  - **F-49 dead-surface cleanup** (REQ-OBS-074): the duplicate `main.rs` copy of
+    `HeaderExtractor` was removed (one canonical copy remains in `src/telemetry/mod.rs`,
+    alongside `OtelMakeSpan` which was relocated there); the dead, unreachable
+    `start_api_server` function was deleted.
+
+  18 requirements-mapped acceptance criteria (AC-OBS-060..074, AC-ALARM-080/081/082) plus 2
+  global gates (G1 quality gates, G2 rename operator-visibility) — all 20 PASS. `cargo test`
+  exit 0 (lib 661→681, +20 tests), `cargo clippy --all-targets --all-features -- -D warnings`
+  exit 0, `cargo fmt --check` exit 0. No new dependency added, no new endpoint, no new
+  migration. Two optional DB-gated variants (kill-the-DB-then-start relay retry, live
+  special-character-password connect) remain deferred to a live-Postgres verification pass —
+  the non-DB-gated primary paths for both PASS.
+
 - **SPEC-API-005** — API contract fixes, query bounds & schema truth
   (`src/api/{quotes,extract,coins,candles,cycle_overlay,websocket,mod}.rs`,
   `src/models/quote.rs`, `tests/{db_integration,migration_files}.rs`):

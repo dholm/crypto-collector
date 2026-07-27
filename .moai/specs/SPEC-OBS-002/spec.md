@@ -2,7 +2,7 @@
 id: SPEC-OBS-002
 title: "Lifecycle, Shutdown & Observability Integrity"
 version: "0.1.0"
-status: in-progress
+status: completed
 created: 2026-07-27
 updated: 2026-07-27
 author: dholm
