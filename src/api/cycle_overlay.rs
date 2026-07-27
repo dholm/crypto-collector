@@ -18,9 +18,12 @@
 //! `{model}` (including `real`) is validated BEFORE dispatch and returns HTTP 400
 //! (REQ-CYCLE-093/094).
 
+use std::sync::LazyLock;
+
 use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CycleOverlayKey},
@@ -30,6 +33,19 @@ use super::{
 };
 use crate::collectors::cycle_overlay::OverlayPoint;
 use crate::models::cycle_overlay::CycleOverlayPoint;
+
+/// Concurrency ceiling for the per-request `as_of` full-history recompute (F-35, REQ-API-412).
+///
+// @MX:WARN: [AUTO] as_of recompute concurrency ceiling — the most plausible self-inflicted
+//           resource-exhaustion vector on the 256 Mi pod.
+// @MX:REASON: each `as_of` request re-runs load_daily_series + compute_overlay + projection over
+//             the coin's FULL daily history (no memoization, D4). Without a ceiling, N concurrent
+//             as_of requests issue N simultaneous full-history recomputes → OOM risk on the small
+//             pod. A module-level Semaphore (not an AppState field — OR-API5-4, avoids taxing every
+//             test constructor) caps concurrent recomputes; permit count 4 is a conservative
+//             default tuning parameter. Excess requests wait for a permit rather than piling on.
+// @MX:SPEC: SPEC-API-005 REQ-API-412
+static AS_OF_RECOMPUTE_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
 
 // ── Projection model (v0.6.0, single source of truth, OR-CYCLE-9) ──────────────
 
@@ -270,6 +286,13 @@ async fn compute_as_of_page(
     projected_model: &str,
 ) -> ApiResult<Vec<CycleOverlayPoint>> {
     use crate::collectors::cycle_overlay::{compute_overlay, load_daily_series};
+
+    // Bound concurrent full-history recomputes (F-35/REQ-API-412). The permit is held for the
+    // load + compute + projection and released on return (RAII drop of `_permit`). The static
+    // Semaphore is never closed, so acquire only errors in an unreachable close scenario.
+    let _permit = AS_OF_RECOMPUTE_PERMITS.acquire().await.map_err(|e| {
+        ApiError::Internal(anyhow::anyhow!("as_of recompute semaphore closed: {e}"))
+    })?;
 
     let daily = load_daily_series(pool, coin_id, vs_currency, Some(as_of)).await?;
     let real = compute_overlay(daily.clone());
@@ -821,6 +844,34 @@ mod tests {
             as_of: None,
         };
         assert!(params.as_of.is_none());
+    }
+
+    // SPEC-API-005 M6 (F-35, REQ-API-412): the as_of recompute path is concurrency-bounded by a
+    // Semaphore, and the permit is released on drop (RAII), so the ceiling is reusable across
+    // requests. Functional guard on the ceiling itself (the full recompute is DB-gated).
+    #[tokio::test]
+    async fn as_of_recompute_semaphore_is_bounded_and_released_on_drop() {
+        let total = AS_OF_RECOMPUTE_PERMITS.available_permits();
+        assert!(
+            total >= 1,
+            "the as_of recompute must carry a bounded concurrency ceiling (>= 1 permit)"
+        );
+        {
+            let _permit = AS_OF_RECOMPUTE_PERMITS
+                .acquire()
+                .await
+                .expect("static semaphore is never closed");
+            assert_eq!(
+                AS_OF_RECOMPUTE_PERMITS.available_permits(),
+                total - 1,
+                "acquiring a permit must reduce the available count"
+            );
+        }
+        assert_eq!(
+            AS_OF_RECOMPUTE_PERMITS.available_permits(),
+            total,
+            "the permit must be released on drop so the ceiling is reusable"
+        );
     }
 
     // `OverlayPoint` → `CycleOverlayPoint` mapping preserves every field, including bands.
