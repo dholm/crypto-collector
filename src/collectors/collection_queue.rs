@@ -35,9 +35,7 @@ use crate::db::upserts::{
 };
 use crate::models::quote::CoinCandle;
 use crate::pacer::{acquire_slot, AcquireSlotError};
-use crate::providers::{
-    Capability, CoinMarket, CoinMeta, MarketQuery, OhlcCandle, Provider, ProviderError, SpotQuote,
-};
+use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
 use crate::shutdown::shutdown_arm_should_break;
 
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
@@ -352,121 +350,6 @@ async fn chain_fetch_ohlc_local(
     result
 }
 
-async fn chain_fetch_spot_local(
-    chain: &[Arc<dyn Provider>],
-    market: &MarketQuery,
-    registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<SpotQuote, ProviderError> {
-    let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
-    let mut attempted = false;
-    for p in chain {
-        if !p.supports(Capability::Spot) {
-            continue;
-        }
-        attempted = true;
-        match p.fetch_spot(market).await {
-            Ok(q) => {
-                if let Some(reg) = registry {
-                    reg.record_provider_success(p.name());
-                    reg.record_chain_success();
-                }
-                return Ok(q);
-            }
-            Err(e) => {
-                if let Some(reg) = registry {
-                    if matches!(e, ProviderError::Network(_)) {
-                        reg.record_provider_network_failure(p.name());
-                    }
-                }
-                last_err = e;
-            }
-        }
-    }
-    if attempted {
-        if let Some(reg) = registry {
-            reg.record_chain_all_failed();
-        }
-    }
-    Err(last_err)
-}
-
-async fn chain_fetch_coin_metadata(
-    chain: &[Arc<dyn Provider>],
-    coin_id: &str,
-    registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<CoinMeta, ProviderError> {
-    let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
-    let mut attempted = false;
-    for p in chain {
-        if !p.supports(Capability::CoinMetadata) {
-            continue;
-        }
-        attempted = true;
-        match p.fetch_coin_metadata(coin_id).await {
-            Ok(m) => {
-                if let Some(reg) = registry {
-                    reg.record_provider_success(p.name());
-                    reg.record_chain_success();
-                }
-                return Ok(m);
-            }
-            Err(e) => {
-                if let Some(reg) = registry {
-                    if matches!(e, ProviderError::Network(_)) {
-                        reg.record_provider_network_failure(p.name());
-                    }
-                }
-                last_err = e;
-            }
-        }
-    }
-    if attempted {
-        if let Some(reg) = registry {
-            reg.record_chain_all_failed();
-        }
-    }
-    Err(last_err)
-}
-
-async fn chain_fetch_coin_market(
-    chain: &[Arc<dyn Provider>],
-    coin_id: &str,
-    vs_currency: &str,
-    registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<CoinMarket, ProviderError> {
-    let mut last_err = ProviderError::Other(anyhow::anyhow!("empty chain"));
-    let mut attempted = false;
-    for p in chain {
-        if !p.supports(Capability::CoinMarket) {
-            continue;
-        }
-        attempted = true;
-        match p.fetch_coin_market(coin_id, vs_currency).await {
-            Ok(m) => {
-                if let Some(reg) = registry {
-                    reg.record_provider_success(p.name());
-                    reg.record_chain_success();
-                }
-                return Ok(m);
-            }
-            Err(e) => {
-                if let Some(reg) = registry {
-                    if matches!(e, ProviderError::Network(_)) {
-                        reg.record_provider_network_failure(p.name());
-                    }
-                }
-                last_err = e;
-            }
-        }
-    }
-    if attempted {
-        if let Some(reg) = registry {
-            reg.record_chain_all_failed();
-        }
-    }
-    Err(last_err)
-}
-
 /// Find the first provider supporting `cap`; return its name for pacer pacing.
 fn first_provider_for_cap(chain: &[Arc<dyn Provider>], cap: Capability) -> Option<String> {
     chain
@@ -630,15 +513,6 @@ async fn dispatch_item(
                 }
             };
 
-            match acquire_slot(pool, &provider_name).await {
-                Err(ref e) if pacer_should_skip_queue(e) => {
-                    warn!("queue_worker: pacer skip for item {}: {e}", item.id);
-                    return Ok(DispatchOutcome::SoftSkip);
-                }
-                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
-                Ok(()) => {}
-            }
-
             let mq = MarketQuery {
                 market_id: 0, // dummy; coin-keyed dispatch does not use market_id
                 coin_id: Some(coin_id.clone()),
@@ -648,9 +522,31 @@ async fn dispatch_item(
                 vs_currency: "usd".to_string(),
             };
 
-            // REQ-OBS-012/015: instrument provider call.
+            // REQ-OBS-012/015: instrument provider call. Pacer acquire moves INTO chain_try,
+            // charged per-attempted-provider (F-16, REQ-REFACTOR-021); first_provider_for_cap
+            // above is retained only for the permanent-no-capable check and the metric label
+            // (behavior-preserving, REQ-REFACTOR-080).
             let fetch_start = std::time::Instant::now();
-            let quote_result = chain_fetch_spot_local(chain, &mq, registry).await;
+            let quote_result = crate::providers::chain_try(
+                chain,
+                cap,
+                registry,
+                |name| Box::pin(acquire_slot(pool, name)),
+                |p| Box::pin(p.fetch_spot(&mq)),
+            )
+            .await;
+
+            // A pacer soft-skip releases WITHOUT an attempt and emits NO metric (backpressure is
+            // not a served request); a non-skip pacer error is transient — both bail before the
+            // metric block, exactly as the prior pre-fetch acquire did (REQ-SCHED-060.2/061).
+            if let Err(ProviderError::Pacer(ref e)) = quote_result {
+                if pacer_should_skip_queue(e) {
+                    warn!("queue_worker: pacer skip for item {}: {e}", item.id);
+                    return Ok(DispatchOutcome::SoftSkip);
+                }
+                return Err(DispatchError::Transient(format!("pacer: {e}")));
+            }
+
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if quote_result.is_ok() {
                 "success"
@@ -702,18 +598,27 @@ async fn dispatch_item(
                 }
             };
 
-            match acquire_slot(pool, &provider_name).await {
-                Err(ref e) if pacer_should_skip_queue(e) => {
+            // REQ-OBS-012/015: instrument provider call. Pacer acquire moves INTO chain_try,
+            // charged per-attempted-provider (F-16); first_provider_for_cap is retained only for
+            // the permanent-no-capable check and the metric label (behavior-preserving).
+            let fetch_start = std::time::Instant::now();
+            let meta_result = crate::providers::chain_try(
+                chain,
+                cap,
+                registry,
+                |name| Box::pin(acquire_slot(pool, name)),
+                |p| Box::pin(p.fetch_coin_metadata(coin_id)),
+            )
+            .await;
+
+            if let Err(ProviderError::Pacer(ref e)) = meta_result {
+                if pacer_should_skip_queue(e) {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
                     return Ok(DispatchOutcome::SoftSkip);
                 }
-                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
-                Ok(()) => {}
+                return Err(DispatchError::Transient(format!("pacer: {e}")));
             }
 
-            // REQ-OBS-012/015: instrument provider call.
-            let fetch_start = std::time::Instant::now();
-            let meta_result = chain_fetch_coin_metadata(chain, coin_id, registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if meta_result.is_ok() {
                 "success"
@@ -766,18 +671,27 @@ async fn dispatch_item(
                 }
             };
 
-            match acquire_slot(pool, &provider_name).await {
-                Err(ref e) if pacer_should_skip_queue(e) => {
+            // REQ-OBS-012/015: instrument provider call. Pacer acquire moves INTO chain_try,
+            // charged per-attempted-provider (F-16); first_provider_for_cap is retained only for
+            // the permanent-no-capable check and the metric label (behavior-preserving).
+            let fetch_start = std::time::Instant::now();
+            let snapshot_result = crate::providers::chain_try(
+                chain,
+                cap,
+                registry,
+                |name| Box::pin(acquire_slot(pool, name)),
+                |p| Box::pin(p.fetch_coin_market(coin_id, "usd")),
+            )
+            .await;
+
+            if let Err(ProviderError::Pacer(ref e)) = snapshot_result {
+                if pacer_should_skip_queue(e) {
                     warn!("queue_worker: pacer skip for item {}: {e}", item.id);
                     return Ok(DispatchOutcome::SoftSkip);
                 }
-                Err(e) => return Err(DispatchError::Transient(format!("pacer: {e}"))),
-                Ok(()) => {}
+                return Err(DispatchError::Transient(format!("pacer: {e}")));
             }
 
-            // REQ-OBS-012/015: instrument provider call.
-            let fetch_start = std::time::Instant::now();
-            let snapshot_result = chain_fetch_coin_market(chain, coin_id, "usd", registry).await;
             let fetch_dur = fetch_start.elapsed().as_secs_f64();
             let outcome = if snapshot_result.is_ok() {
                 "success"

@@ -21,6 +21,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::Serialize;
 use sqlx::PgPool;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -634,6 +636,136 @@ pub async fn chain_fetch_ohlc_range(
     }
 }
 
+/// Generic ordered-fallback helper for the four non-OHLC provider chains: try each
+/// capability-supporting provider in declared order and return the first success
+/// (SPEC-REFACTOR-001 REQ-REFACTOR-020, F-53a).
+///
+/// This is the single implementation behind the former `chain_fetch_spot`,
+/// `chain_fetch_spot_local`, `chain_fetch_coin_metadata`, and `chain_fetch_coin_market`
+/// loops. It owns the `HealthRegistry` bookkeeping (per-provider success, per-provider
+/// network-failure, chain success, chain all-failed) exactly as those four loops did.
+///
+/// The OHLC chains ([`chain_fetch_ohlc`], [`chain_fetch_ohlc_range`]) are deliberately NOT
+/// routed through here — they have distinct continue-on-empty / error-surfacing semantics
+/// (SPEC-REFACTOR-001 DEC-1/D5) and remain separate, unmodified functions.
+///
+/// # Per-provider pacing (F-16, INTENDED behavior change (a), REQ-REFACTOR-021)
+///
+/// `pace` is invoked for EACH attempted provider immediately before its fetch, so the pacer
+/// slot is acquired for — and charged to — the provider that actually serves the request,
+/// replacing the prior behavior of keying `acquire_slot` on the *first* capability-supporting
+/// member before the loop (the F-16 mis-attribution). Production wires
+/// `pace = |name| Box::pin(acquire_slot(pool, name))`. A provider that is paced out
+/// (cooldown / credit exhaustion) is SKIPPED and the next provider is tried, so a cooled-down
+/// primary no longer blocks a fallback that still has capacity. Per-provider `signal_cooldown`
+/// on a 429 continues to be handled inside each provider's own `transport::paced` postlude
+/// (SPEC-PROV-002), which — because `chain_try` now attempts the actual serving provider —
+/// fires for the serving provider rather than the first-capable one.
+///
+/// # Error resolution
+///
+/// - a provider success short-circuits and returns immediately (first success wins);
+/// - if any provider was actually fetched and every fetch failed, the last fetch error is
+///   returned and `record_chain_all_failed` fires (a genuine chain failure);
+/// - if every capability-supporting provider was paced out (no fetch attempted), the pacer
+///   error is surfaced as [`ProviderError::Pacer`] so the worker soft-skips WITHOUT recording
+///   a chain failure or consuming its retry budget (backpressure is not a failure);
+/// - a non-empty chain whose members are all unsupported yields
+///   [`ProviderError::NoCapableProvider`], distinct from the genuinely-empty-chain label
+///   (REQ-REFACTOR-023), mirroring the OHLC chains' F-26 distinction.
+///
+/// `registry` follows the same optional, no-op-when-`None` contract as [`chain_fetch_ohlc`].
+///
+// @MX:ANCHOR: [AUTO] chain_try — the single non-OHLC ordered-fallback + per-provider-pacing helper
+// @MX:REASON: fan_in >= 3 — the spot (live_poller + collection_queue), metadata, and market
+//             callers plus the characterization tests all dispatch through this one function.
+//             Declared order IS the fallback priority (D2/REQ-PROV-003); it MUST iterate in
+//             chain order. It owns the HealthRegistry bookkeeping the four former loops carried,
+//             and the empty-vs-all-unsupported error distinction (REQ-REFACTOR-020/023).
+// @MX:WARN: [AUTO] `pace` is the fleet-wide egress-governor enforcement point — it now runs
+//           per ATTEMPTED provider inside the loop (F-16), NOT once on first_provider_for_cap
+//           before it. Do NOT hoist pacing back out of the loop: that reintroduces the
+//           mis-attribution where fallback traffic is unpaced and the failing primary's
+//           credits are burned. A paced-out provider is skipped, never treated as a chain
+//           failure (must not fire record_chain_all_failed on pure backpressure).
+// @MX:REASON: This helper governs upstream egress for every non-OHLC provider call; charging
+//             the wrong provider's credit (or skipping the whole coin when a fallback has
+//             capacity) is the F-16 bug this consolidation exists to fix.
+// @MX:SPEC: SPEC-REFACTOR-001 REQ-REFACTOR-020 REQ-REFACTOR-021 REQ-REFACTOR-023 SPEC-PROV-001 REQ-PROV-003
+pub async fn chain_try<'e, T>(
+    chain: &'e [Arc<dyn Provider>],
+    capability: Capability,
+    registry: Option<&'e crate::alarm::HealthRegistry>,
+    mut pace: impl FnMut(
+        &'e str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<(), crate::pacer::AcquireSlotError>> + Send + 'e>,
+    >,
+    mut fetch: impl FnMut(
+        &'e Arc<dyn Provider>,
+    ) -> Pin<Box<dyn Future<Output = Result<T, ProviderError>> + Send + 'e>>,
+) -> Result<T, ProviderError> {
+    let mut last_fetch_err: Option<ProviderError> = None;
+    let mut last_pace_err: Option<crate::pacer::AcquireSlotError> = None;
+
+    for provider in chain {
+        if !provider.supports(capability) {
+            // Unsupported members are skipped and not recorded (matching the former loops).
+            continue;
+        }
+
+        // Per-attempted-provider pacer acquire (F-16): charged to THIS provider — the one
+        // about to serve — not to the first capability-supporting member.
+        match pace(provider.name()).await {
+            Ok(()) => {}
+            Err(pace_err) => {
+                // Paced out (cooldown / credit) or a pacer-layer error: skip THIS provider and
+                // try the next. Backpressure is NOT a chain failure and is never recorded.
+                last_pace_err = Some(pace_err);
+                continue;
+            }
+        }
+
+        match fetch(provider).await {
+            Ok(v) => {
+                if let Some(reg) = registry {
+                    reg.record_provider_success(provider.name());
+                    reg.record_chain_success();
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if let Some(reg) = registry {
+                    if matches!(e, ProviderError::Network(_)) {
+                        reg.record_provider_network_failure(provider.name());
+                    }
+                }
+                last_fetch_err = Some(e);
+            }
+        }
+    }
+
+    match last_fetch_err {
+        // At least one provider was actually fetched and every attempt failed.
+        Some(e) => {
+            if let Some(reg) = registry {
+                reg.record_chain_all_failed();
+            }
+            Err(e)
+        }
+        None => match last_pace_err {
+            // Every capability-supporting provider was paced out — surface the pacer error so
+            // the worker soft-skips (releases without consuming its retry budget).
+            Some(pace_err) => Err(ProviderError::Pacer(pace_err)),
+            // No provider supported the capability. Distinguish empty vs all-unsupported
+            // (REQ-REFACTOR-023 / F-26): a non-empty all-unsupported chain reports
+            // NoCapableProvider, never the misleading "empty provider chain" label.
+            None if chain.is_empty() => Err(ProviderError::Other(anyhow!("empty provider chain"))),
+            None => Err(ProviderError::NoCapableProvider(capability)),
+        },
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1217,5 +1349,359 @@ mod tests {
                 "{label} fetch_coin_tickers must default to Ok(vec![])"
             );
         }
+    }
+
+    // ── SPEC-REFACTOR-001 M2 (F-53a, F-16): chain_try characterization ───────────
+    //
+    // These are PURE (no DB): chain_try's fallback loop + registry bookkeeping is exercised
+    // via injected `pace` / `fetch` closures, so both pacing and fetching are fully under
+    // test control. Production wires `pace = |name| Box::pin(acquire_slot(pool, name))` and
+    // `fetch = |p| Box::pin(p.fetch_spot(&mq))`; here they are canned so the branch behavior
+    // is asserted without a live PostgreSQL or a live upstream.
+
+    /// Minimal capability-configurable test double. Only `name()` / `supports()` are
+    /// exercised — every fetch is supplied by chain_try's injected `fetch` closure, so the
+    /// fetch methods rely on the trait defaults and are never called.
+    struct CapProvider {
+        nm: &'static str,
+        caps: &'static [Capability],
+    }
+
+    #[async_trait]
+    impl Provider for CapProvider {
+        fn name(&self) -> &str {
+            self.nm
+        }
+        fn supports(&self, cap: Capability) -> bool {
+            self.caps.contains(&cap)
+        }
+    }
+
+    fn spot_stub(source: &str) -> SpotQuote {
+        SpotQuote {
+            market_id: 0,
+            ts: Utc::now(),
+            price: rust_decimal_macros::dec!(100),
+            bid: None,
+            ask: None,
+            volume_24h: None,
+            vs_currency: "usd".to_string(),
+            source: source.to_string(),
+        }
+    }
+
+    /// AC-REFACTOR-020b(i): primary success returns the primary result and records
+    /// per-provider + chain success; only the primary is attempted.
+    #[tokio::test]
+    async fn chain_try_primary_success_records_success() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::Spot],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let reg = crate::alarm::HealthRegistry::new();
+        let paced = std::cell::RefCell::new(Vec::<String>::new());
+
+        let result = chain_try(
+            &chain,
+            Capability::Spot,
+            Some(&reg),
+            |name| {
+                paced.borrow_mut().push(name.to_string());
+                Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) })
+            },
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("primary must succeed").source,
+            "coingecko",
+            "the primary provider's result must be returned"
+        );
+        // First success wins — only the primary is attempted (and paced).
+        assert_eq!(*paced.borrow(), vec!["coingecko".to_string()]);
+        assert!(!reg.all_providers_down(), "chain success recorded");
+        assert!(reg.provider_snapshot("coingecko").last_success_at.is_some());
+    }
+
+    /// AC-REFACTOR-020b(ii) + AC-REFACTOR-021a: primary error then fallback success. Proves
+    /// the F-16 fix — the pacer slot is acquired for EACH attempted provider (both coingecko
+    /// AND binance), so the serving fallback is charged; under the prior first_provider_for_cap
+    /// behavior binance (the fallback) was never paced.
+    #[tokio::test]
+    async fn chain_try_falls_back_on_primary_error_and_paces_each_attempt() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::Spot],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let reg = crate::alarm::HealthRegistry::new();
+        let paced = std::cell::RefCell::new(Vec::<String>::new());
+
+        let result = chain_try(
+            &chain,
+            Capability::Spot,
+            Some(&reg),
+            |name| {
+                paced.borrow_mut().push(name.to_string());
+                Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) })
+            },
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move {
+                    if nm == "coingecko" {
+                        Err(ProviderError::Http {
+                            status: 500,
+                            body: "boom".to_string(),
+                        })
+                    } else {
+                        Ok(spot_stub(&nm))
+                    }
+                })
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.expect("fallback must serve").source,
+            "binance",
+            "the fallback provider's result must be returned"
+        );
+        // INTENDED CHANGE (a): the slot is acquired for the provider that actually serves.
+        // Both attempted providers were paced, in declared order.
+        assert_eq!(
+            *paced.borrow(),
+            vec!["coingecko".to_string(), "binance".to_string()],
+            "each attempted provider's slot must be acquired (F-16 attribution)"
+        );
+        assert!(!reg.all_providers_down(), "fallback served → chain success");
+        assert!(reg.provider_snapshot("binance").last_success_at.is_some());
+    }
+
+    /// AC-REFACTOR-020b(iii): the first capable-by-order member is unsupported for the
+    /// requested capability; chain_try skips it (no pace, no fetch) and serves from the next.
+    #[tokio::test]
+    async fn chain_try_skips_unsupported_first_member() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::CoinMetadata], // does NOT support Spot
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let paced = std::cell::RefCell::new(Vec::<String>::new());
+
+        let result = chain_try(
+            &chain,
+            Capability::Spot,
+            None,
+            |name| {
+                paced.borrow_mut().push(name.to_string());
+                Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) })
+            },
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+
+        assert_eq!(result.expect("binance serves").source, "binance");
+        // The unsupported member is neither paced nor fetched.
+        assert_eq!(*paced.borrow(), vec!["binance".to_string()]);
+    }
+
+    /// AC-REFACTOR-020b(iv) + REQ-REFACTOR-023: a non-empty chain whose members are all
+    /// unsupported yields NoCapableProvider — not the misleading empty-chain label.
+    #[tokio::test]
+    async fn chain_try_all_unsupported_reports_no_capable_provider() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::CoinMetadata],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Ohlc],
+            }),
+        ];
+        let result = chain_try(
+            &chain,
+            Capability::Spot,
+            None,
+            |_name| Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) }),
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+        match result {
+            Err(ProviderError::NoCapableProvider(Capability::Spot)) => {}
+            other => panic!("expected NoCapableProvider(Spot), got: {other:?}"),
+        }
+    }
+
+    /// REQ-REFACTOR-023: a genuinely empty chain still reports the empty-chain label,
+    /// distinct from the non-empty all-unsupported case above.
+    #[tokio::test]
+    async fn chain_try_empty_chain_reports_empty() {
+        let chain: Vec<Arc<dyn Provider>> = vec![];
+        let result: Result<SpotQuote, _> = chain_try(
+            &chain,
+            Capability::Spot,
+            None,
+            |_name| Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) }),
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("empty provider chain"),
+            "a genuinely empty chain must report 'empty provider chain', got: {msg}"
+        );
+    }
+
+    /// AC-REFACTOR-021a companion (intended change (a)): a cooled-down primary must NOT block
+    /// a fallback that still has capacity — per-provider pacing lets the fallback serve.
+    #[tokio::test]
+    async fn chain_try_paced_out_primary_falls_through_to_fallback() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::Spot],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let reg = crate::alarm::HealthRegistry::new();
+        let result = chain_try(
+            &chain,
+            Capability::Spot,
+            Some(&reg),
+            |name| {
+                let nm = name.to_string();
+                Box::pin(async move {
+                    if nm == "coingecko" {
+                        Err(crate::pacer::AcquireSlotError::Cooldown(nm, Utc::now()))
+                    } else {
+                        Ok(())
+                    }
+                })
+            },
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+        assert_eq!(
+            result
+                .expect("fallback serves past cooled-down primary")
+                .source,
+            "binance"
+        );
+        // A paced-out provider is backpressure, NOT a chain failure.
+        assert!(!reg.all_providers_down());
+    }
+
+    /// Every capability-supporting provider is paced out → chain_try surfaces a Pacer error so
+    /// the worker soft-skips, and it does NOT record a chain failure (backpressure ≠ failure).
+    #[tokio::test]
+    async fn chain_try_all_paced_out_surfaces_pacer_error() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::Spot],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let reg = crate::alarm::HealthRegistry::new();
+        let result: Result<SpotQuote, _> = chain_try(
+            &chain,
+            Capability::Spot,
+            Some(&reg),
+            |name| {
+                let nm = name.to_string();
+                Box::pin(
+                    async move { Err(crate::pacer::AcquireSlotError::Cooldown(nm, Utc::now())) },
+                )
+            },
+            |p| {
+                let nm = p.name().to_string();
+                Box::pin(async move { Ok(spot_stub(&nm)) })
+            },
+        )
+        .await;
+        match result {
+            Err(ProviderError::Pacer(crate::pacer::AcquireSlotError::Cooldown(..))) => {}
+            other => panic!("all-paced-out must surface a Pacer error, got: {other:?}"),
+        }
+        assert!(
+            !reg.all_providers_down(),
+            "a paced-out chain must NOT record chain_all_failed"
+        );
+    }
+
+    /// Every attempted provider's fetch fails → the last error is returned and the chain-all-
+    /// failed signal is stamped (REQ-REFACTOR-020 registry bookkeeping).
+    #[tokio::test]
+    async fn chain_try_all_fail_records_chain_all_failed() {
+        let chain: Vec<Arc<dyn Provider>> = vec![
+            Arc::new(CapProvider {
+                nm: "coingecko",
+                caps: &[Capability::Spot],
+            }),
+            Arc::new(CapProvider {
+                nm: "binance",
+                caps: &[Capability::Spot],
+            }),
+        ];
+        let reg = crate::alarm::HealthRegistry::new();
+        let result: Result<SpotQuote, _> = chain_try(
+            &chain,
+            Capability::Spot,
+            Some(&reg),
+            |_name| Box::pin(async { Ok::<(), crate::pacer::AcquireSlotError>(()) }),
+            |_p| {
+                Box::pin(async {
+                    Err(ProviderError::Http {
+                        status: 500,
+                        body: "down".to_string(),
+                    })
+                })
+            },
+        )
+        .await;
+        assert!(result.is_err(), "all fetches failed → error");
+        assert!(
+            reg.all_providers_down(),
+            "every attempted provider failed → chain_all_failed stamped"
+        );
     }
 }

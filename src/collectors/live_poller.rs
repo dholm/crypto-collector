@@ -347,61 +347,18 @@ async fn poll_cycle(
             vs_currency: "usd".to_string(),
         };
 
-        // Find the first provider supporting Spot for pacing (REQ-SCHED-041).
-        let provider_name = match chain.iter().find(|p| p.supports(Capability::Spot)) {
-            Some(p) => p.name().to_string(),
-            None => {
-                // No provider can ever serve this coin — a PERMANENT per-coin condition.
-                // Defer its re-claim (marker forward) rather than clear it, so it is not
-                // immediately re-due every tick (REQ-SCHED-063.4).
-                warn!(
-                    "live_poller: no provider supports Spot for coin {}; deferring",
-                    coin.coin_id
-                );
-                if let Err(e) = defer_coin_poll(
-                    pool,
-                    &coin.coin_id,
-                    crate::config::live_poll_max_interval_secs() as i64,
-                )
-                .await
-                {
-                    warn!(
-                        "live_poller: defer marker failed for coin {}: {e}",
-                        coin.coin_id
-                    );
-                }
-                continue;
-            }
-        };
-
-        // Acquire pacer slot OUTSIDE any transaction (REQ-SCHED-041).
-        match acquire_slot(pool, &provider_name).await {
-            Ok(()) => {}
-            Err(ref e) if pacer_should_skip(e) => {
-                // Cooldown or credit exhaustion — release the marker, skip for now.
-                warn!("live_poller: pacer skip for coin {}: {e}", coin.coin_id);
-                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
-                    warn!(
-                        "live_poller: marker clear failed for coin {}: {e}",
-                        coin.coin_id
-                    );
-                }
-                continue;
-            }
-            Err(e) => {
-                error!("live_poller: pacer error for coin {}: {e}", coin.coin_id);
-                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
-                    warn!(
-                        "live_poller: marker clear failed for coin {}: {e}",
-                        coin.coin_id
-                    );
-                }
-                continue;
-            }
-        }
-
-        // Fetch via chain (outside any transaction, REQ-SCHED-004).
-        let fetch_result = chain_fetch_spot(chain, &mq, registry).await;
+        // Fetch via chain with per-provider pacing (F-16): the pacer slot is acquired inside
+        // chain_try for EACH attempted provider and charged to the provider that actually
+        // serves — no longer keyed on the first Spot-capable member before the loop
+        // (SPEC-REFACTOR-001 REQ-REFACTOR-021). Runs outside any transaction (REQ-SCHED-004/041).
+        let fetch_result = crate::providers::chain_try(
+            chain,
+            Capability::Spot,
+            registry,
+            |name| Box::pin(acquire_slot(pool, name)),
+            |p| Box::pin(p.fetch_spot(&mq)),
+        )
+        .await;
 
         match fetch_result {
             Ok(quote) => {
@@ -428,6 +385,47 @@ async fn poll_cycle(
                 if let Err(e) = mark_coin_poll_success(pool, &coin.coin_id).await {
                     error!(
                         "live_poller: success mark error for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
+            }
+            // No provider supports Spot — a PERMANENT per-coin condition. Defer its re-claim
+            // (marker forward) rather than clear it, so it is not immediately re-due every tick
+            // (REQ-SCHED-063.4). Preserves the prior pre-loop find(Spot)==None behavior.
+            Err(ProviderError::NoCapableProvider(_)) => {
+                warn!(
+                    "live_poller: no provider supports Spot for coin {}; deferring",
+                    coin.coin_id
+                );
+                if let Err(e) = defer_coin_poll(
+                    pool,
+                    &coin.coin_id,
+                    crate::config::live_poll_max_interval_secs() as i64,
+                )
+                .await
+                {
+                    warn!(
+                        "live_poller: defer marker failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
+            }
+            // Every Spot-capable provider was paced out (cooldown / credit exhaustion) —
+            // release the marker and skip for now; the coin stays due (soft skip, REQ-SCHED-041).
+            Err(ProviderError::Pacer(ref e)) if pacer_should_skip(e) => {
+                warn!("live_poller: pacer skip for coin {}: {e}", coin.coin_id);
+                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                    warn!(
+                        "live_poller: marker clear failed for coin {}: {e}",
+                        coin.coin_id
+                    );
+                }
+            }
+            Err(ProviderError::Pacer(e)) => {
+                error!("live_poller: pacer error for coin {}: {e}", coin.coin_id);
+                if let Err(e) = clear_coin_poll_marker(pool, &coin.coin_id).await {
+                    warn!(
+                        "live_poller: marker clear failed for coin {}: {e}",
                         coin.coin_id
                     );
                 }
@@ -470,45 +468,6 @@ async fn poll_cycle(
     }
 
     Ok(())
-}
-
-/// Try providers in order for `fetch_spot`; return the first success.
-async fn chain_fetch_spot(
-    chain: &[Arc<dyn Provider>],
-    market: &MarketQuery,
-    registry: Option<&crate::alarm::HealthRegistry>,
-) -> Result<crate::providers::SpotQuote, ProviderError> {
-    let mut last_err = ProviderError::Other(anyhow::anyhow!("empty provider chain"));
-    let mut attempted = false;
-    for provider in chain {
-        if !provider.supports(Capability::Spot) {
-            continue;
-        }
-        attempted = true;
-        match provider.fetch_spot(market).await {
-            Ok(q) => {
-                if let Some(reg) = registry {
-                    reg.record_provider_success(provider.name());
-                    reg.record_chain_success();
-                }
-                return Ok(q);
-            }
-            Err(e) => {
-                if let Some(reg) = registry {
-                    if matches!(e, ProviderError::Network(_)) {
-                        reg.record_provider_network_failure(provider.name());
-                    }
-                }
-                last_err = e;
-            }
-        }
-    }
-    if attempted {
-        if let Some(reg) = registry {
-            reg.record_chain_all_failed();
-        }
-    }
-    Err(last_err)
 }
 
 fn is_transient_provider_error(e: &ProviderError) -> bool {
