@@ -39,6 +39,7 @@ use crate::collectors::retry::DispatchError;
 use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
+use crate::shutdown::shutdown_arm_should_break;
 
 /// Dataset tag used for the startup once-per-coin historical backfill job
 /// (`enqueue_startup_backfills`). Matches the `ON CONFLICT (coin_id, dataset)`
@@ -855,7 +856,7 @@ pub async fn run_backfill_worker(
                 // loop when the shutdown sender is dropped (`changed()` → Err) rather than
                 // busy-spin on the immediate error (REQ-SCHED-065.3).
                 tokio::select! {
-                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
                     _ = tokio::time::sleep(idle_sleep) => {}
                 }
                 continue;
@@ -865,7 +866,7 @@ pub async fn run_backfill_worker(
                 // Bounded pause raced against shutdown, not a bare sleep, so shutdown is
                 // prompt and a dropped sender breaks the loop (REQ-SCHED-062/065.3).
                 tokio::select! {
-                    res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
                     _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
                 }
                 continue;
@@ -1003,7 +1004,7 @@ pub async fn run_backfill_worker(
             // Bounded pause raced against shutdown (REQ-SCHED-062.1): shutdown stays prompt,
             // and a dropped sender breaks the loop instead of busy-spinning (REQ-SCHED-065.3).
             tokio::select! {
-                res = shutdown.changed() => { if res.is_err() || *shutdown.borrow() { break; } }
+                res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
                 _ = tokio::time::sleep(idle_sleep) => {}
             }
         }
@@ -1470,8 +1471,10 @@ mod tests {
         // its own assertion-message string literals.
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
         assert!(
-            code.contains("res.is_err()"),
-            "worker loop select! arms must break on a dropped shutdown sender (REQ-SCHED-065.3)"
+            code.contains("shutdown_arm_should_break"),
+            "worker loop select! arms must adopt the shared shutdown_arm_should_break helper — its \
+             break decision is behavior-verified by shutdown::tests::shutdown_arm_should_break_truth_table \
+             (REQ-SCHED-065.3)"
         );
         assert!(
             !code.contains("_ = shutdown.changed()"),

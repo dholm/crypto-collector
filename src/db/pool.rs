@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
+use crate::shutdown::shutdown_arm_should_break;
+
 /// Pool size shared by every connection path (eager, lazy).
 const MAX_CONNECTIONS: u32 = 10;
 
@@ -119,7 +121,7 @@ pub async fn migrate_with_retry(
                 ),
             },
             res = shutdown.changed() => {
-                if res.is_err() || *shutdown.borrow() {
+                if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) {
                     return Ok(false);
                 }
             }
@@ -129,7 +131,7 @@ pub async fn migrate_with_retry(
             _ = tokio::time::sleep(backoff) => {}
             res = shutdown.changed() => {
                 // Sender dropped or flipped to true → abort startup.
-                if res.is_err() || *shutdown.borrow() {
+                if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) {
                     return Ok(false);
                 }
             }
