@@ -74,8 +74,23 @@ _<pending run-phase — owned by manager-develop>_
   helpers via the @MX annotations verified above (chain_try, lease-queue scaffold, batched
   upsert, ApiInterval, paginate) — no additional narrative module-doc edit was required beyond
   the @MX blocks already landed in the M1-M6 commits.
-- **Status transition applied**: `spec.md` frontmatter `status: draft → implemented`
-  (`updated: 2026-07-27` unchanged — same day). `completed` intentionally NOT set.
+- **Status transition applied**: `spec.md` frontmatter `status: draft → implemented → completed`
+  (`updated: 2026-07-27`). The `implemented → completed` close was authorized on **live-runtime
+  evidence** from the deployed instance (user chose "close on live-runtime evidence" over running
+  the mutating #[ignore] suite against production — the DB-gated tests use `claim_*` on the
+  globally-oldest queue row and would collide with live workers).
+- **Live-runtime close evidence** (deployed pod `crypto-collector-868f5dd744-qrsk4`, finance ns,
+  2026-07-27 19:39Z): migrations applied; provider chain built `["binance","coingecko","bitstamp"]`
+  + pacer-row validation passed (M1/M6); both workers log `target: lease_worker` (M3 scaffold);
+  collection_queue items completing (M2 `chain_try` + M4 batched writes); `collection_requests_total{...,outcome="success"}`
+  for binance/ohlc + coingecko/coin_market (M2 dispatch); LISTEN/NOTIFY relays up (change b live path);
+  **API guard live-verified**: `GET /candles?interval=3m`→400, `1M`→400, `1h`/`4h`→200 (M6 `is_api_facing`);
+  `coin_candle` write histogram absent (M4 batching, expected); no panics/errors.
+- **Residual risk (documented, accepted)**: the #[ignore] DB-gated tests were NOT executed —
+  row-level N-row==N-single batch parity, native/rollup ON CONFLICT direction, and exact
+  live=1/backfill=0 NOTIFY counts are proven by unit tests (SQL-string assertions) + live-runtime
+  behavior, NOT by the DB-gated suite. If a future regression is suspected, run
+  `DATABASE_URL=<test-db> cargo test -- --ignored --test-threads=1` against a scratch DB.
 - **Scope discipline confirmed**: spec.md / plan.md / acceptance.md BODY content untouched this
   session (frontmatter `status:` only); no git push performed by this agent (staged for the
   orchestrator's independent verification + push per author-email discipline).
