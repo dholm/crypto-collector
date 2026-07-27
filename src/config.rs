@@ -27,7 +27,15 @@ pub fn database_connect_options() -> anyhow::Result<sqlx::postgres::PgConnectOpt
         if !url.is_empty() {
             return url
                 .parse::<sqlx::postgres::PgConnectOptions>()
-                .map_err(|e| anyhow::anyhow!("invalid DATABASE_URL: {e}"));
+                // Credential-safe: never echo the raw parse error, which can quote the
+                // connection string (and its embedded credentials) into a log line (F-40 /
+                // REQ-OBS-073). A fixed message keeps diagnostics useful without leaking.
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "invalid DATABASE_URL — check scheme/host/port/database and \
+                         credential encoding"
+                    )
+                });
         }
     }
     let host = required("DB_HOST")?;
@@ -754,6 +762,12 @@ fn parse_env_value<T: std::str::FromStr>(raw: Option<&str>, default: T) -> (T, b
 
 /// Parse an env var, emitting a `tracing::warn!` naming the variable and the fallback used
 /// when it is present-but-unparseable (REQ-OBS-071) rather than silently reverting.
+///
+/// SECURITY: this logs the raw unparseable value (see the `value = ...` field below), so
+/// secret-bearing env vars MUST NOT be routed through it — a malformed secret would be
+/// echoed into a log line. `DB_PASSWORD` (and any credential) is read directly in
+/// `database_connect_options` / `build_pg_connect_options`, never parsed here, and must
+/// stay that way (F-40 / REQ-OBS-073).
 fn parse_env_or_warn<T>(name: &str, default: T) -> T
 where
     T: std::str::FromStr + std::fmt::Display + Copy,

@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::db::upserts::upsert_coin_quote;
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{Capability, MarketQuery, Provider, ProviderError};
+use crate::shutdown::shutdown_arm_should_break;
 
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
 
@@ -285,7 +286,7 @@ pub async fn run_live_poller(
             res = shutdown.changed() => {
                 // Break on a dropped shutdown sender too, rather than busy-spin on the
                 // immediate Err (REQ-SCHED-065.3).
-                if res.is_err() || *shutdown.borrow() {
+                if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) {
                     info!("live_poller: shutdown signal received");
                     break;
                 }
@@ -733,16 +734,18 @@ mod tests {
     // ── AC-SCHED-065c (mechanical): guarded shutdown select! arm ──────────────
 
     #[test]
-    fn worker_select_arm_guards_dropped_sender() {
+    fn worker_select_arm_captures_changed_result() {
         let src =
             std::fs::read_to_string("src/collectors/live_poller.rs").expect("read live_poller.rs");
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        // The break decision itself is verified behaviorally by
+        // `crate::shutdown::tests::shutdown_arm_should_break_truth_table` (pure fn); this
+        // mechanical guard only enforces that the arm CAPTURES the result rather than
+        // discarding it in an un-captured `_ = shutdown.changed()` arm (REQ-SCHED-065.3).
+        // Needle built by concatenation so this assertion string is not itself a match.
+        let uncaptured = format!("_ {} shutdown.changed()", "=");
         assert!(
-            code.contains("res.is_err()"),
-            "the main loop select! arm must break on a dropped shutdown sender (REQ-SCHED-065.3)"
-        );
-        assert!(
-            !code.contains("_ = shutdown.changed()"),
+            !code.contains(&uncaptured),
             "no un-captured `_ = shutdown.changed()` arm may remain (REQ-SCHED-065.3)"
         );
     }

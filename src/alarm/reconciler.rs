@@ -32,6 +32,7 @@
 use crate::alarm::catalog::{self, Condition, Severity};
 use crate::alarm::registry::{HealthRegistry, ProviderHealth};
 use crate::alarm::AlarmClient;
+use crate::shutdown::shutdown_arm_should_break;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -637,7 +638,7 @@ pub async fn run_reconciler(reconciler: Arc<Reconciler>, mut shutdown: watch::Re
             // Break on the shutdown value AND on a dropped sender (`changed()` → Err), rather
             // than busy-spin on the immediately-ready error (REQ-OBS-068 / F-47).
             res = shutdown.changed() => {
-                if res.is_err() || *shutdown.borrow() {
+                if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) {
                     info!("reconciler: shutdown signal received; stopping (no mass-clear, REQ-ALARM-018)");
                     break;
                 }
@@ -755,17 +756,16 @@ mod tests {
         assert!(!conditions.contains(&Condition::AllProvidersDown));
     }
 
-    /// AC-OBS-068 (mechanical): the reconciler run loop's shutdown select arm captures the
-    /// result and breaks on a dropped sender (`changed()` → Err), rather than busy-spinning
-    /// on the immediately-ready error (REQ-OBS-068 / F-47). Mirrors the worker-loop guards.
+    /// AC-OBS-068 (mechanical): the reconciler run loop's shutdown select arm CAPTURES the
+    /// result (`res = shutdown.changed()`) rather than discarding it in an un-captured
+    /// `_ = shutdown.changed()` arm that would busy-spin on the immediately-ready error
+    /// (REQ-OBS-068 / F-47). The break decision itself is verified behaviorally by
+    /// `crate::shutdown::tests::shutdown_arm_should_break_truth_table` (pure fn), which
+    /// replaces the former brittle `res.is_err()` source-text scan.
     #[test]
-    fn reconciler_shutdown_arm_guards_dropped_sender() {
+    fn reconciler_shutdown_arm_captures_changed_result() {
         let src = std::fs::read_to_string("src/alarm/reconciler.rs").expect("read reconciler.rs");
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
-        assert!(
-            code.contains("res.is_err()"),
-            "the reconciler loop shutdown arm must break on a dropped sender (REQ-OBS-068)"
-        );
         // Needle built by concatenation so this assertion string is not itself a match.
         let uncaptured = format!("_ {} shutdown.changed()", "=");
         assert!(

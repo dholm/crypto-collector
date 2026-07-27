@@ -19,4 +19,5 @@ pub mod metrics;
 pub mod models;
 pub mod pacer;
 pub mod providers;
+pub mod shutdown;
 pub mod telemetry;

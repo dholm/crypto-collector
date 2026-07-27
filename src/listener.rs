@@ -28,6 +28,8 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 
+use crate::shutdown::shutdown_arm_should_break;
+
 /// Relay PG NOTIFY `coin_quote_updated` → `coin_quote_tx`.
 ///
 /// Returns `Ok(())` on a clean shutdown-signal exit; returns `Err` on an initial connect /
@@ -88,7 +90,7 @@ async fn run_listener(
             // gone, so there is nothing left to wait for — breaking avoids busy-spinning on
             // the immediately-ready error (REQ-OBS-068 / F-47).
             res = shutdown_rx.changed() => {
-                if res.is_err() || *shutdown_rx.borrow() {
+                if shutdown_arm_should_break(res.is_err(), *shutdown_rx.borrow()) {
                     info!(channel, "PG listener received shutdown; exiting");
                     break;
                 }
@@ -123,18 +125,16 @@ async fn run_listener(
 mod tests {
     use super::*;
 
-    /// AC-OBS-068 (mechanical): the relay loop's shutdown select arm captures the result and
-    /// breaks on a dropped sender (`changed()` → Err), rather than busy-spinning on the
-    /// immediately-ready error (REQ-OBS-068 / F-47). Mirrors the worker-loop guards
-    /// (REQ-SCHED-065.3); the relay loop itself is DB-gated so this is the no-DB verification.
+    /// AC-OBS-068 (mechanical): the relay loop's shutdown select arm CAPTURES the result
+    /// (`res = shutdown_rx.changed()`) rather than discarding it in an un-captured
+    /// `_ = shutdown_rx.changed()` arm that would busy-spin on the immediately-ready error
+    /// (REQ-OBS-068 / F-47). The break decision itself is verified behaviorally by
+    /// `crate::shutdown::tests::shutdown_arm_should_break_truth_table` (pure fn), which
+    /// replaces the former brittle `res.is_err()` source-text scan.
     #[test]
-    fn listener_shutdown_arm_guards_dropped_sender() {
+    fn listener_shutdown_arm_captures_changed_result() {
         let src = std::fs::read_to_string("src/listener.rs").expect("read listener.rs");
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
-        assert!(
-            code.contains("res.is_err()"),
-            "the relay loop shutdown arm must break on a dropped sender (REQ-OBS-068)"
-        );
         // Needle built by concatenation so this assertion string is not itself a match.
         let uncaptured = format!("_ {} shutdown_rx.changed()", "=");
         assert!(
