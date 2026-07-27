@@ -187,13 +187,22 @@ pub async fn list_candles(
     };
 
     // source_interval was returned by select_source_interval, which only returns strings that
-    // parse as ApiInterval → this parse never fails in practice.
-    let source_secs = source_interval
+    // parse as ApiInterval → this parse never fails in practice. Degrade to an empty page
+    // rather than panic if that invariant is ever violated (plan §G: no new `.expect`).
+    let source_secs = match source_interval
         .parse::<ApiInterval>()
+        .ok()
         .map(|i| i.secs())
-        .expect(
-            "source interval selected from ApiInterval vocabulary must have a known second count",
-        );
+    {
+        Some(secs) => secs,
+        None => {
+            let empty: Page<CoinCandleDto> = Page {
+                items: vec![],
+                next_cursor: None,
+            };
+            return Ok(Json(empty));
+        }
+    };
 
     // Hard ceiling on source rows fetched to bound memory regardless of the N multiplier
     // (e.g. 1w from 1m → N = 10 080; without a cap, limit=1000 would request ~10M rows).

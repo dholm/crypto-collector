@@ -5,8 +5,8 @@
 //! [`batched_upsert_coin_candles`] is the single UNNEST-based batch write shared by the
 //! candles dispatch path (`collectors::collection_queue`) and the backfill page-write
 //! path (`collectors::backfill`). It carries a [`CandleConflictPolicy`] parameter that
-//! keeps two conflict policies deliberately distinct: `NativeUnconditional` (the native
-//! write path, unconditional `DO UPDATE`) and `RollupNativeWins` (the rollup path's
+//! keeps two conflict policies deliberately distinct: `NativeOverwrite` (the native
+//! write path, unconditional `DO UPDATE`) and `RollupGuarded` (the rollup path's
 //! `WHERE coin_candles.source LIKE 'rollup:%'` guard) — the two are never conflated
 //! (D1). A [`CandleNotifyPolicy`] parameter controls whether the write emits
 //! `pg_notify`: the live-poll path emits one per event; the backfill path emits none.
