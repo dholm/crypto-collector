@@ -7,19 +7,20 @@
 //! With `as_of=<timestamp>`: returns the revision with the greatest
 //! `first_seen_at <= as_of` (REQ-API-050).
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use super::{dto::CoinMetadataDto, ApiError, ApiResult, AppState};
+use super::{
+    dto::CoinMetadataDto,
+    extract::{ApiPath, ApiQuery},
+    ApiError, ApiResult, AppState,
+};
 
 // ── Query parameter types ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+/// `Serialize` is derived for the F-59 parameter-parity test (src/api/mod.rs).
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GetMetadataParams {
     /// Optional point-in-time: return the revision active at this timestamp.
     pub as_of: Option<DateTime<Utc>>,
@@ -30,8 +31,8 @@ pub struct GetMetadataParams {
 /// `GET /v1/coins/{coin_id}/metadata` — latest or as-of coin metadata revision (REQ-API-050).
 pub async fn get_metadata(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<GetMetadataParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<GetMetadataParams>,
 ) -> ApiResult<impl IntoResponse> {
     // Verify coin exists.
     ensure_coin_exists(&state.pool, &coin_id).await?;

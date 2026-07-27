@@ -18,17 +18,14 @@
 //! `{model}` (including `real`) is validated BEFORE dispatch and returns HTTP 400
 //! (REQ-CYCLE-093/094).
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CycleOverlayKey},
     dto::{CycleOverlayPointDto, CycleProjectionModelDto, CycleProjectionModelsDto, Page},
+    extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
 };
 use crate::collectors::cycle_overlay::OverlayPoint;
@@ -109,7 +106,9 @@ impl std::str::FromStr for ProjectionModel {
 // ── Query parameter types ─────────────────────────────────────────────────────
 
 /// Query parameters for `GET /v1/coins/{coin_id}/cycle-projection/{model}` (SPEC-CYCLE-001).
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived for the F-59 parameter-parity test (src/api/mod.rs).
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListCycleOverlayParams {
     /// Optional: quote currency filter; defaults to `usd` (REQ-CYCLE-052).
     pub vs_currency: Option<String>,
@@ -136,11 +135,11 @@ pub struct ListCycleOverlayParams {
 /// page — NOT 404 (REQ-CYCLE-052/091).
 pub async fn list_cycle_projection_data(
     State(state): State<AppState>,
-    Path((coin_id, model)): Path<(String, String)>,
-    Query(params): Query<ListCycleOverlayParams>,
+    ApiPath((coin_id, model)): ApiPath<(String, String)>,
+    ApiQuery(params): ApiQuery<ListCycleOverlayParams>,
 ) -> ApiResult<impl IntoResponse> {
     let model: ProjectionModel = model.parse()?;
-    list_overlay_for_model(State(state), Path(coin_id), Query(params), model.as_str()).await
+    list_overlay_for_model(state, coin_id, params, model.as_str()).await
 }
 
 /// `GET /v1/coins/{coin_id}/cycle-projection` (base path, no `{model}`) — model-discovery
@@ -172,9 +171,9 @@ pub async fn list_cycle_projection_models() -> impl IntoResponse {
 //             (REQ-CYCLE-090/091/092).
 // @MX:SPEC: SPEC-CYCLE-001 REQ-CYCLE-090 REQ-CYCLE-091 REQ-CYCLE-092
 async fn list_overlay_for_model(
-    State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<ListCycleOverlayParams>,
+    state: AppState,
+    coin_id: String,
+    params: ListCycleOverlayParams,
     projected_model: &str,
 ) -> ApiResult<impl IntoResponse> {
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;

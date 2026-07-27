@@ -19,13 +19,14 @@ pub mod coins;
 pub mod cursor;
 pub mod cycle_overlay;
 pub mod dto;
+pub mod extract;
 pub mod metadata;
 pub mod poll_interval;
 pub mod quotes;
 pub mod websocket;
 
 use axum::{
-    extract::rejection::JsonRejection,
+    extract::rejection::{JsonRejection, PathRejection, QueryRejection},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
@@ -128,8 +129,24 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+// F-33 (REQ-API-410): the extractor-rejection funnel. `ApiJson`/`ApiQuery`/`ApiPath`
+// (src/api/extract.rs) declare `rejection(ApiError)`, so each built-in extractor's rejection
+// is converted here into the uniform `{code, message}` BadRequest JSON body (REQ-API-074).
+// `From<JsonRejection>` was previously dead code (handlers used bare `Json`); it is now live.
 impl From<JsonRejection> for ApiError {
     fn from(e: JsonRejection) -> Self {
+        ApiError::BadRequest(e.to_string())
+    }
+}
+
+impl From<QueryRejection> for ApiError {
+    fn from(e: QueryRejection) -> Self {
+        ApiError::BadRequest(e.to_string())
+    }
+}
+
+impl From<PathRejection> for ApiError {
+    fn from(e: PathRejection) -> Self {
         ApiError::BadRequest(e.to_string())
     }
 }

@@ -8,13 +8,8 @@
 //! - `PATCH /v1/coins/{coin_id}` → update_coin (tri-state live_poll_interval; REQ-API-112/114)
 //! - `DELETE /v1/coins/{coin_id}`→ delete_coin (soft-deregister)
 
-use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use serde::Deserialize;
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use serde::{Deserialize, Serialize};
 
 use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
 use crate::config;
@@ -22,6 +17,7 @@ use crate::config;
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
     dto::{CoinDto, CoinSearchPage, Page, RegisterCoinRequest, UpdateCoinRequest},
+    extract::{ApiJson, ApiPath, ApiQuery},
     poll_interval, ApiError, ApiResult, AppState,
 };
 
@@ -33,13 +29,15 @@ use super::{
 
 // ── Query parameter types ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+// `Serialize` is derived (alongside `Deserialize`) so the F-59 parameter-parity test
+// (src/api/mod.rs) can reflect the struct's serde field set.
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListCoinsParams {
     pub cursor: Option<String>,
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct SearchCoinsParams {
     pub q: Option<String>,
     pub limit: Option<i64>,
@@ -50,7 +48,7 @@ pub struct SearchCoinsParams {
 /// `GET /v1/coins` — keyset-paginated list of tracked coins (REQ-API-012).
 pub async fn list_coins(
     State(state): State<AppState>,
-    Query(params): Query<ListCoinsParams>,
+    ApiQuery(params): ApiQuery<ListCoinsParams>,
 ) -> ApiResult<impl IntoResponse> {
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -92,7 +90,7 @@ pub async fn list_coins(
 /// `POST /v1/coins` — register a coin for collection (idempotent; REQ-API-010/011).
 pub async fn register_coin(
     State(state): State<AppState>,
-    Json(req): Json<RegisterCoinRequest>,
+    ApiJson(req): ApiJson<RegisterCoinRequest>,
 ) -> ApiResult<impl IntoResponse> {
     validate_coin_id(&req.coin_id)?;
 
@@ -151,7 +149,7 @@ pub async fn register_coin(
 /// `GET /v1/coins/search?q=` — search candidate coins via provider (REQ-API-013).
 pub async fn search_coins(
     State(state): State<AppState>,
-    Query(params): Query<SearchCoinsParams>,
+    ApiQuery(params): ApiQuery<SearchCoinsParams>,
 ) -> ApiResult<impl IntoResponse> {
     let q = params.q.as_deref().unwrap_or("").trim().to_string();
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -186,7 +184,7 @@ pub async fn search_coins(
 /// `GET /v1/coins/{coin_id}` — get one tracked coin (REQ-API-012).
 pub async fn get_coin(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
+    ApiPath(coin_id): ApiPath<String>,
 ) -> ApiResult<impl IntoResponse> {
     let coin: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
         "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
@@ -211,8 +209,8 @@ pub async fn get_coin(
 /// - String: parse, validate bounds (422 on violation; REQ-API-114), set new interval.
 pub async fn update_coin(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Json(req): Json<UpdateCoinRequest>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiJson(req): ApiJson<UpdateCoinRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if let Some(ref s) = req.status {
         validate_coin_status(s)?;
@@ -292,7 +290,7 @@ pub async fn update_coin(
 /// Sets `status = 'paused'` so workers stop collecting but historical data is retained.
 pub async fn delete_coin(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
+    ApiPath(coin_id): ApiPath<String>,
 ) -> ApiResult<impl IntoResponse> {
     let rows_affected = sqlx::query(
         "UPDATE tracked_coins SET status = 'paused' WHERE coin_id = $1 AND status != 'paused'",
@@ -403,6 +401,51 @@ mod tests {
             .add_query_param("cursor", "not!!valid!!base64@@")
             .await;
         assert_eq!(resp.status_code(), 400);
+    }
+
+    // ── SPEC-API-005 M2 (F-33, REQ-API-409/410): uniform extractor error bodies ──
+
+    // AC-API-409: a malformed JSON body → the documented {code, message} JSON body (not
+    // Axum's default text/plain rejection). Extraction fails before the handler → no DB.
+    #[tokio::test]
+    async fn malformed_json_body_returns_json_error_body() {
+        let server = test_server();
+        let resp = server
+            .post("/v1/coins")
+            .content_type("application/json")
+            .text("{ this is not valid json")
+            .await;
+        assert_eq!(resp.status_code(), 400);
+        let ct = resp.header("content-type");
+        assert!(
+            ct.to_str().unwrap().contains("application/json"),
+            "malformed body rejection must be application/json, got {ct:?}"
+        );
+        // Body must be the {code, message} shape — parsing as a JSON object proves it is not
+        // Axum's plain-text rejection.
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["code"], "BAD_REQUEST");
+        assert!(body["message"].is_string());
+    }
+
+    // AC-API-409: a malformed query value (limit is i64; "notanumber" fails to deserialize) →
+    // {code, message} JSON. The ApiQuery wrapper funnels the QueryRejection through ApiError.
+    #[tokio::test]
+    async fn malformed_query_value_returns_json_error_body() {
+        let server = test_server();
+        let resp = server
+            .get("/v1/coins")
+            .add_query_param("limit", "notanumber")
+            .await;
+        assert_eq!(resp.status_code(), 400);
+        let ct = resp.header("content-type");
+        assert!(
+            ct.to_str().unwrap().contains("application/json"),
+            "malformed query rejection must be application/json, got {ct:?}"
+        );
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["code"], "BAD_REQUEST");
+        assert!(body["message"].is_string());
     }
 
     #[test]

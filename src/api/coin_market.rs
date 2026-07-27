@@ -4,31 +4,30 @@
 //! - `GET /v1/coins/{coin_id}/market/latest` → get_coin_market_latest
 //! - `GET /v1/coins/{coin_id}/market`        → list_coin_market (keyset-paginated)
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     cursor::{decode_keyset_cursor, validate_limit, TsKey},
     dto::{CoinMarketSnapshotDto, Page},
+    extract::{ApiPath, ApiQuery},
     metadata::ensure_coin_exists,
     quotes::paginate_ts,
     ApiError, ApiResult, AppState,
 };
 
 // ── Query parameter types ─────────────────────────────────────────────────────
+//
+// `Serialize` is derived for the F-59 parameter-parity test (src/api/mod.rs).
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct GetCoinMarketLatestParams {
     /// Required quote currency (e.g. `usd`, `btc`).
     pub vs_currency: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListCoinMarketParams {
     pub vs_currency: Option<String>,
     pub cursor: Option<String>,
@@ -42,8 +41,8 @@ pub struct ListCoinMarketParams {
 /// `GET /v1/coins/{coin_id}/market/latest` — newest market snapshot (REQ-API-051).
 pub async fn get_coin_market_latest(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<GetCoinMarketLatestParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<GetCoinMarketLatestParams>,
 ) -> ApiResult<impl IntoResponse> {
     let vs_currency = params
         .vs_currency
@@ -77,8 +76,8 @@ pub async fn get_coin_market_latest(
 /// `GET /v1/coins/{coin_id}/market` — keyset-paginated market snapshot history (REQ-API-052).
 pub async fn list_coin_market(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<ListCoinMarketParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<ListCoinMarketParams>,
 ) -> ApiResult<impl IntoResponse> {
     let vs_currency = params
         .vs_currency

@@ -11,13 +11,9 @@
 //! - Optional `vs_currency` parameter (default `usd`); unrecognised values → 200 empty page.
 //! - Aggregation fallback when no native candles exist at the exact interval.
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Duration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::{
     candles_agg::{
@@ -25,6 +21,7 @@ use super::{
     },
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
     dto::{CoinCandleDto, Page},
+    extract::{ApiPath, ApiQuery},
     quotes::paginate_ts,
     ApiError, ApiResult, AppState,
 };
@@ -39,7 +36,9 @@ pub const SUPPORTED_INTERVALS: &[&str] = &["1m", "5m", "15m", "1h", "4h", "1d", 
 // ── Query parameter types ─────────────────────────────────────────────────────
 
 /// Query parameters for `GET /v1/coins/{coin_id}/candles` (SPEC-API-002/003).
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived for the F-59 parameter-parity test (src/api/mod.rs).
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListCandlesParams {
     /// Required: must be one of SUPPORTED_INTERVALS (REQ-API-041).
     pub interval: Option<String>,
@@ -68,8 +67,8 @@ pub struct ListCandlesParams {
 // @MX:SPEC: SPEC-API-003 REQ-API-200 REQ-API-201 OR-API3-2
 pub async fn list_candles(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<ListCandlesParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<ListCandlesParams>,
 ) -> ApiResult<impl IntoResponse> {
     // `interval` is required (REQ-API-041 / REQ-API-215).
     let interval = params

@@ -4,17 +4,14 @@
 //! - `GET /v1/coins/{coin_id}/quotes/latest` → get_latest_quote
 //! - `GET /v1/coins/{coin_id}/quotes`        → list_quotes (keyset-paginated, time-range)
 
-use axum::{
-    extract::{Path, Query, State},
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
     dto::{CoinQuoteDto, CoinQuoteOverviewDto, CoinQuoteOverviewPage, Page},
+    extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
 };
 
@@ -58,8 +55,8 @@ pub struct ListLatestQuotesParams {
 /// bound is what makes PostgreSQL prune partitions (REQ-API-402/404).
 pub async fn get_latest_quote(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<GetLatestQuoteParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<GetLatestQuoteParams>,
 ) -> ApiResult<impl IntoResponse> {
     let vs_currency = params.vs_currency.as_deref().unwrap_or("usd");
 
@@ -100,8 +97,8 @@ pub async fn get_latest_quote(
 /// keyset path, where that value defines the bound instead of the 48h default.
 pub async fn list_quotes(
     State(state): State<AppState>,
-    Path(coin_id): Path<String>,
-    Query(params): Query<ListQuotesParams>,
+    ApiPath(coin_id): ApiPath<String>,
+    ApiQuery(params): ApiQuery<ListQuotesParams>,
 ) -> ApiResult<impl IntoResponse> {
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -186,7 +183,7 @@ pub async fn list_quotes(
 //           newly-tracked coin, never a fake 0% change (REQ-API-303, D3).
 pub async fn list_latest_quotes(
     State(state): State<AppState>,
-    Query(params): Query<ListLatestQuotesParams>,
+    ApiQuery(params): ApiQuery<ListLatestQuotesParams>,
 ) -> ApiResult<impl IntoResponse> {
     let vs_currency = params.vs_currency.as_deref().unwrap_or("usd");
 
