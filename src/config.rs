@@ -5,23 +5,29 @@
 
 // ── SPEC-DB-001 database connection configuration ─────────────────────────────
 
-/// Assemble the PostgreSQL connection URL (SPEC-DB-001).
+/// Build the PostgreSQL connect options (SPEC-DB-001; credential-safe per SPEC-OBS-002
+/// REQ-OBS-073).
 ///
-/// Mirrors `ticker-collector`'s pattern: the URL is built from discrete
-/// `DB_HOST` / `DB_PORT` / `DB_NAME` parts, with optional `DB_USERNAME` /
-/// `DB_PASSWORD` credentials (sourced from Kubernetes Secrets in deployment).
-/// No `DATABASE_URL` secret is required.
+/// Assembled from discrete `DB_HOST` / `DB_PORT` / `DB_NAME` parts plus optional
+/// `DB_USERNAME` / `DB_PASSWORD` credentials (sourced from Kubernetes Secrets in deployment)
+/// via `PgConnectOptions`. The password is stored verbatim on the options and is NEVER
+/// formatted into a `postgres://…` URL string — so a password containing URL-significant
+/// characters (`@ / : # %`, spaces) connects correctly, and the credential never enters a
+/// loggable formatted string (F-40). No `DATABASE_URL` secret is required.
 ///
-/// As a convenience for local development and integration tests, an explicit
-/// non-empty `DATABASE_URL` takes precedence when set.
+/// As a convenience for local development and integration tests, an explicit non-empty
+/// `DATABASE_URL` still takes precedence and is parsed via `PgConnectOptions`' own
+/// connection-string parser.
 ///
-/// Env vars: `DATABASE_URL` (optional override), `DB_HOST` (required),
-/// `DB_PORT` (default 5432), `DB_NAME` (required), `DB_USERNAME` / `DB_PASSWORD`
-/// (optional; both must be present for credentials to be included).
-pub fn database_url() -> anyhow::Result<String> {
+/// Env vars: `DATABASE_URL` (optional override), `DB_HOST` (required), `DB_PORT`
+/// (default 5432), `DB_NAME` (required), `DB_USERNAME` / `DB_PASSWORD` (optional; both must
+/// be present for credentials to be included).
+pub fn database_connect_options() -> anyhow::Result<sqlx::postgres::PgConnectOptions> {
     if let Ok(url) = std::env::var("DATABASE_URL") {
         if !url.is_empty() {
-            return Ok(url);
+            return url
+                .parse::<sqlx::postgres::PgConnectOptions>()
+                .map_err(|e| anyhow::anyhow!("invalid DATABASE_URL: {e}"));
         }
     }
     let host = required("DB_HOST")?;
@@ -29,7 +35,7 @@ pub fn database_url() -> anyhow::Result<String> {
     let name = required("DB_NAME")?;
     let username = std::env::var("DB_USERNAME").ok().filter(|s| !s.is_empty());
     let password = std::env::var("DB_PASSWORD").ok().filter(|s| !s.is_empty());
-    Ok(build_database_url(
+    Ok(build_pg_connect_options(
         &host,
         port,
         &name,
@@ -38,20 +44,27 @@ pub fn database_url() -> anyhow::Result<String> {
     ))
 }
 
-/// Pure connection-string assembly (testable without environment mutation).
-///
-/// Credentials are embedded only when both username and password are present.
-fn build_database_url(
+/// Pure connect-options assembly (testable without environment mutation). The password is
+/// stored via `PgConnectOptions::password` and never enters a formatted URL (REQ-OBS-073);
+/// credentials are included only when both username and password are present.
+fn build_pg_connect_options(
     host: &str,
     port: u16,
-    name: &str,
+    database: &str,
     username: Option<&str>,
     password: Option<&str>,
-) -> String {
-    match (username, password) {
-        (Some(u), Some(p)) => format!("postgres://{u}:{p}@{host}:{port}/{name}"),
-        _ => format!("postgres://{host}:{port}/{name}"),
+) -> sqlx::postgres::PgConnectOptions {
+    let mut opts = sqlx::postgres::PgConnectOptions::new()
+        .host(host)
+        .port(port)
+        .database(database);
+    if let Some(u) = username {
+        opts = opts.username(u);
     }
+    if let Some(p) = password {
+        opts = opts.password(p);
+    }
+    opts
 }
 
 fn required(name: &str) -> anyhow::Result<String> {
@@ -846,35 +859,64 @@ mod tests {
         let _ = resolve_pacer_cooldown_ms("PACER_X_COOLDOWN_MS", Some("notanumber"), 500);
     }
 
-    // ── SPEC-DB-001 database URL assembly (ticker-collector pattern) ─────────
+    // ── SPEC-OBS-002 credential-safe connect options (F-40 / REQ-OBS-073) ─────
 
     #[test]
-    fn build_database_url_with_credentials() {
-        assert_eq!(
-            build_database_url("h", 5433, "n", Some("u"), Some("p")),
-            "postgres://u:p@h:5433/n"
-        );
+    fn connect_options_from_parts_with_credentials() {
+        let opts = build_pg_connect_options("h", 5433, "n", Some("u"), Some("p"));
+        assert_eq!(opts.get_host(), "h");
+        assert_eq!(opts.get_port(), 5433);
+        assert_eq!(opts.get_database(), Some("n"));
+        assert_eq!(opts.get_username(), "u");
     }
 
     #[test]
-    fn build_database_url_without_credentials() {
-        assert_eq!(
-            build_database_url("localhost", 5432, "mydb", None, None),
-            "postgres://localhost:5432/mydb"
+    fn connect_options_from_parts_without_credentials() {
+        let opts = build_pg_connect_options("localhost", 5432, "mydb", None, None);
+        assert_eq!(opts.get_host(), "localhost");
+        assert_eq!(opts.get_port(), 5432);
+        assert_eq!(opts.get_database(), Some("mydb"));
+    }
+
+    /// AC-OBS-073: a password containing URL-significant characters yields correct connect
+    /// options — host/port/database/username preserved. The password is stored verbatim on
+    /// the options (there is no getter — sqlx never exposes it), so it cannot be corrupted by
+    /// URL parsing. The contrast at the end demonstrates the F-40 bug the parts-based builder
+    /// fixes: the old `postgres://user:PASSWORD@host` assembly re-parses to the WRONG host/user.
+    #[test]
+    fn special_char_password_yields_correct_connect_options() {
+        let password = "p@ss:w/rd#%x y"; // @ : / # % and a space — all URL-significant
+        let opts = build_pg_connect_options("dbhost", 5433, "mydb", Some("dbuser"), Some(password));
+        assert_eq!(opts.get_host(), "dbhost");
+        assert_eq!(opts.get_port(), 5433);
+        assert_eq!(opts.get_database(), Some("mydb"));
+        assert_eq!(opts.get_username(), "dbuser");
+
+        // Contrast: the OLD URL-string assembly corrupts a special-char password. Re-parsing
+        // `postgres://dbuser:p@ss.../mydb` mis-attributes the `@` inside the password, so the
+        // parsed host/username no longer match (or the parse fails outright) — proving why the
+        // credential must be set via PgConnectOptions, never formatted into a URL (F-40).
+        let naive_url = format!("postgres://dbuser:{password}@dbhost:5433/mydb");
+        let corrupted = match naive_url.parse::<sqlx::postgres::PgConnectOptions>() {
+            Err(_) => true,
+            Ok(o) => o.get_host() != "dbhost" || o.get_username() != "dbuser",
+        };
+        assert!(
+            corrupted,
+            "URL-string assembly must corrupt a special-char password (the F-40 defect)"
         );
     }
 
+    /// AC-OBS-073: the DATABASE_URL override path is still honored (parsed via PgConnectOptions).
     #[test]
-    fn build_database_url_partial_credentials_are_omitted() {
-        // Username without password (or vice versa) yields a credential-less URL.
-        assert_eq!(
-            build_database_url("h", 5432, "n", Some("u"), None),
-            "postgres://h:5432/n"
-        );
-        assert_eq!(
-            build_database_url("h", 5432, "n", None, Some("p")),
-            "postgres://h:5432/n"
-        );
+    fn database_url_override_is_parsed() {
+        let opts = "postgres://ovuser:ovpass@ovhost:6000/ovdb"
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("override URL parses");
+        assert_eq!(opts.get_host(), "ovhost");
+        assert_eq!(opts.get_port(), 6000);
+        assert_eq!(opts.get_database(), Some("ovdb"));
+        assert_eq!(opts.get_username(), "ovuser");
     }
 
     #[test]

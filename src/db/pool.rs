@@ -65,6 +65,20 @@ pub fn connect_lazy(database_url: &str) -> Result<PgPool> {
     Ok(pool)
 }
 
+/// Build a lazy connection pool from pre-assembled [`sqlx::postgres::PgConnectOptions`]
+/// (SPEC-OBS-002 REQ-OBS-073, credential-safe).
+///
+/// Identical to [`connect_lazy`] but takes the credential-safe options built by
+/// `config::database_connect_options()` — the password is carried on the options, never
+/// formatted into a URL string. `connect_lazy_with` performs no I/O and is infallible (no
+/// connection-string parsing), so it returns the pool directly.
+pub fn connect_lazy_with(options: sqlx::postgres::PgConnectOptions) -> PgPool {
+    PgPoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .acquire_timeout(LAZY_ACQUIRE_TIMEOUT)
+        .connect_lazy_with(options)
+}
+
 /// Apply migrations, retrying with capped exponential backoff until the database
 /// is reachable (REQ-OBS-041).
 ///

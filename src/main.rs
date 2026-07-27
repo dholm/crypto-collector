@@ -115,10 +115,11 @@ async fn main() -> Result<()> {
     // `connect_lazy` performs no I/O — the pool is ready to hand to the health
     // server immediately. Migrations run in Step 8 with retry, so the health
     // listener can bind (and answer liveness) even while the DB is unreachable.
-    let database_url =
-        config::database_url().context("failed to resolve database connection settings")?;
-    let pool = crypto_collector::db::connect_lazy(&database_url)
-        .context("failed to build database connection pool")?;
+    // Credential-safe connect options assembled from parts (REQ-OBS-073): the DB password
+    // is carried on PgConnectOptions and never formatted into a URL string.
+    let connect_options = config::database_connect_options()
+        .context("failed to resolve database connection settings")?;
+    let pool = crypto_collector::db::connect_lazy_with(connect_options);
 
     // ── Step 5: Health state + shutdown channel ───────────────────────────────
     // Health state starts not-ready; readiness stays 503 until set_ready() (Step 10).
