@@ -15,13 +15,12 @@
 //! - `candle_insert_duration_seconds` — histogram for candle upserts
 //!
 //! > **Operator-visible rename (SPEC-OBS-002 F-38 / REQ-OBS-060)**: these two
-//! > histograms were previously *emitted* under the drifted names
-//! > `coin_quote_insert_duration_seconds` / `coin_candle_insert_duration_seconds`
-//! > while being *described* under the canonical names above. The emitters now
-//! > bind to the shared consts [`QUOTE_INSERT_DURATION_SECONDS`] /
-//! > [`CANDLE_INSERT_DURATION_SECONDS`], so the emitted series are the canonical
-//! > names. External Grafana dashboards/alerts keyed on the old `coin_*` series
-//! > MUST be migrated in lockstep.
+//! > histograms were previously *emitted* with a `coin_` prefix (each canonical name
+//! > above prefixed with `coin_`) while being *described* under the canonical names.
+//! > The emitters now bind to the shared consts [`QUOTE_INSERT_DURATION_SECONDS`] /
+//! > [`CANDLE_INSERT_DURATION_SECONDS`], so the emitted series are the canonical names.
+//! > External Grafana dashboards/alerts keyed on the old `coin_*` series MUST be
+//! > migrated in lockstep (the exact old→new mapping is in the M1 commit body).
 //!
 //! Registry gauges (REQ-OBS-013):
 //! - `tracked_coins` — total tracked coins
@@ -59,9 +58,9 @@ pub const HTTP_BUCKETS: &[f64] = &[
 //             describe/emit parity test all bind to these consts; a divergent string literal
 //             re-introduces the F-38 ghost-metric defect (a described name with no emitter, or
 //             an emitted name that is not described).
-// @MX:NOTE: [AUTO] F-38 operator-visible rename — the emitters previously recorded
-//           `coin_quote_insert_duration_seconds` / `coin_candle_insert_duration_seconds`; they
-//           now emit the canonical REQ-OBS-015 names below. External Grafana dashboards/alerts
+// @MX:NOTE: [AUTO] F-38 operator-visible rename — the emitters previously recorded these two
+//           series with a `coin_` prefix (each canonical name below prefixed with `coin_`);
+//           they now emit the canonical REQ-OBS-015 names. External Grafana dashboards/alerts
 //           keyed on the old `coin_*` series MUST migrate in lockstep.
 // @MX:SPEC: SPEC-OBS-002 REQ-OBS-060 REQ-OBS-061
 /// Histogram name for live-quote upsert latency (REQ-OBS-015; canonical, no `coin_` prefix).
