@@ -60,8 +60,11 @@ pub fn provider_unreachable_active(
     }
 }
 
-/// Pure: the Tier 1 desired-active-set derivable from the in-memory registry alone
-/// (provider-unreachable + all-providers-down). Pacer-derived Tier 1 conditions
+/// Pure: the per-provider Tier 1 desired-active-set derivable from the in-memory registry
+/// alone (provider-unreachable). `all-providers-down` is NOT produced here — it needs the
+/// sustained timer (REQ-ALARM-080), so the sweep layers `sustained_state_update` /
+/// `sustained_active` over the registry's raw `all_providers_down()` signal directly (the
+/// same shape as db-unreachable / db-pool-exhausted). Pacer-derived Tier 1 conditions
 /// (rate-limited, credit-exhausted) require a DB read; see [`pacer_rows_to_conditions`].
 pub fn registry_desired_conditions(
     registry: &HealthRegistry,
@@ -74,9 +77,6 @@ pub fn registry_desired_conditions(
         if provider_unreachable_active(&snap, now, provider_unreachable_threshold) {
             conditions.push(Condition::ProviderUnreachable { provider });
         }
-    }
-    if registry.all_providers_down() {
-        conditions.push(Condition::AllProvidersDown);
     }
     conditions
 }
@@ -252,6 +252,7 @@ pub fn compute_sweep_actions(
 /// Thresholds read once per sweep from `crate::config` (env vars).
 struct Thresholds {
     provider_unreachable: Duration,
+    all_providers_down: Duration,
     db_unreachable: Duration,
     queue_failed_threshold: u32,
     queue_failed_window_secs: i64,
@@ -272,6 +273,7 @@ impl Thresholds {
             provider_unreachable: Duration::from_secs(
                 crate::config::alarm_provider_unreachable_secs(),
             ),
+            all_providers_down: Duration::from_secs(crate::config::alarm_all_providers_down_secs()),
             db_unreachable: Duration::from_secs(crate::config::alarm_db_unreachable_secs()),
             queue_failed_threshold: crate::config::alarm_queue_failed_threshold(),
             queue_failed_window_secs: crate::config::alarm_queue_failed_window_secs() as i64,
@@ -296,16 +298,18 @@ impl Thresholds {
 /// detect active→inactive transitions for the optional Critical/Error fast-clear
 /// (REQ-ALARM-014); losing it (e.g. on restart) does not affect correctness.
 ///
-/// `db_unreachable_since`/`pool_saturation_since` are sustained-timer markers for the
-/// two conditions whose active signal needs "how long has this held continuously" —
-/// they are NOT correctness-critical either: losing them on restart merely resets the
-/// sustained clock (worst case, one extra reconcile interval before the alarm fires).
+/// `all_providers_down_since`/`db_unreachable_since`/`pool_saturation_since` are
+/// sustained-timer markers for the three conditions whose active signal needs "how long
+/// has this held continuously" — they are NOT correctness-critical either: losing them on
+/// restart merely resets the sustained clock (worst case, one extra reconcile interval
+/// before the alarm fires).
 pub struct Reconciler {
     client: Arc<AlarmClient>,
     registry: Arc<HealthRegistry>,
     pool: PgPool,
     interval: Duration,
     previously_active: Mutex<HashMap<String, Severity>>,
+    all_providers_down_since: Mutex<Option<Instant>>,
     db_unreachable_since: Mutex<Option<Instant>>,
     pool_saturation_since: Mutex<Option<Instant>>,
     first_sweep_done: std::sync::atomic::AtomicBool,
@@ -324,6 +328,7 @@ impl Reconciler {
             pool,
             interval,
             previously_active: Mutex::new(HashMap::new()),
+            all_providers_down_since: Mutex::new(None),
             db_unreachable_since: Mutex::new(None),
             pool_saturation_since: Mutex::new(None),
             first_sweep_done: std::sync::atomic::AtomicBool::new(false),
@@ -458,6 +463,24 @@ impl Reconciler {
 
         let mut conditions =
             registry_desired_conditions(&self.registry, now, thresholds.provider_unreachable);
+
+        // all-providers-down (REQ-ALARM-022 / SPEC-OBS-002 REQ-ALARM-080): sustained-timer
+        // over the registry's raw chain-outcome signal. The raw signal (`all_providers_down()`
+        // = most recent chain evidence is an all-failure) is fed through the same
+        // sustained_state_update / sustained_active helpers as db-unreachable, so the Critical
+        // alarm fires only after a continuous whole-chain outage across the window — a single
+        // sampled failure among successes cannot flip it, and (because failures dominate at
+        // sweep time during a real outage) a lone success blip between sweeps does not suppress it.
+        {
+            let mut since = self
+                .all_providers_down_since
+                .lock()
+                .expect("all_providers_down_since lock poisoned");
+            *since = sustained_state_update(self.registry.all_providers_down(), *since, now);
+            if sustained_active(*since, now, thresholds.all_providers_down) {
+                conditions.push(Condition::AllProvidersDown);
+            }
+        }
 
         // Pacer-derived: Tier 1 (rate-limited/credit-exhausted) + Tier 2 (missing-pacer-row).
         if let Some(rows) = self.pacer_rows().await {
@@ -603,6 +626,9 @@ impl Reconciler {
 /// (REQ-ALARM-018).
 pub async fn run_reconciler(reconciler: Arc<Reconciler>, mut shutdown: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(reconciler.interval());
+    // REQ-ALARM-082 (F-42/F-48): if a sweep runs long enough to miss ticks, skip the missed
+    // ticks rather than firing a burst of catch-up sweeps (consistent with `live_poller`).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = ticker.tick() => {
@@ -713,12 +739,125 @@ mod tests {
     }
 
     #[test]
-    fn registry_desired_conditions_includes_all_providers_down() {
+    fn registry_desired_conditions_excludes_all_providers_down() {
+        // all-providers-down is NO LONGER produced by registry_desired_conditions
+        // (SPEC-OBS-002 REQ-ALARM-080): it is a sustained-timer condition layered in the
+        // sweep, not a raw per-sweep push. This function now yields per-provider conditions
+        // only, so a raw all-failed flag must not appear here.
         let reg = HealthRegistry::new();
         reg.record_chain_all_failed();
         let conditions =
             registry_desired_conditions(&reg, Instant::now(), Duration::from_secs(300));
-        assert!(conditions.contains(&Condition::AllProvidersDown));
+        assert!(!conditions.contains(&Condition::AllProvidersDown));
+    }
+
+    // ── AC-ALARM-080: sustained all_providers_down (SPEC-OBS-002 REQ-ALARM-080 / F-42) ──
+    //
+    // The sweep composes `chain_all_failed_now` (registry raw signal) → `sustained_state_update`
+    // → `sustained_active`. These tests drive that exact composition with injected Instants
+    // across the window boundary (the reconciler samples at discrete sweep points).
+
+    use crate::alarm::registry::chain_all_failed_now;
+
+    #[test]
+    fn all_providers_down_not_raised_by_single_failure_among_successes() {
+        // A lone all-failed sample surrounded by successes: at each sweep the most recent
+        // evidence is a success, so the raw signal is false and the sustained marker never
+        // starts — the Critical alarm is not flipped by one coin's failure (F-42).
+        let window = Duration::from_secs(180);
+        let t0 = Instant::now();
+        let mut since = None;
+
+        // sweep 1: last outcome = success (success at t0 after a failure at t0-ε)
+        let cond = chain_all_failed_now(Some(t0), Some(t0 + Duration::from_millis(1)));
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(30));
+        assert!(!sustained_active(
+            since,
+            t0 + Duration::from_secs(30),
+            window
+        ));
+
+        // sweep 2 (well past the window): still success-dominant → never fires.
+        let cond = chain_all_failed_now(Some(t0), Some(t0 + Duration::from_secs(200)));
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(240));
+        assert!(!sustained_active(
+            since,
+            t0 + Duration::from_secs(240),
+            window
+        ));
+    }
+
+    #[test]
+    fn all_providers_down_raised_only_after_sustained_window() {
+        // Continuous all-failure (failures dominate at every sweep): the marker starts on the
+        // first all-failed sweep, holds, and the alarm fires only once the window elapses.
+        let window = Duration::from_secs(180);
+        let t0 = Instant::now();
+        let mut since = None;
+
+        // sweep 1 at t0: all-failed (no success yet) → marker starts, not yet active.
+        let cond = chain_all_failed_now(Some(t0), None);
+        since = sustained_state_update(cond, since, t0);
+        assert!(
+            !sustained_active(since, t0, window),
+            "not active immediately"
+        );
+
+        // sweep 2 at t0+90: still all-failed, marker held, below window → not active.
+        let cond = chain_all_failed_now(Some(t0 + Duration::from_secs(90)), None);
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(90));
+        assert!(!sustained_active(
+            since,
+            t0 + Duration::from_secs(90),
+            window
+        ));
+
+        // sweep 3 at t0+180: window elapsed with continuous failure → Critical fires.
+        let cond = chain_all_failed_now(Some(t0 + Duration::from_secs(180)), None);
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(180));
+        assert!(sustained_active(
+            since,
+            t0 + Duration::from_secs(180),
+            window
+        ));
+    }
+
+    #[test]
+    fn all_providers_down_not_suppressed_by_lone_success_blip() {
+        // Genuine outage with one lone success between sweeps: because failures resume before
+        // the next sweep, every SWEEP-TIME sample reads all-failed, so the sustained marker is
+        // never reset by the blip and the alarm still fires after the window (F-42).
+        let window = Duration::from_secs(180);
+        let t0 = Instant::now();
+        let mut since = None;
+
+        // sweep 1 at t0: all-failed → marker starts.
+        since = sustained_state_update(chain_all_failed_now(Some(t0), None), since, t0);
+
+        // A lone success lands at t0+60 (last_chain_success_at = t0+60), but the outage
+        // continues so last_all_failed_at advances to t0+120 before sweep 2 at t0+120.
+        // At sweep time the most recent evidence is a failure → raw signal still true.
+        let cond = chain_all_failed_now(
+            Some(t0 + Duration::from_secs(120)),
+            Some(t0 + Duration::from_secs(60)),
+        );
+        assert!(
+            cond,
+            "failures resumed after the blip → raw signal true at sweep time"
+        );
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(120));
+
+        // sweep 3 at t0+180: window elapsed, marker never reset by the blip → fires.
+        let cond = chain_all_failed_now(
+            Some(t0 + Duration::from_secs(180)),
+            Some(t0 + Duration::from_secs(60)),
+        );
+        since = sustained_state_update(cond, since, t0 + Duration::from_secs(180));
+        assert!(sustained_active(
+            since,
+            t0 + Duration::from_secs(180),
+            window
+        ));
     }
 
     #[test]

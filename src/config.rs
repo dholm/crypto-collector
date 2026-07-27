@@ -611,6 +611,20 @@ pub fn alarm_provider_unreachable_secs() -> u64 {
     parse_env_u64("ALARM_PROVIDER_UNREACHABLE_SECS", 300)
 }
 
+/// Sustained whole-chain-outage threshold before the `all_providers_down` Critical alarm
+/// activates (REQ-ALARM-022 / SPEC-OBS-002 REQ-ALARM-080). The chain-outcome signal must
+/// read all-failed continuously (at sweep granularity) for this long before the Critical
+/// alarm fires — long enough to ride out a transient blip, short enough to alert on a
+/// genuine total outage. Chosen at 180 s (OR-OBS2-2): shorter than the per-provider
+/// `ALARM_PROVIDER_UNREACHABLE_SECS` (300 s) because a whole-chain outage is more urgent,
+/// and a multiple of the 30 s reconcile interval so ~6 consecutive all-failed sweeps are
+/// required.
+///
+/// Env var: `ALARM_ALL_PROVIDERS_DOWN_SECS`. Default: 180 s.
+pub fn alarm_all_providers_down_secs() -> u64 {
+    parse_env_u64("ALARM_ALL_PROVIDERS_DOWN_SECS", 180)
+}
+
 /// Sustained readiness-ping failure threshold before the DB-unreachable Critical alarm
 /// activates (REQ-ALARM-030/051).
 ///

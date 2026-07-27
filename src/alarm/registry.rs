@@ -9,9 +9,11 @@
 //! upsert call sites, REQ-ALARM-042).
 //!
 //! @MX:NOTE: [AUTO] HealthRegistry enumerates exactly the counters/flags each condition
-//! reads: `providers` feeds provider-unreachable (REQ-ALARM-020); `all_providers_down`
-//! feeds all-providers-down (REQ-ALARM-022); `worker_restarts` feeds worker-crash-looping
-//! (REQ-ALARM-034); `upsert_failure_streak` feeds db-upsert-failures (REQ-ALARM-042).
+//! reads: `providers` feeds provider-unreachable (REQ-ALARM-020); the chain-outcome
+//! timestamps `last_all_failed_at` / `last_chain_success_at` feed all-providers-down
+//! (REQ-ALARM-022, sustained per SPEC-OBS-002 REQ-ALARM-080); `worker_restarts` feeds
+//! worker-crash-looping (REQ-ALARM-034); `upsert_failure_streak` feeds db-upsert-failures
+//! (REQ-ALARM-042).
 //! This registry drives DETECTION only — it is never a clear mechanism (recovery is
 //! server-driven via TTL, see `crate::alarm::reconciler`), so its imperfection or loss
 //! cannot strand an alarm.
@@ -44,9 +46,35 @@ pub struct ProviderHealth {
 #[derive(Default)]
 pub struct HealthRegistry {
     providers: Mutex<HashMap<String, ProviderHealth>>,
-    all_providers_down: Mutex<bool>,
+    /// Most recent time a chain fetch recorded EVERY attempt as a failure (REQ-ALARM-022 /
+    /// REQ-ALARM-080). Paired with `last_chain_success_at` to derive the sustained
+    /// all-providers-down signal — a timestamp pair, NOT a sampled last-outcome flag (F-42).
+    last_all_failed_at: Mutex<Option<Instant>>,
+    /// Most recent time a chain fetch recorded at least one success (REQ-ALARM-080).
+    last_chain_success_at: Mutex<Option<Instant>>,
     worker_restarts: Mutex<HashMap<String, Vec<Instant>>>,
     upsert_failure_streak: AtomicU32,
+}
+
+/// Pure: is the chain "all providers down" right now, given the two chain-outcome
+/// timestamps? True iff an all-failure has been recorded and no chain success has been
+/// recorded after it (the most recent chain evidence is an all-failure). This is the raw
+/// point-in-time signal; the reconciler layers the sustained timer
+/// (`sustained_state_update` / `sustained_active`, REQ-ALARM-080) on top so the Critical
+/// alarm reflects a SUSTAINED whole-chain outage, not a single sampled last-outcome flag.
+///
+/// A tie (`failed == success`, possible when two records land on the same monotonic
+/// `Instant`) resolves to NOT-down: a recorded success is never overridden by a
+/// simultaneous failure.
+pub fn chain_all_failed_now(
+    last_all_failed_at: Option<Instant>,
+    last_chain_success_at: Option<Instant>,
+) -> bool {
+    match (last_all_failed_at, last_chain_success_at) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(failed), Some(success)) => failed > success,
+    }
 }
 
 impl HealthRegistry {
@@ -91,42 +119,60 @@ impl HealthRegistry {
             .collect()
     }
 
-    /// Set the chain-outcome flag: a chain fetch recorded every attempt as a failure
-    /// (REQ-ALARM-022).
+    /// Stamp the chain-all-failed timestamp: a chain fetch recorded every attempt as a
+    /// failure (REQ-ALARM-022 / REQ-ALARM-080).
     pub fn record_chain_all_failed(&self) {
         *self
-            .all_providers_down
+            .last_all_failed_at
             .lock()
-            .expect("registry lock poisoned") = true;
+            .expect("registry lock poisoned") = Some(Instant::now());
     }
 
-    /// Clear the chain-outcome flag: a chain fetch recorded at least one success.
+    /// Stamp the chain-success timestamp: a chain fetch recorded at least one success
+    /// (REQ-ALARM-080).
     pub fn record_chain_success(&self) {
         *self
-            .all_providers_down
+            .last_chain_success_at
             .lock()
-            .expect("registry lock poisoned") = false;
+            .expect("registry lock poisoned") = Some(Instant::now());
     }
 
-    /// Current chain-outcome flag (REQ-ALARM-022 active signal).
+    /// Current raw all-providers-down signal (REQ-ALARM-022 active signal): the most recent
+    /// chain evidence is an all-failure. The reconciler feeds this into the sustained timer
+    /// (REQ-ALARM-080) so a single sampled failure cannot flip the Critical alarm.
     pub fn all_providers_down(&self) -> bool {
-        *self
-            .all_providers_down
+        let last_all_failed_at = *self
+            .last_all_failed_at
             .lock()
-            .expect("registry lock poisoned")
+            .expect("registry lock poisoned");
+        let last_chain_success_at = *self
+            .last_chain_success_at
+            .lock()
+            .expect("registry lock poisoned");
+        chain_all_failed_now(last_all_failed_at, last_chain_success_at)
     }
 
-    /// Convenience: derive provider-success/network-failure and chain-outcome updates
-    /// from a batch of `AttemptRecord`s (as produced by `chain_fetch_ohlc`/
-    /// `chain_fetch_ohlc_range`). Only `ProviderOutcome::Success`/`Failure` affect the
-    /// registry; `Unsupported` attempts are ignored (a provider that does not support
-    /// the capability is neither reachable nor unreachable evidence).
+    /// Convenience: derive the CHAIN-OUTCOME signal only (all-failed vs any-success) from a
+    /// batch of `AttemptRecord`s (as produced by `chain_fetch_ohlc` / `chain_fetch_ohlc_range`).
+    /// Among the attempted records (`Unsupported` filtered out — a provider that does not
+    /// support the capability is neither reachable nor unreachable evidence): any `Success`
+    /// stamps `last_chain_success_at`; all-`Failure` stamps `last_all_failed_at`.
     ///
-    /// Note: `AttemptRecord` does not carry the underlying `ProviderError`, so this
-    /// records ANY failure as a network failure for the provider-unreachable signal.
-    /// Callers with access to the concrete error (e.g. `chain_fetch_ohlc`'s per-attempt
-    /// match arms) should prefer the more precise `record_provider_network_failure`
-    /// gated on `ProviderError::Network` instead of calling this helper.
+    /// This helper does NOT update the per-provider network-failure streak. `AttemptRecord`
+    /// does not carry the underlying `ProviderError`, so this helper cannot distinguish a
+    /// `ProviderError::Network` (reachability) failure from a non-`Network` failure (e.g. a
+    /// repeated 5xx) — and the per-provider `provider-unreachable` streak counts ONLY
+    /// `Network` failures (REQ-ALARM-020). The concrete-error call sites in `chain_fetch_ohlc`
+    /// own that per-provider update, gated on `matches!(e, ProviderError::Network(_))`; this
+    /// helper deliberately leaves `consecutive_network_failures` untouched.
+    ///
+    // @MX:NOTE: [AUTO] OR-OBS2-3 (REQ-ALARM-081, doc/code drift) resolved — the CODE is
+    //           authoritative: `observe_chain_records` derives ONLY the chain-outcome signal
+    //           and never touches the per-provider streak; the per-provider streak counts
+    //           ONLY `ProviderError::Network` failures (non-Network 5xx do NOT count). The
+    //           prior doc claiming it "records ANY failure as a network failure" was wrong
+    //           and has been corrected here.
+    // @MX:SPEC: SPEC-OBS-002 REQ-ALARM-081 SPEC-ALARM-001 REQ-ALARM-020
     pub fn observe_chain_records(&self, records: &[AttemptRecord]) {
         let attempted: Vec<&AttemptRecord> = records
             .iter()
@@ -301,6 +347,24 @@ mod tests {
         reg.record_chain_all_failed();
         reg.record_chain_success();
         assert!(!reg.all_providers_down());
+    }
+
+    // ── chain_all_failed_now pure helper (REQ-ALARM-080) ───────────────────────
+
+    #[test]
+    fn chain_all_failed_now_semantics() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        // Never observed → not down.
+        assert!(!chain_all_failed_now(None, None));
+        // Failed, never succeeded → down.
+        assert!(chain_all_failed_now(Some(t0), None));
+        // Success after failure → not down.
+        assert!(!chain_all_failed_now(Some(t0), Some(t1)));
+        // Failure after success → down.
+        assert!(chain_all_failed_now(Some(t1), Some(t0)));
+        // Tie (same instant) → not down (a success is never overridden by a simultaneous failure).
+        assert!(!chain_all_failed_now(Some(t0), Some(t0)));
     }
 
     // ── observe_chain_records ───────────────────────────────────────────────────
