@@ -304,8 +304,8 @@ impl BinanceProvider {
     fn ticker_symbol(market: &MarketQuery) -> String {
         format!(
             "{}{}",
-            market.base.to_uppercase(),
-            market.quote.to_uppercase()
+            market.base().to_uppercase(),
+            market.quote().to_uppercase()
         )
     }
 }
@@ -340,7 +340,7 @@ impl Provider for BinanceProvider {
         })
         .await?;
 
-        normalise_ticker_24hr(&ticker, market.market_id, &market.vs_currency)
+        normalise_ticker_24hr(&ticker, market.market_id(), market.vs_currency())
     }
 
     async fn fetch_ohlc(
@@ -362,7 +362,7 @@ impl Provider for BinanceProvider {
 
         klines
             .iter()
-            .map(|v| normalise_kline(v, market.market_id, interval, &market.vs_currency))
+            .map(|v| normalise_kline(v, market.market_id(), interval, market.vs_currency()))
             .collect()
     }
 
@@ -395,7 +395,7 @@ impl Provider for BinanceProvider {
 
         klines
             .iter()
-            .map(|v| normalise_kline(v, market.market_id, interval, &market.vs_currency))
+            .map(|v| normalise_kline(v, market.market_id(), interval, market.vs_currency()))
             .collect()
     }
 
@@ -685,7 +685,7 @@ mod tests {
                 .expect("lazy pool");
         let provider = BinanceProvider::new(Some(server.uri()), pool);
 
-        let market = MarketQuery {
+        let market = MarketQuery::MarketKeyed {
             market_id: 7,
             coin_id: Some("bitcoin".to_string()),
             base: "BTC".to_string(),
@@ -999,7 +999,7 @@ mod tests {
                 .expect("lazy pool");
         let provider = BinanceProvider::new(Some(server.uri()), pool);
 
-        let market = MarketQuery {
+        let market = MarketQuery::MarketKeyed {
             market_id: 7,
             coin_id: Some("bitcoin".to_string()),
             base: "BTC".to_string(),

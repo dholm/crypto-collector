@@ -58,21 +58,95 @@ pub enum Capability {
     Derivatives,
 }
 
-/// Context for market-level provider calls.
+/// Context for market-level provider calls (SPEC-REFACTOR-001 M6, F-56 keyed query).
+///
+/// Keyed either by CoinGecko `coin_id` (every collection path) or by an internal
+/// market-registry id. The `CoinKeyed` variant structurally carries NO `market_id`: the
+/// coin-keyed collectors (live_poller, collection_queue, backfill) re-key the produced rows by
+/// `coin_id` and discard the model's `market_id`, so the old `market_id: 0 /* dummy */` sentinel
+/// is unrepresentable (REQ-REFACTOR-063). Providers read the shared fields through the accessor
+/// methods below rather than a possibly-dummy `market_id` field.
 #[derive(Debug, Clone)]
-pub struct MarketQuery {
-    /// Internal market registry ID (used to tag normalised models).
-    pub market_id: i64,
-    /// CoinGecko coin identifier (e.g. `"bitcoin"`); `None` for exchange-only providers.
-    pub coin_id: Option<String>,
-    /// Base asset symbol (e.g. `"BTC"`).
-    pub base: String,
-    /// Quote asset symbol (e.g. `"USDT"`).
-    pub quote: String,
-    /// Trading venue (e.g. `"binance"`); `None` = aggregator/CoinGecko source.
-    pub venue: Option<String>,
-    /// Price vs-currency (e.g. `"usd"`).
-    pub vs_currency: String,
+pub enum MarketQuery {
+    /// Coin-keyed context (CoinGecko `coin_id` path) — carries no market-registry id.
+    CoinKeyed {
+        /// CoinGecko coin identifier (e.g. `"bitcoin"`).
+        coin_id: String,
+        /// Base asset symbol (e.g. `"BTC"`).
+        symbol: String,
+        /// Quote asset symbol (e.g. `"USDT"`).
+        quote: String,
+        /// Price vs-currency (e.g. `"usd"`).
+        vs_currency: String,
+    },
+    /// Market-keyed context — identified by an internal market-registry id.
+    MarketKeyed {
+        /// Internal market registry ID (used to tag normalised models).
+        market_id: i64,
+        /// CoinGecko coin identifier (e.g. `"bitcoin"`); `None` for exchange-only providers.
+        coin_id: Option<String>,
+        /// Base asset symbol (e.g. `"BTC"`).
+        base: String,
+        /// Quote asset symbol (e.g. `"USDT"`).
+        quote: String,
+        /// Trading venue (e.g. `"binance"`); `None` = aggregator/CoinGecko source.
+        venue: Option<String>,
+        /// Price vs-currency (e.g. `"usd"`).
+        vs_currency: String,
+    },
+}
+
+impl MarketQuery {
+    /// Market-registry id to stamp on produced models.
+    ///
+    /// `CoinKeyed` has no registry id and returns `0` — the coin-keyed collectors discard the
+    /// produced model's `market_id` (they re-key rows by `coin_id`), so this projection is never
+    /// consumed on that path (behavior-preserving vs the former `market_id: 0` dummy).
+    pub fn market_id(&self) -> i64 {
+        match self {
+            MarketQuery::CoinKeyed { .. } => 0,
+            MarketQuery::MarketKeyed { market_id, .. } => *market_id,
+        }
+    }
+
+    /// CoinGecko coin identifier, if this query carries one.
+    pub fn coin_id(&self) -> Option<&str> {
+        match self {
+            MarketQuery::CoinKeyed { coin_id, .. } => Some(coin_id.as_str()),
+            MarketQuery::MarketKeyed { coin_id, .. } => coin_id.as_deref(),
+        }
+    }
+
+    /// Base asset symbol (`symbol` for coin-keyed, `base` for market-keyed).
+    pub fn base(&self) -> &str {
+        match self {
+            MarketQuery::CoinKeyed { symbol, .. } => symbol,
+            MarketQuery::MarketKeyed { base, .. } => base,
+        }
+    }
+
+    /// Quote asset symbol.
+    pub fn quote(&self) -> &str {
+        match self {
+            MarketQuery::CoinKeyed { quote, .. } | MarketQuery::MarketKeyed { quote, .. } => quote,
+        }
+    }
+
+    /// Trading venue, if any. `CoinKeyed` has none.
+    pub fn venue(&self) -> Option<&str> {
+        match self {
+            MarketQuery::CoinKeyed { .. } => None,
+            MarketQuery::MarketKeyed { venue, .. } => venue.as_deref(),
+        }
+    }
+
+    /// Price vs-currency.
+    pub fn vs_currency(&self) -> &str {
+        match self {
+            MarketQuery::CoinKeyed { vs_currency, .. }
+            | MarketQuery::MarketKeyed { vs_currency, .. } => vs_currency,
+        }
+    }
 }
 
 /// Normalised spot quote (provider-level, before DB write).
@@ -936,7 +1010,7 @@ mod tests {
     }
 
     fn stub_market() -> MarketQuery {
-        MarketQuery {
+        MarketQuery::MarketKeyed {
             market_id: 1,
             coin_id: Some("bitcoin".to_string()),
             base: "BTC".to_string(),

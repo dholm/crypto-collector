@@ -581,7 +581,7 @@ mod tests {
             .expect("lazy pool");
         // Override the empty default chain with the search stub; reuse AppState::test for the rest.
         let state = AppState {
-            chain: Arc::new(vec![
+            chain: Arc::from(vec![
                 Arc::new(SearchStubProvider { behavior }) as Arc<dyn crate::providers::Provider>
             ]),
             ..AppState::test(pool)

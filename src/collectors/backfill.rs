@@ -109,7 +109,11 @@ pub fn resolve_interval_secs(
     global_secs: i64,
 ) -> i64 {
     chunk_interval
-        .and_then(crate::api::candles_agg::interval_to_seconds)
+        .and_then(|iv| {
+            iv.parse::<crate::models::ApiInterval>()
+                .ok()
+                .map(|i| i.secs())
+        })
         .unwrap_or_else(|| {
             crate::config::effective_candle_interval_secs(live_poll_interval, global_secs)
         })
@@ -708,12 +712,10 @@ async fn process_chunk(
     let (symbol, live_poll_interval) =
         row.ok_or_else(|| DispatchError::Permanent(format!("coin {} not found", chunk.coin_id)))?;
 
-    let mq = MarketQuery {
-        market_id: 0,
-        coin_id: Some(chunk.coin_id.clone()),
-        base: symbol,
+    let mq = MarketQuery::CoinKeyed {
+        coin_id: chunk.coin_id.clone(),
+        symbol,
         quote: "USDT".to_string(),
-        venue: None,
         vs_currency: "usd".to_string(),
     };
 
@@ -861,7 +863,7 @@ async fn process_chunk(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_backfill_worker(
     pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
+    chain: Arc<[Arc<dyn Provider>]>,
     claimed_by: String,
     lease_secs: i64,
     heartbeat_interval_secs: u64,

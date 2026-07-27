@@ -130,7 +130,7 @@ pub struct AlarmComponents {
 // @MX:SPEC: SPEC-SCHED-001 REQ-SCHED-050 REQ-SCHED-051 SPEC-ALARM-001 REQ-ALARM-001 REQ-ALARM-010
 pub async fn spawn_workers(
     pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
+    chain: Arc<[Arc<dyn Provider>]>,
     cfg: WorkerConfig,
     mut shutdown_rx: watch::Receiver<bool>,
     alarm: Option<AlarmComponents>,
@@ -459,7 +459,7 @@ mod tests {
             .connect_lazy("postgres://localhost/does_not_exist")
             .expect("lazy pool");
 
-        let chain: Arc<Vec<Arc<dyn Provider>>> = Arc::new(vec![]);
+        let chain: Arc<[Arc<dyn Provider>]> = Arc::from(vec![]);
         let cfg = WorkerConfig::from_env();
 
         let handle = spawn_workers(pool, chain, cfg, rx, None).await;

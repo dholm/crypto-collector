@@ -420,12 +420,10 @@ async fn dispatch_item(
                 Ok(()) => {}
             }
 
-            let mq = MarketQuery {
-                market_id: 0, // dummy; coin-keyed dispatch does not use market_id
-                coin_id: Some(coin_id.clone()),
-                base: symbol,
+            let mq = MarketQuery::CoinKeyed {
+                coin_id: coin_id.clone(),
+                symbol,
                 quote: "USDT".to_string(),
-                venue: None,
                 vs_currency: "usd".to_string(),
             };
 
@@ -533,12 +531,10 @@ async fn dispatch_item(
                 }
             };
 
-            let mq = MarketQuery {
-                market_id: 0, // dummy; coin-keyed dispatch does not use market_id
-                coin_id: Some(coin_id.clone()),
-                base: symbol,
+            let mq = MarketQuery::CoinKeyed {
+                coin_id: coin_id.clone(),
+                symbol,
                 quote: "USDT".to_string(),
-                venue: None,
                 vs_currency: "usd".to_string(),
             };
 
@@ -796,7 +792,7 @@ async fn dispatch_item(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_collection_queue_worker(
     pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
+    chain: Arc<[Arc<dyn Provider>]>,
     claimed_by: String,
     lease_secs: i64,
     heartbeat_interval_secs: u64,

@@ -50,7 +50,7 @@ pub struct AppState {
     /// Database connection pool.
     pub pool: PgPool,
     /// Ordered provider chain (same instance as the background workers).
-    pub chain: Arc<Vec<Arc<dyn Provider>>>,
+    pub chain: Arc<[Arc<dyn Provider>]>,
     /// Provider name to use for search calls (typically the first in the chain).
     pub search_provider: String,
     /// Broadcast sender for coin spot quotes — WebSocket fan-out (REQ-API-148).
@@ -78,7 +78,7 @@ impl AppState {
     pub(crate) fn test(pool: PgPool) -> Self {
         AppState {
             pool,
-            chain: Arc::new(vec![]),
+            chain: Arc::from(vec![]),
             search_provider: "coingecko".to_string(),
             coin_quote_tx: broadcast::channel(16).0,
             coin_candle_tx: broadcast::channel(16).0,

@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
     // ── Step 8: Provider chain (SPEC-PROV-001) ─────────────────────────────────
     let provider_names = config::provider_names();
     let coingecko_cfg = crypto_collector::providers::CoinGeckoConfig::from_env();
-    let chain = Arc::new(
+    let chain: Arc<[Arc<dyn crypto_collector::providers::Provider>]> = Arc::from(
         match crypto_collector::providers::build_chain(&provider_names, coingecko_cfg, pool.clone())
         {
             Ok(chain) => chain,

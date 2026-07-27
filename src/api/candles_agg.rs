@@ -4,47 +4,25 @@
 //! All arithmetic uses `rust_decimal::Decimal`; no `f64` anywhere (REQ-API-216, REQ-PROV-012).
 //! `now` is always injected by the caller so pure logic remains hermetically testable.
 
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use crate::models::quote::CoinCandle;
+use crate::models::{quote::CoinCandle, ApiInterval};
 
 // ── Interval arithmetic ───────────────────────────────────────────────────────
 
-/// Map an interval string to its fixed-second duration.
+/// Resolve a stored interval string to its fixed-second duration via [`ApiInterval`].
 ///
-/// Covers the full stored vocabulary:
-/// - Binance: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`,
-///   `1d`, `3d`, `1w` (and the CoinGecko subset `30m`, `4h`, `4d`).
-/// - Returns `None` for `1M` (calendar month — non-fixed duration) and any
-///   unrecognised string.
-///
-// @MX:ANCHOR: [AUTO] interval_to_seconds — canonical interval→seconds table; every
-//             divisibility check in select_source_interval depends on this mapping.
-// @MX:REASON: Non-fixed-duration units (1M) MUST return None so they are never
-//             selected as aggregation sources (REQ-API-204). Adding a new stored
-//             interval string requires a matching entry here first (REQ-API-203/204).
-// @MX:SPEC: SPEC-API-003 REQ-API-203 REQ-API-204
-pub fn interval_to_seconds(interval: &str) -> Option<i64> {
-    match interval {
-        "1m" => Some(60),
-        "3m" => Some(180),
-        "5m" => Some(300),
-        "15m" => Some(900),
-        "30m" => Some(1_800),
-        "1h" => Some(3_600),
-        "2h" => Some(7_200),
-        "4h" => Some(14_400),
-        "6h" => Some(21_600),
-        "8h" => Some(28_800),
-        "12h" => Some(43_200),
-        "1d" => Some(86_400),
-        "3d" => Some(259_200),
-        "4d" => Some(345_600),
-        "1w" => Some(604_800),
-        // "1M" and any unrecognised string — non-fixed duration or unknown.
-        _ => None,
-    }
+/// The interval→seconds table now lives on `ApiInterval::secs()` (the single total source,
+/// SPEC-REFACTOR-001 M6 / DEC-2). This helper preserves the prior
+/// `interval_to_seconds(iv)? → Option<i64>` shape used by the divisibility filters:
+/// non-fixed-duration strings (`1M`) and any unknown string fail `ApiInterval::from_str` and
+/// therefore resolve to `None`, exactly as the retired standalone table returned `None`.
+#[inline]
+fn interval_secs(interval: &str) -> Option<i64> {
+    ApiInterval::from_str(interval).ok().map(|i| i.secs())
 }
 
 /// Stored-interval coverage: the `[earliest, latest]` timestamp span actually present
@@ -64,7 +42,7 @@ pub struct IntervalCoverage<'a> {
 ///
 /// Candidate divisors are the fixed-duration stored intervals with
 /// `source_secs < target_secs` and `target_secs % source_secs == 0` (non-fixed-duration
-/// strings like `1M` are excluded via `interval_to_seconds` returning `None`).
+/// strings like `1M` are excluded via `ApiInterval::from_str` failing → `None`).
 ///
 /// Among divisors, the one whose stored span best covers the requested window
 /// `[floor, now]` is chosen. Each divisor is scored by the seconds of that window it
@@ -88,10 +66,10 @@ pub struct IntervalCoverage<'a> {
 ///
 // @MX:ANCHOR: [AUTO] select_source_interval — correctness core for aggregation source selection
 // @MX:REASON: Divisibility is `target_secs % source_secs == 0`; non-fixed-duration
-//             intervals (e.g. `1M`) are excluded via interval_to_seconds returning None.
-//             Coverage score (deep-miss + stale-miss) is minimized; ties fall back to the
-//             larger divisor (REQ-API-205). fan_in >= 3: list_candles handler + unit tests
-//             + acceptance scenarios.
+//             intervals (e.g. `1M`) are excluded via ApiInterval::from_str failing (secs table
+//             folded into ApiInterval::secs, SPEC-REFACTOR-001 M6). Coverage score (deep-miss +
+//             stale-miss) is minimized; ties fall back to the larger divisor (REQ-API-205).
+//             fan_in >= 3: list_candles handler + unit tests + acceptance scenarios.
 // @MX:SPEC: SPEC-API-003 REQ-API-203 REQ-API-204 REQ-API-205
 pub fn select_source_interval<'a>(
     stored: &[IntervalCoverage<'a>],
@@ -100,11 +78,11 @@ pub fn select_source_interval<'a>(
     now: DateTime<Utc>,
 ) -> Option<&'a str> {
     // Candidate divisors: fixed-duration intervals strictly smaller than the target that
-    // divide it evenly (non-fixed-duration strings excluded via interval_to_seconds → None).
+    // divide it evenly (non-fixed-duration strings excluded via ApiInterval::from_str → None).
     let divisors: Vec<(i64, &IntervalCoverage)> = stored
         .iter()
         .filter_map(|c| {
-            let secs = interval_to_seconds(c.interval)?;
+            let secs = interval_secs(c.interval)?;
             (secs < target_secs && target_secs % secs == 0).then_some((secs, c))
         })
         .collect();
@@ -360,103 +338,16 @@ mod tests {
         }
     }
 
-    // ── T-001: interval_to_seconds ─────────────────────────────────────────────
-    // Scenario: every vocab string maps to the exact seconds (REQ-API-203/204).
-
+    // ── T-001: interval→seconds resolution (migrated onto ApiInterval) ─────────
+    // The standalone `interval_to_seconds` table was folded into `ApiInterval::secs()`
+    // (SPEC-REFACTOR-001 M6, F-54). The exhaustive interval→seconds table + `1M`/unknown
+    // exclusion is now proven in `crate::models::interval` tests (AC-REFACTOR-060a). This
+    // anchor keeps candles_agg's divisibility-vocabulary intent (REQ-API-203/204) covered:
+    // the aggregation source selector resolves the full stored vocabulary via the private
+    // `interval_secs` adapter, and non-fixed strings (`1M`) still resolve to `None`.
     #[test]
-    fn interval_seconds_1m() {
-        assert_eq!(interval_to_seconds("1m"), Some(60));
-    }
-
-    #[test]
-    fn interval_seconds_3m() {
-        assert_eq!(interval_to_seconds("3m"), Some(180));
-    }
-
-    #[test]
-    fn interval_seconds_5m() {
-        assert_eq!(interval_to_seconds("5m"), Some(300));
-    }
-
-    #[test]
-    fn interval_seconds_15m() {
-        assert_eq!(interval_to_seconds("15m"), Some(900));
-    }
-
-    #[test]
-    fn interval_seconds_30m() {
-        assert_eq!(interval_to_seconds("30m"), Some(1_800));
-    }
-
-    #[test]
-    fn interval_seconds_1h() {
-        assert_eq!(interval_to_seconds("1h"), Some(3_600));
-    }
-
-    #[test]
-    fn interval_seconds_2h() {
-        assert_eq!(interval_to_seconds("2h"), Some(7_200));
-    }
-
-    #[test]
-    fn interval_seconds_4h() {
-        assert_eq!(interval_to_seconds("4h"), Some(14_400));
-    }
-
-    #[test]
-    fn interval_seconds_6h() {
-        assert_eq!(interval_to_seconds("6h"), Some(21_600));
-    }
-
-    #[test]
-    fn interval_seconds_8h() {
-        assert_eq!(interval_to_seconds("8h"), Some(28_800));
-    }
-
-    #[test]
-    fn interval_seconds_12h() {
-        assert_eq!(interval_to_seconds("12h"), Some(43_200));
-    }
-
-    #[test]
-    fn interval_seconds_1d() {
-        assert_eq!(interval_to_seconds("1d"), Some(86_400));
-    }
-
-    #[test]
-    fn interval_seconds_3d() {
-        assert_eq!(interval_to_seconds("3d"), Some(259_200));
-    }
-
-    #[test]
-    fn interval_seconds_4d() {
-        assert_eq!(interval_to_seconds("4d"), Some(345_600));
-    }
-
-    #[test]
-    fn interval_seconds_1w() {
-        assert_eq!(interval_to_seconds("1w"), Some(604_800));
-    }
-
-    // REQ-API-204: 1M is not a fixed-second duration — must return None.
-    #[test]
-    fn interval_seconds_1m_calendar_month_is_none() {
-        assert_eq!(interval_to_seconds("1M"), None);
-    }
-
-    // REQ-API-204: unrecognised strings return None.
-    #[test]
-    fn interval_seconds_unknown_strings_are_none() {
-        assert_eq!(interval_to_seconds(""), None);
-        assert_eq!(interval_to_seconds("2d"), None);
-        assert_eq!(interval_to_seconds("10h"), None);
-        assert_eq!(interval_to_seconds("1hour"), None);
-        assert_eq!(interval_to_seconds("monthly"), None);
-    }
-
-    // Verify the full table in one pass (REQ-API-203 worked examples from spec.md).
-    #[test]
-    fn interval_seconds_full_table_matches_spec() {
+    fn interval_secs_resolves_full_vocabulary_and_excludes_non_fixed() {
+        // Full stored vocabulary (REQ-API-203) resolves to the same seconds ApiInterval owns.
         let table = [
             ("1m", 60i64),
             ("3m", 180),
@@ -475,10 +366,15 @@ mod tests {
             ("1w", 604_800),
         ];
         for (iv, expected) in table {
+            assert_eq!(interval_secs(iv), Some(expected), "interval_secs({iv:?})");
+        }
+        // REQ-API-204: non-fixed-duration (`1M`) and unknown strings are excluded (→ None),
+        // so they are never selected as an aggregation source.
+        for bad in ["1M", "", "2d", "10h", "1hour", "monthly"] {
             assert_eq!(
-                interval_to_seconds(iv),
-                Some(expected),
-                "interval_to_seconds({iv:?}) must be {expected}"
+                interval_secs(bad),
+                None,
+                "interval_secs({bad:?}) must be None"
             );
         }
     }
@@ -539,7 +435,7 @@ mod tests {
     // REQ-API-204: 1M is excluded even when present.
     #[test]
     fn select_excludes_calendar_month_interval() {
-        // 1M has no fixed second count → interval_to_seconds returns None → excluded.
+        // 1M has no fixed second count → ApiInterval::from_str fails → excluded.
         // "30m" remains as the only valid divisor of 1d (86400 % 1800 == 0).
         let stored = ["1M", "30m"].map(cov);
         let result = select_source_interval(&stored, 86_400, None, ts_epoch(SEL_NOW));

@@ -261,7 +261,7 @@ pub async fn defer_coin_poll(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_live_poller(
     pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
+    chain: Arc<[Arc<dyn Provider>]>,
     global_interval_secs: i64,
     claim_ttl_secs: i64,
     claim_batch_limit: i64,
@@ -338,12 +338,10 @@ async fn poll_cycle(
             break;
         }
 
-        let mq = MarketQuery {
-            market_id: 0, // dummy; coin-keyed path does not use market_id
-            coin_id: Some(coin.coin_id.clone()),
-            base: coin.symbol.clone(),
+        let mq = MarketQuery::CoinKeyed {
+            coin_id: coin.coin_id.clone(),
+            symbol: coin.symbol.clone(),
             quote: "USDT".to_string(),
-            venue: None,
             vs_currency: "usd".to_string(),
         };
 

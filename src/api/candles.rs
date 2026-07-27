@@ -16,23 +16,18 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    candles_agg::{
-        aggregate_candles, bucket_start, interval_to_seconds, select_source_interval,
-        IntervalCoverage,
-    },
+    candles_agg::{aggregate_candles, bucket_start, select_source_interval, IntervalCoverage},
     cursor::{decode_keyset_cursor, encode_keyset_cursor, paginate, validate_limit, TsKey},
     dto::{CoinCandleDto, Page},
     ensure_coin_exists,
     extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
 };
-use crate::models::quote::CoinCandle;
+use crate::models::{quote::CoinCandle, ApiInterval};
 
-/// Supported candle intervals (OR-API-1 resolved).
-///
-// @MX:NOTE: [AUTO] Supported candle intervals: 1m, 5m, 15m, 1h, 4h, 1d, 1w (OR-API-1)
-// @MX:SPEC: SPEC-API-001 OR-API-1 REQ-API-041
-pub const SUPPORTED_INTERVALS: &[&str] = &["1m", "5m", "15m", "1h", "4h", "1d", "1w"];
+// The former supported-intervals allow-list (OR-API-1) folded into `ApiInterval::is_api_facing()`
+// (SPEC-REFACTOR-001 M6, F-54): the API-facing subset {1m, 5m, 15m, 1h, 4h, 1d, 1w} is now
+// `ApiInterval::API_FACING`, and the public boundary validates via `validate_interval` below.
 
 // ── Query parameter types ─────────────────────────────────────────────────────
 
@@ -41,7 +36,7 @@ pub const SUPPORTED_INTERVALS: &[&str] = &["1m", "5m", "15m", "1h", "4h", "1d", 
 /// `Serialize` is derived for the F-59 parameter-parity test (src/api/mod.rs).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ListCandlesParams {
-    /// Required: must be one of SUPPORTED_INTERVALS (REQ-API-041).
+    /// Required: must be one of the API-facing intervals (`ApiInterval::is_api_facing`, REQ-API-041).
     pub interval: Option<String>,
     /// Optional: quote currency filter; defaults to `usd` (REQ-API-217).
     /// Unrecognised values are NOT rejected — they simply match no rows → 200 empty page.
@@ -76,7 +71,10 @@ pub async fn list_candles(
         .interval
         .as_deref()
         .ok_or_else(|| ApiError::BadRequest("'interval' query parameter is required".into()))?;
-    validate_interval(interval)?;
+    // Validate against the API-facing subset; a storage-only interval (e.g. `3m`) or any
+    // non-fixed string returns 400 without querying (REQ-API-041/215; behavior-preserving vs
+    // the removed supported-intervals allow-list, SPEC-REFACTOR-001 REQ-REFACTOR-062).
+    let requested_interval = validate_interval(interval)?;
 
     let limit = validate_limit(params.limit).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -158,10 +156,10 @@ pub async fn list_candles(
     // 1-month 4h series); coverage-aware selection avoids silently serving the shallow one.
     let coverage_rows = crate::db::interval_coverage(&state.pool, &coin_id, &vs_currency).await?;
 
-    // `interval` has already been validated against SUPPORTED_INTERVALS; all members of
-    // SUPPORTED_INTERVALS are present in interval_to_seconds → this expect never panics.
-    let target_secs =
-        interval_to_seconds(interval).expect("validated interval must have a known second count");
+    // `interval` was validated into `requested_interval` above; `ApiInterval::secs()` is total
+    // (no Option, no .expect — the old interval_to_seconds `.expect` panic path is gone,
+    // SPEC-REFACTOR-001 REQ-REFACTOR-061).
+    let target_secs = requested_interval.secs();
 
     // Wall-clock `now` is captured before source selection (staleness weighting) and reused
     // for aggregation bucket classification, so the pure logic never reads the system clock.
@@ -188,10 +186,14 @@ pub async fn list_candles(
         }
     };
 
-    // source_interval was returned by select_source_interval, which only returns strings
-    // that passed interval_to_seconds → this expect never panics.
-    let source_secs = interval_to_seconds(source_interval)
-        .expect("source interval selected from interval_to_seconds must have a known second count");
+    // source_interval was returned by select_source_interval, which only returns strings that
+    // parse as ApiInterval → this parse never fails in practice.
+    let source_secs = source_interval
+        .parse::<ApiInterval>()
+        .map(|i| i.secs())
+        .expect(
+            "source interval selected from ApiInterval vocabulary must have a known second count",
+        );
 
     // Hard ceiling on source rows fetched to bound memory regardless of the N multiplier
     // (e.g. 1w from 1m → N = 10 080; without a cap, limit=1000 would request ~10M rows).
@@ -310,16 +312,19 @@ pub async fn list_candles(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Validate `interval` against the supported set (REQ-API-041 / REQ-API-215).
-pub fn validate_interval(interval: &str) -> ApiResult<()> {
-    if SUPPORTED_INTERVALS.contains(&interval) {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(format!(
-            "unsupported interval '{interval}': must be one of {:?}",
-            SUPPORTED_INTERVALS
-        )))
-    }
+/// Validate `interval` against the API-facing set and return the parsed [`ApiInterval`]
+/// (REQ-API-041 / REQ-API-215; SPEC-REFACTOR-001 REQ-REFACTOR-062).
+///
+/// Only the API-facing subset `{1m, 5m, 15m, 1h, 4h, 1d, 1w}` is admitted. A storage-only
+/// interval (e.g. `3m`) or any non-fixed / unknown string returns 400 — identical to the prior
+/// supported-intervals `.contains` allow-list, now expressed as `ApiInterval::from_api_str`.
+pub fn validate_interval(interval: &str) -> ApiResult<ApiInterval> {
+    ApiInterval::from_api_str(interval).ok_or_else(|| {
+        let allowed: Vec<&str> = ApiInterval::API_FACING.iter().map(|i| i.as_str()).collect();
+        ApiError::BadRequest(format!(
+            "unsupported interval '{interval}': must be one of {allowed:?}"
+        ))
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -362,23 +367,32 @@ mod tests {
         assert_eq!(resp.status_code(), 400);
     }
 
-    // Scenario 6: all valid intervals are accepted (validate_interval).
+    // Scenario 6: all API-facing intervals are accepted (validate_interval).
     #[test]
-    fn all_supported_intervals_are_valid() {
-        for &iv in SUPPORTED_INTERVALS {
-            assert!(
-                validate_interval(iv).is_ok(),
-                "interval '{iv}' must be valid"
-            );
+    fn all_api_facing_intervals_are_valid() {
+        for iv in ApiInterval::API_FACING {
+            let s = iv.as_str();
+            let parsed = validate_interval(s).expect("api-facing interval must be valid");
+            assert_eq!(parsed, iv, "interval '{s}' must validate to {iv:?}");
         }
     }
 
-    // Scenario 6: invalid interval rejected.
+    // Scenario 6 (REQ-REFACTOR-062): invalid AND storage-only intervals are rejected.
     #[test]
     fn invalid_interval_is_rejected() {
+        // Non-fixed / unknown strings.
         assert!(validate_interval("3h").is_err());
         assert!(validate_interval("").is_err());
         assert!(validate_interval("1hour").is_err());
+        assert!(validate_interval("1M").is_err());
+        // Storage-only intervals (valid ApiInterval variants, but !is_api_facing) are rejected
+        // at the public boundary, exactly as the removed allow-list rejected them.
+        for storage_only in ["3m", "30m", "2h", "6h", "8h", "12h", "3d", "4d"] {
+            assert!(
+                validate_interval(storage_only).is_err(),
+                "storage-only interval '{storage_only}' must be rejected at the API boundary"
+            );
+        }
     }
 
     // Scenario 10 (REQ-API-071): invalid cursor → 400 on candles endpoint.
@@ -470,7 +484,7 @@ mod tests {
         assert_eq!(resolved, "eur");
     }
 
-    // Scenario 13 (REQ-API-215): 2h (not in SUPPORTED_INTERVALS) → 400 without querying.
+    // Scenario 13 (REQ-API-215): 2h (a storage-only interval) → 400 without querying.
     #[tokio::test]
     async fn list_candles_unsupported_interval_2h_returns_400() {
         let server = test_server();
@@ -478,7 +492,28 @@ mod tests {
             .get("/v1/coins/bitcoin/candles")
             .add_query_param("interval", "2h")
             .await;
-        assert_eq!(resp.status_code(), 400, "2h is not in SUPPORTED_INTERVALS");
+        assert_eq!(resp.status_code(), 400, "2h is not API-facing");
+    }
+
+    // AC-REFACTOR-062b (characterization, behavior-preserving): after folding the supported-intervals
+    // allow-list into ApiInterval::is_api_facing(), a public request for a STORAGE-ONLY interval (`3m`) STILL
+    // returns 400 WITHOUT issuing a query — identical to the prior allow-list rejection. This is
+    // NOT an intended behavior change. Runs without a live DB precisely because the 400 is emitted
+    // at the interval-validation boundary, before ensure_coin_exists / any SQL.
+    #[tokio::test]
+    async fn list_candles_storage_only_interval_3m_returns_400() {
+        let server = test_server();
+        let resp = server
+            .get("/v1/coins/bitcoin/candles")
+            .add_query_param("interval", "3m")
+            .await;
+        assert_eq!(
+            resp.status_code(),
+            400,
+            "storage-only interval 3m must return 400 at the public boundary (behavior-preserving)"
+        );
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["code"], "BAD_REQUEST");
     }
 
     // REQ-API-217: an unrecognised vs_currency must NOT be rejected with 400.
@@ -680,7 +715,7 @@ mod tests {
     }
 
     // Scenario 4 (REQ-API-204/205): non-API stored interval used as source.
-    // dogecoin stores 30m (not in SUPPORTED_INTERVALS); target 1h → source 30m.
+    // dogecoin stores 30m (a storage-only interval); target 1h → source 30m.
     #[tokio::test]
     #[ignore]
     async fn db_scenario_4_non_api_source_30m_for_1h() {

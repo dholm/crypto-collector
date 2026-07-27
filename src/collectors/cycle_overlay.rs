@@ -549,11 +549,11 @@ fn select_widest_source_interval<'a>(
     candidates: &[(&'a str, i64)],
     target_secs: i64,
 ) -> Option<&'a str> {
-    use crate::api::candles_agg::interval_to_seconds;
+    use crate::models::ApiInterval;
     candidates
         .iter()
         .filter_map(|&(name, coverage_secs)| {
-            let secs = interval_to_seconds(name)?;
+            let secs = name.parse::<ApiInterval>().ok()?.secs();
             // Must be a strictly-finer interval that tiles 1d evenly (same divisor rule).
             if secs < target_secs && target_secs % secs == 0 {
                 Some((coverage_secs, secs, name))
@@ -577,13 +577,14 @@ async fn aggregate_daily_from_finer(
     vs_currency: &str,
     as_of: Option<DateTime<Utc>>,
 ) -> Result<Vec<(NaiveDate, Decimal)>> {
-    use crate::api::candles_agg::interval_to_seconds;
+    use crate::models::ApiInterval;
 
     // Per-interval coverage span, so we can prefer the interval that reaches furthest back
     // rather than the coarsest one (which may only hold recent live data).
     let stored = crate::db::interval_coverage(pool, coin_id, vs_currency).await?;
 
-    let target_secs = interval_to_seconds("1d").expect("1d always has a known second count");
+    // ApiInterval::secs() is total — `1d` maps directly, no lookup/expect needed.
+    let target_secs = ApiInterval::D1.secs();
     let candidates: Vec<(&str, i64)> = stored
         .iter()
         .map(|(interval, min_ts, max_ts)| (interval.as_str(), (*max_ts - *min_ts).num_seconds()))

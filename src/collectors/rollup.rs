@@ -33,9 +33,9 @@ use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 
 use crate::api::candles_agg::{
-    aggregate_candles, bucket_start, interval_to_seconds, select_source_interval, IntervalCoverage,
+    aggregate_candles, bucket_start, select_source_interval, IntervalCoverage,
 };
-use crate::models::quote::CoinCandle;
+use crate::models::{quote::CoinCandle, ApiInterval};
 
 /// Rollup source-marker prefix (REQ-CANDLE-003), distinct from the ephemeral read-time
 /// `aggregated:<label>` marker that `aggregate_candles` stamps in-memory (never persisted).
@@ -500,8 +500,10 @@ pub async fn run_rollup(
             continue;
         };
         let source_interval = source_interval.to_string();
-        let source_secs = interval_to_seconds(&source_interval)
-            .expect("select_source_interval only returns intervals known to interval_to_seconds");
+        let source_secs = source_interval
+            .parse::<ApiInterval>()
+            .map(|i| i.secs())
+            .expect("select_source_interval only returns intervals known to ApiInterval");
 
         incremental_recompute_target(
             pool,

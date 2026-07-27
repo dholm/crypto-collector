@@ -226,8 +226,8 @@ impl BitstampProvider {
     fn pair_symbol(market: &MarketQuery) -> String {
         format!(
             "{}{}",
-            market.base.to_lowercase(),
-            market.vs_currency.to_lowercase()
+            market.base().to_lowercase(),
+            market.vs_currency().to_lowercase()
         )
     }
 }
@@ -262,7 +262,7 @@ impl Provider for BitstampProvider {
         .await?;
 
         rows.iter()
-            .map(|r| normalise_row(r, market.market_id, interval, &market.vs_currency))
+            .map(|r| normalise_row(r, market.market_id(), interval, market.vs_currency()))
             .collect()
     }
 
@@ -303,7 +303,7 @@ impl Provider for BitstampProvider {
         .await?;
 
         rows.iter()
-            .map(|r| normalise_row(r, market.market_id, interval, &market.vs_currency))
+            .map(|r| normalise_row(r, market.market_id(), interval, market.vs_currency()))
             .collect()
     }
 
@@ -356,7 +356,7 @@ mod tests {
     }
 
     fn market() -> MarketQuery {
-        MarketQuery {
+        MarketQuery::MarketKeyed {
             market_id: 7,
             coin_id: Some("bitcoin".to_string()),
             base: "BTC".to_string(),

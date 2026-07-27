@@ -130,7 +130,6 @@ pub fn ts_from_secs(secs: i64) -> Result<DateTime<Utc>, ProviderError> {
 #[derive(Debug, Deserialize)]
 struct CgMarketItem {
     id: String,
-    vs_currency: Option<String>,
     current_price: Option<serde_json::Number>,
     market_cap: Option<serde_json::Number>,
     fully_diluted_valuation: Option<serde_json::Number>,
@@ -590,7 +589,9 @@ fn normalise_market_item(
 
     Ok(CoinMarket {
         coin_id,
-        vs_currency: item.vs_currency.unwrap_or_else(|| vs_currency.to_string()),
+        // `/coins/markets` items carry no per-item vs_currency (it is a request query param),
+        // so the resolved currency comes from the caller (F-56: dead field removed).
+        vs_currency: vs_currency.to_string(),
         ts,
         price,
         market_cap,
@@ -652,17 +653,17 @@ pub fn coingecko_days_for_interval(interval: &str, requested_days: u32) -> u32 {
 ///
 /// `/ohlc/range` accepts only `"daily"` or `"hourly"` as the request `interval` param
 /// (confirmed via CoinGecko's official API reference), but those strings are ABSENT from
-/// the canonical `candles_agg::interval_to_seconds` vocabulary. The first tuple element is
+/// the canonical `ApiInterval` vocabulary. The first tuple element is
 /// therefore the API REQUEST param (`"daily"`/`"hourly"`); the second is the canonical
 /// STAMP (`"1d"`/`"1h"`) written on every returned candle. We snap by nearest-neighbour
 /// distance to the band midpoint (1h = 3 600 s, 1d = 86 400 s); ties resolve to daily.
 ///
 // @MX:ANCHOR: [AUTO] coingecko_range_snap_interval — canonical-stamp contract for the range path
 // @MX:REASON: F-20 — the /ohlc/range path stamped the API param strings "daily"/"hourly" as the
-//             candle `interval`, which are ABSENT from candles_agg::interval_to_seconds, so
+//             candle `interval`, which are ABSENT from the ApiInterval vocabulary, so
 //             range-backfilled rows were invisible to interval resolution and coverage selection.
-//             The canonical stamp this returns ("1d"/"1h") MUST be a member of
-//             candles_agg::interval_to_seconds (pairs with that @MX:ANCHOR); the tuple keeps the
+//             The canonical stamp this returns ("1d"/"1h") MUST be a member of the
+//             ApiInterval vocabulary (pairs with the ApiInterval::secs @MX:ANCHOR); the tuple keeps the
 //             API request param ("daily"/"hourly") separate from the stamp ("1d"/"1h"), mirroring
 //             Bitstamp's snap_to_bitstamp_step (step, canonical) split.
 // @MX:SPEC: SPEC-PROV-003 REQ-PROV-065 REQ-PROV-066
@@ -685,18 +686,6 @@ pub fn coingecko_range_max_span(interval: &str) -> chrono::Duration {
     match interval {
         "hourly" => chrono::Duration::days(31),
         _ => chrono::Duration::days(180),
-    }
-}
-
-/// Legacy helper kept for backward compatibility with existing tests.
-///
-/// Maps a `days` count to the CoinGecko auto-selected interval string.
-/// Prefer `coingecko_snap_interval` for new call-sites.
-pub fn coingecko_days_to_interval(days: u32) -> &'static str {
-    match days {
-        1 => "30m",
-        2..=30 => "4h",
-        _ => "4d",
     }
 }
 
@@ -1012,7 +1001,7 @@ impl Provider for CoinGeckoProvider {
     }
 
     async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-        let coin_id = market.coin_id.as_deref().ok_or_else(|| {
+        let coin_id = market.coin_id().ok_or_else(|| {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko spot"))
         })?;
 
@@ -1021,7 +1010,7 @@ impl Provider for CoinGeckoProvider {
         // borrow outlives the awaited future.
         let ids = [coin_id];
         let markets = transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
-            self.client.fetch_markets(&ids, &market.vs_currency)
+            self.client.fetch_markets(&ids, market.vs_currency())
         })
         .await?;
 
@@ -1031,7 +1020,7 @@ impl Provider for CoinGeckoProvider {
             .ok_or_else(|| ProviderError::Parse("no market data returned".to_string()))?;
 
         Ok(SpotQuote {
-            market_id: market.market_id,
+            market_id: market.market_id(),
             ts: cm.ts,
             price: cm.price,
             bid: None,
@@ -1048,7 +1037,7 @@ impl Provider for CoinGeckoProvider {
         days: u32,
         interval_secs: i64,
     ) -> Result<Vec<OhlcCandle>, ProviderError> {
-        let coin_id = market.coin_id.as_deref().ok_or_else(|| {
+        let coin_id = market.coin_id().ok_or_else(|| {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC"))
         })?;
 
@@ -1059,9 +1048,9 @@ impl Provider for CoinGeckoProvider {
         transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
             self.client.fetch_ohlc(
                 coin_id,
-                &market.vs_currency,
+                market.vs_currency(),
                 days,
-                market.market_id,
+                market.market_id(),
                 interval_secs,
             )
         })
@@ -1085,17 +1074,17 @@ impl Provider for CoinGeckoProvider {
             return Err(ProviderError::NotSupported(Capability::OhlcRange));
         }
 
-        let coin_id = market.coin_id.as_deref().ok_or_else(|| {
+        let coin_id = market.coin_id().ok_or_else(|| {
             ProviderError::Other(anyhow::anyhow!("coin_id required for CoinGecko OHLC range"))
         })?;
 
         transport::paced(&self.pool, &self.local_throttle, "coingecko", || {
             self.client.fetch_ohlc_range(
                 coin_id,
-                &market.vs_currency,
+                market.vs_currency(),
                 start,
                 end,
-                market.market_id,
+                market.market_id(),
                 interval_secs,
             )
         })
@@ -1139,17 +1128,12 @@ impl Provider for CoinGeckoProvider {
         })
         .await?;
 
-        let ticker = select_deriv_ticker(
-            &tickers,
-            &market.base,
-            &market.quote,
-            market.venue.as_deref(),
-        )
-        .ok_or_else(|| {
-            ProviderError::Parse(format!("no derivatives ticker for {}", market.base))
+        let ticker = select_deriv_ticker(&tickers, market.base(), market.quote(), market.venue())
+            .ok_or_else(|| {
+            ProviderError::Parse(format!("no derivatives ticker for {}", market.base()))
         })?;
 
-        normalise_deriv_ticker(ticker, market.market_id)
+        normalise_deriv_ticker(ticker, market.market_id())
     }
 
     async fn search_coins(
@@ -1458,16 +1442,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn coingecko_days_to_interval_maps_correctly() {
-        assert_eq!(coingecko_days_to_interval(1), "30m");
-        assert_eq!(coingecko_days_to_interval(2), "4h");
-        assert_eq!(coingecko_days_to_interval(7), "4h");
-        assert_eq!(coingecko_days_to_interval(30), "4h");
-        assert_eq!(coingecko_days_to_interval(31), "4d");
-        assert_eq!(coingecko_days_to_interval(90), "4d");
-        assert_eq!(coingecko_days_to_interval(365), "4d");
-    }
+    // Note: the legacy `coingecko_days_to_interval` helper (dead — no production caller) was
+    // removed in SPEC-REFACTOR-001 M6 (F-56). Its days→interval coverage is subsumed by the
+    // live `coingecko_days_for_interval` / `coingecko_range_snap_interval` tests below/above,
+    // which cover the interval-selection paths actually exercised in production.
 
     // ── coingecko_snap_interval: snaps interval_secs to nearest CG band ───────
 
@@ -1607,7 +1585,7 @@ mod tests {
             tier: Tier::Demo,
         };
         let provider = CoinGeckoProvider::new(cfg, pool);
-        let market = MarketQuery {
+        let market = MarketQuery::MarketKeyed {
             market_id: 1,
             coin_id: Some("bitcoin".to_string()),
             base: "BTC".to_string(),
@@ -1641,14 +1619,13 @@ mod tests {
     }
 
     /// Scenario 1 cross-module (REQ-PROV-066, AC-PROV-065): the canonical stamp the range
-    /// snap produces MUST be a member of the canonical `candles_agg::interval_to_seconds`
-    /// vocabulary — this ties the PRODUCER (coingecko range stamp) to the CONSUMER
-    /// (interval resolution). Before F-20 the range path stamped "daily"/"hourly", which
-    /// are ABSENT from that table, so range-backfilled rows were invisible to interval
-    /// resolution and coverage selection.
+    /// snap produces MUST be a member of the canonical `ApiInterval` vocabulary — this ties the
+    /// PRODUCER (coingecko range stamp) to the CONSUMER (interval resolution). Before F-20 the
+    /// range path stamped "daily"/"hourly", which are ABSENT from that vocabulary, so
+    /// range-backfilled rows were invisible to interval resolution and coverage selection.
     #[test]
-    fn range_stamp_resolves_through_interval_to_seconds_vocabulary() {
-        use crate::api::candles_agg::interval_to_seconds;
+    fn range_stamp_resolves_through_api_interval_vocabulary() {
+        use crate::models::ApiInterval;
 
         // Daily band → canonical "1d" → 86_400 s in the shared vocabulary.
         let (daily_param, daily_stamp) = coingecko_range_snap_interval(86_400);
@@ -1657,33 +1634,39 @@ mod tests {
             daily_stamp, "1d",
             "candles are stamped with the canonical name"
         );
-        assert_eq!(interval_to_seconds(daily_stamp), Some(86_400));
+        assert_eq!(
+            daily_stamp.parse::<ApiInterval>().map(|i| i.secs()),
+            Ok(86_400)
+        );
 
         // Hourly band → canonical "1h" → 3_600 s in the shared vocabulary.
         let (hourly_param, hourly_stamp) = coingecko_range_snap_interval(3_600);
         assert_eq!(hourly_param, "hourly");
         assert_eq!(hourly_stamp, "1h");
-        assert_eq!(interval_to_seconds(hourly_stamp), Some(3_600));
+        assert_eq!(
+            hourly_stamp.parse::<ApiInterval>().map(|i| i.secs()),
+            Ok(3_600)
+        );
 
         // The API param strings themselves are NOT members of the vocabulary — proving
         // the split is load-bearing (stamping them directly would orphan the rows).
-        assert_eq!(interval_to_seconds("daily"), None);
-        assert_eq!(interval_to_seconds("hourly"), None);
+        assert!("daily".parse::<ApiInterval>().is_err());
+        assert!("hourly".parse::<ApiInterval>().is_err());
     }
 
     /// Scenario 1 (REQ-PROV-066): a range candle normalised with the canonical stamp
     /// carries an interval present in the shared vocabulary (no orphan stamp).
     #[test]
     fn normalised_range_candle_interval_is_in_the_vocabulary() {
-        use crate::api::candles_agg::interval_to_seconds;
+        use crate::models::ApiInterval;
 
         let item = json!([1719820000000i64, 100.0, 110.0, 90.0, 105.0]);
         let (_param, canonical) = coingecko_range_snap_interval(86_400);
         let candle = normalise_ohlc_item(&item, 1, "usd", canonical).expect("normalise");
         assert_eq!(candle.interval, "1d");
         assert!(
-            interval_to_seconds(&candle.interval).is_some(),
-            "every stamped range interval must be a member of interval_to_seconds"
+            candle.interval.parse::<ApiInterval>().is_ok(),
+            "every stamped range interval must be a member of the ApiInterval vocabulary"
         );
     }
 
@@ -1744,7 +1727,7 @@ mod tests {
         assert!(candles.iter().all(|c| c.source == "coingecko"));
         // F-20: the outbound request `interval` param stays "daily" (asserted via the
         // query_param matcher above), but the candles are stamped with the CANONICAL "1d"
-        // — a member of candles_agg::interval_to_seconds — NOT the non-canonical "daily".
+        // — a member of the ApiInterval vocabulary — NOT the non-canonical "daily".
         assert!(candles.iter().all(|c| c.interval == "1d"));
     }
 
