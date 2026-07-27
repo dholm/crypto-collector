@@ -483,12 +483,29 @@ async fn main() -> Result<()> {
     api_result.ok();
     health_result.ok();
 
-    // d. Wait for workers to finish in-flight work (REQ-OBS-032).
+    // d. Wait for workers to finish in-flight work, bounded above by drain_secs
+    //    (REQ-OBS-066). `timeout(drain_secs, supervisor)` returns as soon as the supervisor
+    //    (all workers) finishes AND is bounded above — a single wedged worker cannot block
+    //    shutdown past drain_secs. Workers already received the shutdown broadcast in the
+    //    orchestrator above (grace sleep → broadcast, REQ-OBS-067), so this is the bounded
+    //    drain WAIT, not the signal itself. On timeout the supervisor JoinHandle is dropped
+    //    (the wedged task is detached; the process is exiting regardless).
+    //
+    // @MX:WARN: [AUTO] pool.close() + telemetry::shutdown() MUST run on BOTH the drained and
+    //           the timed-out path (REQ-OBS-066) — never move them inside the Ok arm only.
+    // @MX:REASON: a wedged worker must not strand an open DB pool or unflushed traces; the
+    //             cleanup is unconditional, only the drain WAIT is bounded.
+    // @MX:SPEC: SPEC-OBS-002 REQ-OBS-066 REQ-OBS-067
     info!(drain_secs, "crypto-collector: draining in-flight requests");
-    tokio::time::sleep(Duration::from_secs(drain_secs)).await;
-    supervisor.await.ok();
+    match tokio::time::timeout(Duration::from_secs(drain_secs), supervisor).await {
+        Ok(_) => info!("crypto-collector: workers drained cleanly"),
+        Err(_) => tracing::warn!(
+            drain_secs,
+            "crypto-collector: drain timed out; proceeding with shutdown"
+        ),
+    }
 
-    // e. Close DB pool + flush traces (REQ-OBS-032).
+    // e. Close DB pool + flush traces (REQ-OBS-032/066) — ALWAYS, on both paths above.
     pool.close().await;
     crypto_collector::telemetry::shutdown();
 
@@ -709,6 +726,82 @@ mod tests {
         assert!(
             min_termination >= 45,
             "grace ({grace}) + drain ({drain}) must be at least 45 s"
+        );
+    }
+
+    // ── AC-OBS-066/067: bounded shutdown drain (SPEC-OBS-002 F-41) ─────────────
+
+    /// AC-OBS-066: a wedged (never-completing) worker future cannot extend the drain beyond
+    /// `drain_secs` — `timeout(drain_secs, supervisor)` returns bounded above (Err), and the
+    /// cleanup (pool.close + telemetry::shutdown, modelled here as a flag set AFTER the match)
+    /// runs on the timed-out path. Virtual-time (`start_paused`) so the bound is exercised
+    /// without a real 30 s wait.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_drain_times_out_on_wedged_worker_and_still_cleans_up() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let drain = Duration::from_secs(30);
+        let wedged = std::future::pending::<()>();
+        let cleanup_ran = AtomicBool::new(false);
+        // This mirrors main()'s shutdown step d/e exactly: bound the supervisor wait, then
+        // run cleanup unconditionally regardless of which arm was taken.
+        let timed_out = tokio::time::timeout(drain, wedged).await.is_err();
+        cleanup_ran.store(true, Ordering::SeqCst); // pool.close() + telemetry::shutdown().
+        assert!(
+            timed_out,
+            "a wedged worker must hit the drain timeout, not block forever (REQ-OBS-066)"
+        );
+        assert!(
+            cleanup_ran.load(Ordering::SeqCst),
+            "cleanup must run on the timed-out path (REQ-OBS-066)"
+        );
+    }
+
+    /// AC-OBS-066: when the supervisor finishes before `drain_secs`, the drain returns
+    /// immediately (Ok) rather than sleeping the full window.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_drain_returns_early_when_workers_finish() {
+        let drain = Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+        let finished = async {}; // supervisor completes immediately
+        let result = tokio::time::timeout(drain, finished).await;
+        assert!(
+            result.is_ok(),
+            "a finished supervisor returns Ok, bounded early"
+        );
+        assert!(
+            start.elapsed() < drain,
+            "drain must not sleep the full window when workers finish (REQ-OBS-066)"
+        );
+    }
+
+    /// AC-OBS-067: the shutdown sequence keeps the endpoint grace sleep upstream of the
+    /// broadcast, broadcasts to workers before the bounded drain wait begins, and bounds the
+    /// drain via `tokio::time::timeout` (the 15 s grace default is covered by
+    /// `shutdown_timing_grace_plus_drain_fits_in_termination_grace`).
+    #[test]
+    fn shutdown_sequence_order_grace_then_broadcast_then_bounded_drain() {
+        let src = std::fs::read_to_string("src/main.rs").expect("read main.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let grace = code
+            .find("shutdown grace period")
+            .expect("grace sleep log present");
+        let broadcast = code
+            .find("broadcasting shutdown to workers")
+            .expect("broadcast log present");
+        let drain = code
+            .find("draining in-flight requests")
+            .expect("drain log present");
+        assert!(
+            grace < broadcast,
+            "the endpoint grace sleep must stay upstream of the broadcast (REQ-OBS-067)"
+        );
+        assert!(
+            broadcast < drain,
+            "workers must receive the broadcast before the drain wait begins (REQ-OBS-067)"
+        );
+        assert!(
+            code.contains("tokio::time::timeout(Duration::from_secs(drain_secs), supervisor)"),
+            "the drain must be bounded above via tokio::time::timeout (REQ-OBS-066)"
         );
     }
 

@@ -76,9 +76,12 @@ async fn run_listener(
         tokio::select! {
             biased;
 
-            // Honour graceful shutdown signal first.
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            // Honour graceful shutdown signal first. Break on the shutdown value AND on a
+            // dropped sender (`changed()` → Err): a dropped sender means the orchestrator is
+            // gone, so there is nothing left to wait for — breaking avoids busy-spinning on
+            // the immediately-ready error (REQ-OBS-068 / F-47).
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
                     info!(channel, "PG listener received shutdown; exiting");
                     break;
                 }
@@ -111,6 +114,26 @@ async fn run_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AC-OBS-068 (mechanical): the relay loop's shutdown select arm captures the result and
+    /// breaks on a dropped sender (`changed()` → Err), rather than busy-spinning on the
+    /// immediately-ready error (REQ-OBS-068 / F-47). Mirrors the worker-loop guards
+    /// (REQ-SCHED-065.3); the relay loop itself is DB-gated so this is the no-DB verification.
+    #[test]
+    fn listener_shutdown_arm_guards_dropped_sender() {
+        let src = std::fs::read_to_string("src/listener.rs").expect("read listener.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            code.contains("res.is_err()"),
+            "the relay loop shutdown arm must break on a dropped sender (REQ-OBS-068)"
+        );
+        // Needle built by concatenation so this assertion string is not itself a match.
+        let uncaptured = format!("_ {} shutdown_rx.changed()", "=");
+        assert!(
+            !code.contains(&uncaptured),
+            "no un-captured shutdown_rx.changed() arm may remain (REQ-OBS-068)"
+        );
+    }
 
     // Unit: verify the public function signatures compile — no DB needed.
     #[test]
