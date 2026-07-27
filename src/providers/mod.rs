@@ -265,7 +265,12 @@ pub struct AttemptRecord {
 //             this trait. The chain orchestrator and all workers program against Provider only.
 //             Adding/removing methods is a breaking change for all implementations and callers.
 //             fan_in >= 3 (chain, workers, tests). REQ-PROV-001.
-// @MX:SPEC: SPEC-PROV-001 REQ-PROV-001/003/004
+// @MX:NOTE: [AUTO] Every fetch_* method carries a capability-derived default body
+//           (Err(NotSupported(<capability>))); the search pair (search_coins,
+//           fetch_coin_tickers) defaults to Ok(vec![]) (Opt-A). Implementors override ONLY
+//           the capabilities they genuinely serve; name()/supports() stay mandatory
+//           (SPEC-REFACTOR-001 M1, F-50).
+// @MX:SPEC: SPEC-PROV-001 REQ-PROV-001/003/004 SPEC-REFACTOR-001 REQ-REFACTOR-010
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Provider identifier (e.g. `"coingecko"`, `"binance"`).
@@ -275,7 +280,12 @@ pub trait Provider: Send + Sync {
     fn supports(&self, cap: Capability) -> bool;
 
     /// Fetch a live spot quote for the given market.
-    async fn fetch_spot(&self, market: &MarketQuery) -> Result<SpotQuote, ProviderError>;
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::Spot))` — providers that do
+    /// not serve spot quotes rely on this default (SPEC-REFACTOR-001 M1, F-50).
+    async fn fetch_spot(&self, _market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::Spot))
+    }
 
     /// Fetch OHLC candles. `days` selects the lookback window; `interval_secs` is the
     /// desired candle granularity.
@@ -287,12 +297,16 @@ pub trait Provider: Send + Sync {
     /// granularity overrides the `days` band when they conflict.
     ///
     /// REQ-PROV-013: CoinGecko candles have `volume = None`.
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::Ohlc))`.
     async fn fetch_ohlc(
         &self,
-        market: &MarketQuery,
-        days: u32,
-        interval_secs: i64,
-    ) -> Result<Vec<OhlcCandle>, ProviderError>;
+        _market: &MarketQuery,
+        _days: u32,
+        _interval_secs: i64,
+    ) -> Result<Vec<OhlcCandle>, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::Ohlc))
+    }
 
     /// Fetch one page of OHLC candles at-or-after `start` and before `end`, ordered
     /// ascending, capped at the provider's per-call page limit (REQ-PROV-001 backfill).
@@ -317,17 +331,29 @@ pub trait Provider: Send + Sync {
     }
 
     /// Fetch slowly-changing coin metadata (descriptions, links, supply cap).
-    async fn fetch_coin_metadata(&self, coin_id: &str) -> Result<CoinMeta, ProviderError>;
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::CoinMetadata))`.
+    async fn fetch_coin_metadata(&self, _coin_id: &str) -> Result<CoinMeta, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::CoinMetadata))
+    }
 
     /// Fetch continuously-changing coin market aggregates (price, cap, supply, FDV).
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::CoinMarket))`.
     async fn fetch_coin_market(
         &self,
-        coin_id: &str,
-        vs_currency: &str,
-    ) -> Result<CoinMarket, ProviderError>;
+        _coin_id: &str,
+        _vs_currency: &str,
+    ) -> Result<CoinMarket, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::CoinMarket))
+    }
 
     /// Fetch the latest derivative tick (funding rate, OI, mark/index, basis).
-    async fn fetch_derivatives(&self, market: &MarketQuery) -> Result<DerivTick, ProviderError>;
+    ///
+    /// Default: `Err(ProviderError::NotSupported(Capability::Derivatives))`.
+    async fn fetch_derivatives(&self, _market: &MarketQuery) -> Result<DerivTick, ProviderError> {
+        Err(ProviderError::NotSupported(Capability::Derivatives))
+    }
 
     /// Search for coins by name / symbol (SPEC-PROV-001 REQ-PROV-005).
     ///
@@ -335,11 +361,17 @@ pub trait Provider: Send + Sync {
     /// Upstream non-success responses degrade to empty (REQ-PROV-005) and are WARN-logged by the
     /// client; callers should treat `Err` from this method as a network-level failure and may
     /// choose to degrade to empty rather than propagate.
+    ///
+    /// Default (Opt-A per SPEC-REFACTOR-001 DEC-3): `Ok(vec![])` — a non-directory provider
+    /// reports no search results rather than an error, keeping the search pair on this single
+    /// `Provider` trait (a separate `CoinDirectory` trait is deferred to SPEC-COINDIR-001).
     async fn search_coins(
         &self,
-        q: &str,
-        cap: usize,
-    ) -> Result<Vec<CoinSearchResult>, ProviderError>;
+        _q: &str,
+        _cap: usize,
+    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
+        Ok(vec![])
+    }
 
     /// Fetch trading pairs for a resolved coin ID from the provider (SPEC-PROV-001 REQ-PROV-005).
     ///
@@ -347,11 +379,15 @@ pub trait Provider: Send + Sync {
     /// anomaly tickers excluded. Providers that do not support ticker fetching return `Ok(vec![])`.
     /// Upstream non-success responses degrade to empty (REQ-PROV-005) and are WARN-logged by the
     /// client; callers should treat `Err` as a network-level failure and may degrade to empty.
+    ///
+    /// Default (Opt-A per SPEC-REFACTOR-001 DEC-3): `Ok(vec![])`.
     async fn fetch_coin_tickers(
         &self,
-        coin_id: &str,
-        cap: usize,
-    ) -> Result<Vec<MarketSearchResult>, ProviderError>;
+        _coin_id: &str,
+        _cap: usize,
+    ) -> Result<Vec<MarketSearchResult>, ProviderError> {
+        Ok(vec![])
+    }
 }
 
 // ── Chain builder ─────────────────────────────────────────────────────────────
@@ -730,12 +766,10 @@ mod tests {
         fn supports(&self, _cap: Capability) -> bool {
             true
         }
-        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-            Err(ProviderError::Http {
-                status: 500,
-                body: "stub error".to_string(),
-            })
-        }
+        // Only fetch_ohlc is exercised (via chain_fetch_ohlc). fetch_ohlc_range relies on the
+        // trait default (Err(NotSupported(OhlcRange))), which is exactly what the
+        // error-not-masked range test asserts. Every other fetch method relies on trait
+        // defaults and is never called here.
         async fn fetch_ohlc(
             &self,
             _m: &MarketQuery,
@@ -746,42 +780,6 @@ mod tests {
                 status: 500,
                 body: "stub error".to_string(),
             })
-        }
-        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-            Err(ProviderError::Http {
-                status: 500,
-                body: "stub error".to_string(),
-            })
-        }
-        async fn fetch_coin_market(
-            &self,
-            _id: &str,
-            _vs: &str,
-        ) -> Result<CoinMarket, ProviderError> {
-            Err(ProviderError::Http {
-                status: 500,
-                body: "stub error".to_string(),
-            })
-        }
-        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
-            Err(ProviderError::Http {
-                status: 500,
-                body: "stub error".to_string(),
-            })
-        }
-        async fn search_coins(
-            &self,
-            _q: &str,
-            _cap: usize,
-        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_tickers(
-            &self,
-            _coin_id: &str,
-            _cap: usize,
-        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-            Ok(vec![])
         }
     }
 
@@ -793,18 +791,8 @@ mod tests {
         fn supports(&self, _cap: Capability) -> bool {
             true
         }
-        async fn fetch_spot(&self, m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-            Ok(SpotQuote {
-                market_id: m.market_id,
-                ts: Utc::now(),
-                price: rust_decimal_macros::dec!(100),
-                bid: None,
-                ask: None,
-                volume_24h: None,
-                vs_currency: m.vs_currency.clone(),
-                source: "stub_success".to_string(),
-            })
-        }
+        // Only fetch_ohlc is exercised (via chain_fetch_ohlc); every other fetch method
+        // relies on trait defaults and is never called here.
         async fn fetch_ohlc(
             &self,
             _m: &MarketQuery,
@@ -812,33 +800,6 @@ mod tests {
             _interval_secs: i64,
         ) -> Result<Vec<OhlcCandle>, ProviderError> {
             Ok(self.candles.clone())
-        }
-        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMetadata))
-        }
-        async fn fetch_coin_market(
-            &self,
-            _id: &str,
-            _vs: &str,
-        ) -> Result<CoinMarket, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMarket))
-        }
-        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Derivatives))
-        }
-        async fn search_coins(
-            &self,
-            _q: &str,
-            _cap: usize,
-        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_tickers(
-            &self,
-            _coin_id: &str,
-            _cap: usize,
-        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-            Ok(vec![])
         }
     }
 
@@ -920,47 +881,8 @@ mod tests {
             fn supports(&self, _cap: Capability) -> bool {
                 false // supports nothing
             }
-            async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-                Err(ProviderError::NotSupported(Capability::Spot))
-            }
-            async fn fetch_ohlc(
-                &self,
-                _m: &MarketQuery,
-                _d: u32,
-                _interval_secs: i64,
-            ) -> Result<Vec<OhlcCandle>, ProviderError> {
-                Err(ProviderError::NotSupported(Capability::Ohlc))
-            }
-            async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-                Err(ProviderError::NotSupported(Capability::CoinMetadata))
-            }
-            async fn fetch_coin_market(
-                &self,
-                _id: &str,
-                _vs: &str,
-            ) -> Result<CoinMarket, ProviderError> {
-                Err(ProviderError::NotSupported(Capability::CoinMarket))
-            }
-            async fn fetch_derivatives(
-                &self,
-                _m: &MarketQuery,
-            ) -> Result<DerivTick, ProviderError> {
-                Err(ProviderError::NotSupported(Capability::Derivatives))
-            }
-            async fn search_coins(
-                &self,
-                _q: &str,
-                _cap: usize,
-            ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-                Ok(vec![])
-            }
-            async fn fetch_coin_tickers(
-                &self,
-                _coin_id: &str,
-                _cap: usize,
-            ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-                Ok(vec![])
-            }
+            // No fetch method is exercised: chain_fetch_ohlc skips this provider on
+            // supports(Ohlc)=false, so every fetch method relies on the trait defaults.
         }
 
         let chain: Vec<Arc<dyn Provider>> = vec![Arc::new(UnsupportedProvider)];
@@ -1009,45 +931,9 @@ mod tests {
         fn supports(&self, cap: Capability) -> bool {
             matches!(cap, Capability::Ohlc) // Ohlc yes, OhlcRange no
         }
-        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Spot))
-        }
-        async fn fetch_ohlc(
-            &self,
-            _m: &MarketQuery,
-            _d: u32,
-            _interval_secs: i64,
-        ) -> Result<Vec<OhlcCandle>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMetadata))
-        }
-        async fn fetch_coin_market(
-            &self,
-            _id: &str,
-            _vs: &str,
-        ) -> Result<CoinMarket, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMarket))
-        }
-        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Derivatives))
-        }
-        async fn search_coins(
-            &self,
-            _q: &str,
-            _cap: usize,
-        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_tickers(
-            &self,
-            _coin_id: &str,
-            _cap: usize,
-        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        // fetch_ohlc_range: relies on the trait default (NotSupported).
+        // Skipped by chain_fetch_ohlc_range (supports(OhlcRange)=false), so no fetch method
+        // is exercised — every one relies on the trait defaults (fetch_ohlc_range's default
+        // is Err(NotSupported(OhlcRange))).
     }
 
     #[async_trait]
@@ -1058,17 +944,8 @@ mod tests {
         fn supports(&self, cap: Capability) -> bool {
             matches!(cap, Capability::Ohlc | Capability::OhlcRange)
         }
-        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Spot))
-        }
-        async fn fetch_ohlc(
-            &self,
-            _m: &MarketQuery,
-            _d: u32,
-            _interval_secs: i64,
-        ) -> Result<Vec<OhlcCandle>, ProviderError> {
-            Ok(vec![])
-        }
+        // Only fetch_ohlc_range is exercised; every other fetch method relies on trait
+        // defaults and is never called here.
         async fn fetch_ohlc_range(
             &self,
             _m: &MarketQuery,
@@ -1077,33 +954,6 @@ mod tests {
             _interval_secs: i64,
         ) -> Result<Vec<OhlcCandle>, ProviderError> {
             Ok(self.candles.clone())
-        }
-        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMetadata))
-        }
-        async fn fetch_coin_market(
-            &self,
-            _id: &str,
-            _vs: &str,
-        ) -> Result<CoinMarket, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMarket))
-        }
-        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Derivatives))
-        }
-        async fn search_coins(
-            &self,
-            _q: &str,
-            _cap: usize,
-        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_tickers(
-            &self,
-            _coin_id: &str,
-            _cap: usize,
-        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-            Ok(vec![])
         }
     }
 
@@ -1161,17 +1011,8 @@ mod tests {
         fn supports(&self, cap: Capability) -> bool {
             matches!(cap, Capability::Ohlc | Capability::OhlcRange)
         }
-        async fn fetch_spot(&self, _m: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Spot))
-        }
-        async fn fetch_ohlc(
-            &self,
-            _m: &MarketQuery,
-            _d: u32,
-            _i: i64,
-        ) -> Result<Vec<OhlcCandle>, ProviderError> {
-            Ok(vec![])
-        }
+        // Only fetch_ohlc_range is exercised — it returns Ok(empty) to drive the
+        // continue-on-empty fallthrough. Every other fetch method relies on trait defaults.
         async fn fetch_ohlc_range(
             &self,
             _m: &MarketQuery,
@@ -1179,33 +1020,6 @@ mod tests {
             _end: DateTime<Utc>,
             _i: i64,
         ) -> Result<Vec<OhlcCandle>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_metadata(&self, _id: &str) -> Result<CoinMeta, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMetadata))
-        }
-        async fn fetch_coin_market(
-            &self,
-            _id: &str,
-            _vs: &str,
-        ) -> Result<CoinMarket, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::CoinMarket))
-        }
-        async fn fetch_derivatives(&self, _m: &MarketQuery) -> Result<DerivTick, ProviderError> {
-            Err(ProviderError::NotSupported(Capability::Derivatives))
-        }
-        async fn search_coins(
-            &self,
-            _q: &str,
-            _cap: usize,
-        ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-            Ok(vec![])
-        }
-        async fn fetch_coin_tickers(
-            &self,
-            _coin_id: &str,
-            _cap: usize,
-        ) -> Result<Vec<MarketSearchResult>, ProviderError> {
             Ok(vec![])
         }
     }
@@ -1299,5 +1113,109 @@ mod tests {
             result.is_err(),
             "a provider error after an earlier Ok(empty) must surface as Err, not Ok(empty)"
         );
+    }
+
+    // ── SPEC-REFACTOR-001 M1 (F-50): capability-derived trait defaults ────────────
+
+    /// AC-REFACTOR-011a — object-safety preserved: `Arc<dyn Provider>` construction and
+    /// `build_chain` compile after the trait gains default bodies. No default introduces a
+    /// generic type parameter, so `dyn Provider` remains constructible and the chain the
+    /// workers consume still builds.
+    #[tokio::test]
+    async fn provider_trait_object_safety_and_chain_build() {
+        fn assert_object_safe(_p: &dyn Provider) {}
+
+        let names = vec![
+            "coingecko".to_string(),
+            "coinbase".to_string(),
+            "kraken".to_string(),
+        ];
+        let chain: Vec<Arc<dyn Provider>> = build_chain(&names, demo_config(), test_pool())
+            .expect("build_chain must construct an Arc<dyn Provider> chain");
+        assert_eq!(chain.len(), 3);
+        for provider in &chain {
+            // Exercise the trait-object vtable — proves `dyn Provider` is object-safe.
+            assert_object_safe(provider.as_ref());
+        }
+    }
+
+    /// AC-REFACTOR-010 / AC-REFACTOR-014a — characterization (behavior preservation): after
+    /// coinbase.rs / kraken.rs shed their explicit stub bodies, both STILL return exactly the
+    /// prior behavior via the trait defaults — `Err(NotSupported(<capability>))` for every
+    /// fetch method and `Ok(vec![])` for the Opt-A search pair. (This test lives in mod.rs, not
+    /// in coinbase.rs / kraken.rs, so the AC-REFACTOR-012a `grep -c NotSupported` anchor on
+    /// those two files stays 0.)
+    #[tokio::test]
+    async fn coinbase_and_kraken_fetch_methods_default_to_prior_behavior() {
+        let pool = test_pool();
+        let coinbase = CoinbaseProvider::new(pool.clone());
+        let kraken = KrakenProvider::new(pool.clone());
+        let m = stub_market();
+        let now = Utc::now();
+
+        let cases: [(&str, &dyn Provider); 2] = [
+            ("coinbase", &coinbase as &dyn Provider),
+            ("kraken", &kraken as &dyn Provider),
+        ];
+
+        for (label, p) in cases {
+            assert!(
+                matches!(
+                    p.fetch_spot(&m).await,
+                    Err(ProviderError::NotSupported(Capability::Spot))
+                ),
+                "{label} fetch_spot must default to NotSupported(Spot)"
+            );
+            assert!(
+                matches!(
+                    p.fetch_ohlc(&m, 7, 60).await,
+                    Err(ProviderError::NotSupported(Capability::Ohlc))
+                ),
+                "{label} fetch_ohlc must default to NotSupported(Ohlc)"
+            );
+            assert!(
+                matches!(
+                    p.fetch_ohlc_range(&m, now, now, 60).await,
+                    Err(ProviderError::NotSupported(Capability::OhlcRange))
+                ),
+                "{label} fetch_ohlc_range must default to NotSupported(OhlcRange)"
+            );
+            assert!(
+                matches!(
+                    p.fetch_coin_metadata("bitcoin").await,
+                    Err(ProviderError::NotSupported(Capability::CoinMetadata))
+                ),
+                "{label} fetch_coin_metadata must default to NotSupported(CoinMetadata)"
+            );
+            assert!(
+                matches!(
+                    p.fetch_coin_market("bitcoin", "usd").await,
+                    Err(ProviderError::NotSupported(Capability::CoinMarket))
+                ),
+                "{label} fetch_coin_market must default to NotSupported(CoinMarket)"
+            );
+            assert!(
+                matches!(
+                    p.fetch_derivatives(&m).await,
+                    Err(ProviderError::NotSupported(Capability::Derivatives))
+                ),
+                "{label} fetch_derivatives must default to NotSupported(Derivatives)"
+            );
+            // Opt-A search pair defaults to Ok(vec![]) (DEC-3 / AC-REFACTOR-014a).
+            assert!(
+                p.search_coins("btc", 5)
+                    .await
+                    .expect("search_coins default must be Ok")
+                    .is_empty(),
+                "{label} search_coins must default to Ok(vec![])"
+            );
+            assert!(
+                p.fetch_coin_tickers("bitcoin", 5)
+                    .await
+                    .expect("fetch_coin_tickers default must be Ok")
+                    .is_empty(),
+                "{label} fetch_coin_tickers must default to Ok(vec![])"
+            );
+        }
     }
 }

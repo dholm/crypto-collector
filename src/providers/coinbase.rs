@@ -1,16 +1,16 @@
 //! Coinbase exchange provider stub (SPEC-PROV-001).
 //!
-//! Valid member of the provider chain (REQ-PROV-002/003) but returns `NotSupported` for all
-//! capabilities in this SPEC scope. Full implementation is deferred to a future SPEC.
+//! Valid member of the provider chain (REQ-PROV-002/003) that supports no capability in
+//! this SPEC scope: every fetch method resolves through the `Provider` trait's
+//! capability-derived defaults (SPEC-REFACTOR-001 M1, F-50). Full implementation is
+//! deferred to a future SPEC.
 
-use super::{
-    Capability, CoinMarket, CoinMeta, CoinSearchResult, DerivTick, MarketQuery, MarketSearchResult,
-    OhlcCandle, Provider, ProviderError, SpotQuote,
-};
+use super::{Capability, Provider};
 use async_trait::async_trait;
 use sqlx::PgPool;
 
-/// Coinbase provider stub — valid chain member, all capabilities `NotSupported`.
+/// Coinbase provider stub — valid chain member, supports no capability (all fetch methods
+/// resolve to the `Provider` trait defaults).
 pub struct CoinbaseProvider {
     _pool: PgPool,
 }
@@ -29,51 +29,6 @@ impl Provider for CoinbaseProvider {
 
     fn supports(&self, _cap: Capability) -> bool {
         false
-    }
-
-    async fn fetch_spot(&self, _market: &MarketQuery) -> Result<SpotQuote, ProviderError> {
-        Err(ProviderError::NotSupported(Capability::Spot))
-    }
-
-    async fn fetch_ohlc(
-        &self,
-        _market: &MarketQuery,
-        _days: u32,
-        _interval_secs: i64,
-    ) -> Result<Vec<OhlcCandle>, ProviderError> {
-        Err(ProviderError::NotSupported(Capability::Ohlc))
-    }
-
-    async fn fetch_coin_metadata(&self, _coin_id: &str) -> Result<CoinMeta, ProviderError> {
-        Err(ProviderError::NotSupported(Capability::CoinMetadata))
-    }
-
-    async fn fetch_coin_market(
-        &self,
-        _coin_id: &str,
-        _vs_currency: &str,
-    ) -> Result<CoinMarket, ProviderError> {
-        Err(ProviderError::NotSupported(Capability::CoinMarket))
-    }
-
-    async fn fetch_derivatives(&self, _market: &MarketQuery) -> Result<DerivTick, ProviderError> {
-        Err(ProviderError::NotSupported(Capability::Derivatives))
-    }
-
-    async fn search_coins(
-        &self,
-        _q: &str,
-        _cap: usize,
-    ) -> Result<Vec<CoinSearchResult>, ProviderError> {
-        Ok(vec![])
-    }
-
-    async fn fetch_coin_tickers(
-        &self,
-        _coin_id: &str,
-        _cap: usize,
-    ) -> Result<Vec<MarketSearchResult>, ProviderError> {
-        Ok(vec![])
     }
 }
 
