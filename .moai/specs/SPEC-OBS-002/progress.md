@@ -118,7 +118,7 @@ baseline_test_delta: "lib 661→681 (+20 tests); bin 8→9 (net: +4 run-phase, �
 
 ```yaml
 sync_complete_at: 2026-07-27
-sync_commit_sha: pending-backfill-obs002-sync
+sync_commit_sha: 40156d8
 sync_status: PASS
 b12_self_test_a: "grep -c 'SPEC-OBS-002' CHANGELOG.md → 0 (pre-emission), 1 (post-emission)"
 b12_self_test_b: "acceptance.md AC-ID count (grep -oE '\\*\\*AC-[A-Z]+-[0-9]+\\*\\*|\\*\\*G[0-9]\\*\\*') = 20; CHANGELOG entry cites 20"
