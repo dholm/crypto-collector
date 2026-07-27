@@ -18,7 +18,6 @@
 ///  13. Graceful shutdown (REQ-OBS-030..033): set_shutting_down → sleep grace →
 ///      broadcast shutdown → drain → pool.close → telemetry::shutdown.
 use anyhow::{Context, Result};
-use opentelemetry::propagation::Extractor;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     net::TcpListener,
@@ -26,7 +25,6 @@ use tokio::{
 };
 use tower_http::trace::TraceLayer;
 use tracing::info;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 // @MX:ANCHOR: [AUTO] main — startup sequence and graceful-shutdown orchestrator
 // @MX:REASON: fan_in >= 3: startup, shutdown, integration tests.
@@ -35,41 +33,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 //             for zero-drop rollouts (REQ-OBS-030..033/040).
 // @MX:SPEC: SPEC-OBS-001 REQ-OBS-001 REQ-OBS-030 REQ-OBS-031 REQ-OBS-032 REQ-OBS-040 REQ-OBS-041
 
-// ── W3C context extractor for traceparent propagation (REQ-OBS-021/023) ───────
-
-struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
-
-impl<'a> Extractor for HeaderExtractor<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|v| v.to_str().ok())
-    }
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
-    }
-}
-
-/// Per-request OTel span builder — extracts parent context from W3C traceparent header.
-///
-// @MX:NOTE: [AUTO] OtelMakeSpan reads traceparent — must run after global propagator is set in telemetry::init()
-// @MX:SPEC: SPEC-OBS-001 REQ-OBS-021 REQ-OBS-023
-#[derive(Clone)]
-struct OtelMakeSpan;
-
-impl<B> tower_http::trace::MakeSpan<B> for OtelMakeSpan {
-    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
-        let parent_cx = opentelemetry::global::get_text_map_propagator(|prop| {
-            prop.extract(&HeaderExtractor(request.headers()))
-        });
-        let span = tracing::info_span!(
-            "http_request",
-            http.method = %request.method(),
-            http.route  = request.uri().path(),
-            http.status_code = tracing::field::Empty,
-        );
-        let _ = span.set_parent(parent_cx);
-        span
-    }
-}
+// The W3C header extractor and the OTel span builder now live in `src/telemetry/` (the
+// single canonical copy) — SPEC-OBS-002 REQ-OBS-074 / F-49 removed the duplicated private
+// copies from main.
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -474,7 +440,7 @@ async fn main() -> Result<()> {
         .route_layer(axum::middleware::from_fn(
             crypto_collector::metrics::track_metrics,
         ))
-        .layer(TraceLayer::new_for_http().make_span_with(OtelMakeSpan))
+        .layer(TraceLayer::new_for_http().make_span_with(crypto_collector::telemetry::OtelMakeSpan))
         .fallback(crypto_collector::metrics::handle_unmatched);
 
     let api_listener = TcpListener::bind(format!("0.0.0.0:{api_port}"))
@@ -705,44 +671,8 @@ mod tests {
         assert!(sql.contains("COUNT(*)"), "SQL must use COUNT(*)");
     }
 
-    // ── Header extractor (REQ-OBS-021/023) ─────────────────────────────────────
-
-    #[test]
-    fn header_extractor_returns_traceparent() {
-        use opentelemetry::propagation::Extractor;
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "traceparent",
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-                .parse()
-                .unwrap(),
-        );
-        let extractor = HeaderExtractor(&headers);
-        assert_eq!(
-            extractor.get("traceparent"),
-            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
-        );
-    }
-
-    #[test]
-    fn header_extractor_missing_key_returns_none() {
-        use opentelemetry::propagation::Extractor;
-        let headers = axum::http::HeaderMap::new();
-        let extractor = HeaderExtractor(&headers);
-        assert_eq!(extractor.get("traceparent"), None);
-    }
-
-    #[test]
-    fn header_extractor_keys_lists_all_headers() {
-        use opentelemetry::propagation::Extractor;
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert("traceparent", "dummy".parse().unwrap());
-        headers.insert("x-request-id", "req-1".parse().unwrap());
-        let extractor = HeaderExtractor(&headers);
-        let keys = extractor.keys();
-        assert!(keys.contains(&"traceparent"));
-        assert!(keys.contains(&"x-request-id"));
-    }
+    // (The header-extractor tests moved to src/telemetry/ with the canonical struct —
+    // SPEC-OBS-002 REQ-OBS-074 / F-49; the duplicated private copy was removed from main.)
 
     // ── Scenario 10: terminationGracePeriod sizing (REQ-OBS-033) ───────────────
 

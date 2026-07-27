@@ -5,12 +5,10 @@
 //!
 //! # Server bootstrap
 //!
-//! Call `build_api_router(state)` to assemble the Axum router, then bind a
-//! `TcpListener` and call `axum::serve`. The `start_api_server` function does
-//! this end-to-end and is called from `main`.
-//!
-//! SPEC-OBS-001 (health port 8081, Prometheus 9000) will add further
-//! `TcpListener`s alongside this one — structured to minimise overlap.
+//! Call `build_api_router(state)` to assemble the Axum router; `main` binds the
+//! `TcpListener` and calls `axum::serve` itself (alongside the health port 8081 and
+//! Prometheus 9000 listeners). SPEC-OBS-002 REQ-OBS-074 removed the dead API-bootstrap
+//! wrapper — `main` owns the serve loop directly.
 
 pub mod candles;
 pub mod candles_agg;
@@ -35,7 +33,6 @@ use axum::{
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::info;
 
 use crate::providers::Provider;
 
@@ -241,38 +238,8 @@ pub fn build_api_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-// ── Server bootstrap ──────────────────────────────────────────────────────────
-
-/// Bind and serve the API on the given port.
-///
-/// This is the clean extension point for SPEC-OBS-001: it adds health (port 8081)
-/// and metrics (port 9000) listeners alongside this call in `main`.
-pub async fn start_api_server(
-    state: AppState,
-    port: u16,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    let router = build_api_router(state);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to bind API port {port}: {e}"))?;
-    info!("crypto-collector API: listening on port {port}");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            // Shutdown when the worker supervisor signals.
-            loop {
-                if *shutdown_rx.borrow() {
-                    break;
-                }
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("API server error: {e}"))?;
-    Ok(())
-}
+// (The dead API-bootstrap wrapper was removed — SPEC-OBS-002 REQ-OBS-074 / F-49; `main`
+// binds the API listener and drives `axum::serve` itself.)
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

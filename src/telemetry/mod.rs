@@ -11,6 +11,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::SdkTracerProvider, Resource};
 use std::sync::OnceLock;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
@@ -119,6 +120,35 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderExtractor<'a> {
     }
 }
 
+/// Per-request OTel span builder — extracts the parent context from the W3C `traceparent`
+/// header (via [`HeaderExtractor`]) and opens an `http_request` span (REQ-OBS-023).
+///
+/// Wired as `TraceLayer::new_for_http().make_span_with(OtelMakeSpan)` in `main`. Must run
+/// after the global propagator is installed in [`init`]. This is the single canonical copy
+/// (SPEC-OBS-002 REQ-OBS-074 / F-49 — the duplicated private copy in `main.rs` was removed).
+///
+// @MX:NOTE: [AUTO] OtelMakeSpan reads traceparent — must run after the global propagator is
+//           set in telemetry::init()
+// @MX:SPEC: SPEC-OBS-001 REQ-OBS-021 REQ-OBS-023 SPEC-OBS-002 REQ-OBS-074
+#[derive(Clone)]
+pub struct OtelMakeSpan;
+
+impl<B> tower_http::trace::MakeSpan<B> for OtelMakeSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> tracing::Span {
+        let parent_cx = opentelemetry::global::get_text_map_propagator(|prop| {
+            prop.extract(&HeaderExtractor(request.headers()))
+        });
+        let span = tracing::info_span!(
+            "http_request",
+            http.method = %request.method(),
+            http.route  = request.uri().path(),
+            http.status_code = tracing::field::Empty,
+        );
+        let _ = span.set_parent(parent_cx);
+        span
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -191,6 +221,23 @@ mod tests {
         let keys = extractor.keys();
         assert!(keys.contains(&"traceparent"));
         assert!(keys.contains(&"x-request-id"));
+    }
+
+    // ── OtelMakeSpan (SPEC-OBS-002 REQ-OBS-074 / F-49): canonical single copy ──
+
+    /// The moved OtelMakeSpan builds a per-request span (via HeaderExtractor parent
+    /// extraction) without panicking (REQ-OBS-023). The HeaderExtractor behavior it relies on
+    /// is covered by the header_extractor_* tests above (the canonical set — OR-OBS2-5).
+    #[test]
+    fn otel_make_span_builds_span_without_panic() {
+        use tower_http::trace::MakeSpan;
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/coins/{coin_id}")
+            .body(())
+            .expect("build request");
+        let mut maker = OtelMakeSpan;
+        let _span = maker.make_span(&request);
     }
 
     // ── shutdown() is a no-op when OTLP was not configured ────────────────────
