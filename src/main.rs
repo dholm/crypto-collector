@@ -362,7 +362,7 @@ async fn main() -> Result<()> {
     .await;
     info!("crypto-collector: workers started");
 
-    // Gauge-refresh task: keeps tracked_coins / tracked_markets current (REQ-OBS-013).
+    // Gauge-refresh task: keeps the tracked_coins gauge current (REQ-OBS-013).
     {
         let pool_gauge = pool.clone();
         let mut shutdown_gauge = shutdown_rx.clone();
@@ -527,7 +527,8 @@ async fn wait_for_shutdown_signal() {
 /// Refresh `tracked_coins` gauge from the DB.
 ///
 /// On error, logs a warning and preserves the last gauge value (no reset to 0).
-/// `tracked_markets` gauge removed: table dropped by migration 0011 (SPEC-API-002).
+/// The former per-market gauge was removed: its backing table was dropped by
+/// migration 0011 (SPEC-API-002; ghost gauge dropped in SPEC-OBS-002 REQ-OBS-062).
 ///
 // @MX:NOTE: [AUTO] DB-backed gauge — each replica queries its own pool; gauge is per-replica.
 //           Aggregate with max()/avg() across replicas in Prometheus, NOT sum().

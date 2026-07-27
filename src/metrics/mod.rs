@@ -14,9 +14,17 @@
 //! - `quote_insert_duration_seconds` — histogram for live-quote upserts
 //! - `candle_insert_duration_seconds` — histogram for candle upserts
 //!
+//! > **Operator-visible rename (SPEC-OBS-002 F-38 / REQ-OBS-060)**: these two
+//! > histograms were previously *emitted* under the drifted names
+//! > `coin_quote_insert_duration_seconds` / `coin_candle_insert_duration_seconds`
+//! > while being *described* under the canonical names above. The emitters now
+//! > bind to the shared consts [`QUOTE_INSERT_DURATION_SECONDS`] /
+//! > [`CANDLE_INSERT_DURATION_SECONDS`], so the emitted series are the canonical
+//! > names. External Grafana dashboards/alerts keyed on the old `coin_*` series
+//! > MUST be migrated in lockstep.
+//!
 //! Registry gauges (REQ-OBS-013):
 //! - `tracked_coins` — total tracked coins
-//! - `tracked_markets` — total tracked markets
 //!
 //! Backlog + pacer (REQ-OBS-014):
 //! - `collection_queue_pending` — pending queue items
@@ -44,6 +52,23 @@ pub const HTTP_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
 
+// @MX:ANCHOR: [AUTO] persistence-latency metric-name consts — single source of truth bound
+//             by BOTH describe_all() AND every emitter (src/db/upserts.rs). One const per name
+//             makes describe/emit drift structurally impossible (REQ-OBS-060/061).
+// @MX:REASON: fan_in >= 3 — describe_all(), upsert_coin_quote, upsert_coin_candle, and the
+//             describe/emit parity test all bind to these consts; a divergent string literal
+//             re-introduces the F-38 ghost-metric defect (a described name with no emitter, or
+//             an emitted name that is not described).
+// @MX:NOTE: [AUTO] F-38 operator-visible rename — the emitters previously recorded
+//           `coin_quote_insert_duration_seconds` / `coin_candle_insert_duration_seconds`; they
+//           now emit the canonical REQ-OBS-015 names below. External Grafana dashboards/alerts
+//           keyed on the old `coin_*` series MUST migrate in lockstep.
+// @MX:SPEC: SPEC-OBS-002 REQ-OBS-060 REQ-OBS-061
+/// Histogram name for live-quote upsert latency (REQ-OBS-015; canonical, no `coin_` prefix).
+pub const QUOTE_INSERT_DURATION_SECONDS: &str = "quote_insert_duration_seconds";
+/// Histogram name for candle upsert latency (REQ-OBS-015; canonical, no `coin_` prefix).
+pub const CANDLE_INSERT_DURATION_SECONDS: &str = "candle_insert_duration_seconds";
+
 /// Register all metric descriptors (names, help text) without emitting values.
 ///
 /// Safe to call multiple times (idempotent — metrics crate ignores duplicate describe calls).
@@ -69,19 +94,19 @@ pub fn describe_all() {
         "Upstream provider call latency in seconds by provider and capability"
     );
 
-    // Persistence latency (REQ-OBS-015)
+    // Persistence latency (REQ-OBS-015) — described THROUGH the shared consts so the
+    // described names can never drift from the emitter names (REQ-OBS-060/061).
     metrics::describe_histogram!(
-        "quote_insert_duration_seconds",
+        QUOTE_INSERT_DURATION_SECONDS,
         "Live-quote upsert latency in seconds"
     );
     metrics::describe_histogram!(
-        "candle_insert_duration_seconds",
+        CANDLE_INSERT_DURATION_SECONDS,
         "Candle upsert latency in seconds"
     );
 
     // Registry gauges (REQ-OBS-013)
     metrics::describe_gauge!("tracked_coins", "Total number of tracked coins");
-    metrics::describe_gauge!("tracked_markets", "Total number of tracked markets");
 
     // Backlog + pacer (REQ-OBS-014)
     metrics::describe_gauge!(
@@ -331,35 +356,72 @@ mod tests {
 
     // ── REQ-OBS-015: persistence latency histograms ────────────────────────────
 
-    /// Scenario 6: quote_insert_duration_seconds histogram (REQ-OBS-015).
+    /// Scenario 6: quote_insert_duration_seconds histogram (REQ-OBS-015), emitted through the const.
     #[test]
     fn quote_insert_duration_histogram_registered() {
         let (recorder, handle) = make_recorder();
         metrics::with_local_recorder(&recorder, || {
-            metrics::histogram!("quote_insert_duration_seconds").record(0.002);
+            metrics::histogram!(QUOTE_INSERT_DURATION_SECONDS).record(0.002);
         });
         let rendered = handle.render();
         assert!(
-            rendered.contains("quote_insert_duration_seconds"),
+            rendered.contains(QUOTE_INSERT_DURATION_SECONDS),
             "quote_insert_duration_seconds must appear in /metrics output (REQ-OBS-015)"
         );
     }
 
-    /// Scenario 6: candle_insert_duration_seconds histogram (REQ-OBS-015).
+    /// Scenario 6: candle_insert_duration_seconds histogram (REQ-OBS-015), emitted through the const.
     #[test]
     fn candle_insert_duration_histogram_registered() {
         let (recorder, handle) = make_recorder();
         metrics::with_local_recorder(&recorder, || {
-            metrics::histogram!("candle_insert_duration_seconds").record(0.005);
+            metrics::histogram!(CANDLE_INSERT_DURATION_SECONDS).record(0.005);
         });
         let rendered = handle.render();
         assert!(
-            rendered.contains("candle_insert_duration_seconds"),
+            rendered.contains(CANDLE_INSERT_DURATION_SECONDS),
             "candle_insert_duration_seconds must appear in /metrics output (REQ-OBS-015)"
         );
     }
 
-    // ── REQ-OBS-013: tracked_coins and tracked_markets gauges ──────────────────
+    /// REQ-OBS-060/061: describe/emit parity for the persistence-latency histograms.
+    ///
+    /// `describe_all()` and the upsert emitters (`src/db/upserts.rs`) both bind to the SAME
+    /// shared consts, so a described name and its emitter can never diverge. This test emits
+    /// through the same consts the real emitters use and asserts the described names render;
+    /// it also pins the canonical (no-`coin_`-prefix) values so the F-38 rename cannot regress.
+    #[test]
+    fn persistence_metric_describe_emit_parity() {
+        // Canonical names — the F-38 rename dropped the `coin_` prefix from the emitted series.
+        assert_eq!(
+            QUOTE_INSERT_DURATION_SECONDS,
+            "quote_insert_duration_seconds"
+        );
+        assert_eq!(
+            CANDLE_INSERT_DURATION_SECONDS,
+            "candle_insert_duration_seconds"
+        );
+
+        let (recorder, handle) = make_recorder();
+        metrics::with_local_recorder(&recorder, || {
+            describe_all();
+            // Emit through the SAME consts the real emitters use — drift is impossible.
+            metrics::histogram!(QUOTE_INSERT_DURATION_SECONDS).record(0.001);
+            metrics::histogram!(CANDLE_INSERT_DURATION_SECONDS).record(0.001);
+        });
+        let rendered = handle.render();
+        for name in [
+            QUOTE_INSERT_DURATION_SECONDS,
+            CANDLE_INSERT_DURATION_SECONDS,
+        ] {
+            assert!(
+                rendered.contains(name),
+                "described + emitted persistence metric {name} must render (describe/emit parity)"
+            );
+        }
+    }
+
+    // ── REQ-OBS-013: tracked_coins gauge ───────────────────────────────────────
 
     #[test]
     fn tracked_coins_gauge_registered() {
@@ -375,23 +437,6 @@ mod tests {
         assert!(
             rendered.contains("42"),
             "tracked_coins must reflect set value"
-        );
-    }
-
-    #[test]
-    fn tracked_markets_gauge_registered() {
-        let (recorder, handle) = make_recorder();
-        metrics::with_local_recorder(&recorder, || {
-            metrics::gauge!("tracked_markets").set(7.0_f64);
-        });
-        let rendered = handle.render();
-        assert!(
-            rendered.contains("tracked_markets"),
-            "tracked_markets gauge must be registered"
-        );
-        assert!(
-            rendered.contains("7"),
-            "tracked_markets must reflect set value"
         );
     }
 

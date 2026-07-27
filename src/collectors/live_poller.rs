@@ -661,10 +661,9 @@ mod tests {
             LIVE_COIN_CLAIM_SQL.contains("tracked_coins"),
             "claim SQL must target tracked_coins table"
         );
-        assert!(
-            !LIVE_COIN_CLAIM_SQL.contains("tracked_markets"),
-            "claim SQL must not reference tracked_markets"
-        );
+        // (The old negative check against the removed markets table was dropped with
+        // the ghost gauge — SPEC-OBS-002 REQ-OBS-062; the backing table was dropped by
+        // migration 0011_remove_markets.sql.)
     }
 
     #[test]

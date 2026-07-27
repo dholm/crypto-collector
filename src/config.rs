@@ -132,7 +132,7 @@ pub fn shutdown_drain_seconds() -> u64 {
     parse_env_u64("SHUTDOWN_DRAIN_SECONDS", 30)
 }
 
-/// Interval at which `tracked_coins` / `tracked_markets` gauges are refreshed (SPEC-OBS-001 REQ-OBS-013).
+/// Interval at which the `tracked_coins` gauge is refreshed (SPEC-OBS-001 REQ-OBS-013).
 ///
 /// Env var: `TRACKED_GAUGE_INTERVAL_SECS`. Default: 30 s (OR-OBS-3).
 pub fn tracked_gauge_interval_secs() -> u64 {

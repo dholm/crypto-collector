@@ -75,7 +75,9 @@ pub async fn upsert_coin_quote(
         .await?;
 
     let result = tx.commit().await;
-    metrics::histogram!("coin_quote_insert_duration_seconds").record(start.elapsed().as_secs_f64());
+    // Emit through the shared const (REQ-OBS-060) — canonical name, no `coin_` prefix.
+    metrics::histogram!(crate::metrics::QUOTE_INSERT_DURATION_SECONDS)
+        .record(start.elapsed().as_secs_f64());
     result?;
     Ok(())
 }
@@ -140,7 +142,8 @@ pub async fn upsert_coin_candle(pool: &PgPool, candle: &CoinCandle) -> Result<()
         .await?;
 
     let result = tx.commit().await;
-    metrics::histogram!("coin_candle_insert_duration_seconds")
+    // Emit through the shared const (REQ-OBS-060) — canonical name, no `coin_` prefix.
+    metrics::histogram!(crate::metrics::CANDLE_INSERT_DURATION_SECONDS)
         .record(start.elapsed().as_secs_f64());
     result?;
     Ok(())
