@@ -8,8 +8,11 @@ use std::path::Path;
 
 // ── Milestone 1: migration file presence and naming ──────────────────────────
 
+// SPEC-API-005 F-58 (REQ-API-416): renamed from all_fourteen_migration_files_exist and extended
+// to every current migration file (0001–0021). The old name/list drifted after migrations 0015+
+// were added.
 #[test]
-fn all_fourteen_migration_files_exist() {
+fn all_migration_files_exist() {
     let expected = [
         "migrations/0001_registries.sql",
         "migrations/0002_live_quotes.sql",
@@ -25,6 +28,13 @@ fn all_fourteen_migration_files_exist() {
         "migrations/0012_coin_backfill.sql",
         "migrations/0013_cycle_overlay.sql",
         "migrations/0014_collection_queue_cycle_overlay_kind.sql",
+        "migrations/0015_cycle_overlay_projected.sql",
+        "migrations/0016_collection_queue_rollup_kind.sql",
+        "migrations/0017_cycle_overlay_bands.sql",
+        "migrations/0018_bitstamp_pacer_seed.sql",
+        "migrations/0019_cycle_overlay_projection_model.sql",
+        "migrations/0020_coin_candles_departition.sql",
+        "migrations/0021_coingecko_range_interval_canonicalise.sql",
     ];
     for path in &expected {
         assert!(

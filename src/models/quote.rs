@@ -22,14 +22,18 @@ pub struct CoinQuote {
     pub source: String,
 }
 
-/// Coin-keyed OHLCV candle (SPEC-API-002 REQ-API-141/142).
+/// Coin-keyed OHLCV candle (SPEC-API-002 REQ-API-141/142; de-partitioned per migrations/0020).
 ///
-/// Partitioned by `ts` (monthly RANGE). PK: `(coin_id, vs_currency, interval, ts)`.
+/// Plain (non-partitioned) table. PK: `(coin_id, vs_currency, interval, ts)`.
 /// `volume` is nullable: CoinGecko OHLC has no per-candle volume (REQ-DB-011).
 ///
-/// @MX:ANCHOR: [AUTO] coin_candles partition+index contract — btree(coin_id, vs_currency, interval, ts DESC) + BRIN(ts)
-/// @MX:REASON: All coin-keyed candle read paths depend on this index shape (REQ-DB-015).
-///             The interval column is invariant in the PK; removing it collapses 1m and 1d into one row.
+/// @MX:ANCHOR: [AUTO] coin_candles index contract — btree(coin_id, vs_currency, interval, ts DESC) + BRIN(ts) on a FLAT table
+/// @MX:REASON: coin_candles was de-partitioned in migrations/0020_coin_candles_departition.sql —
+///             it is a plain table, NOT monthly RANGE-partitioned (the ~1.25M-row volume made
+///             ~200 partitions pure planning overhead). All coin-keyed candle read paths still
+///             depend on the btree + BRIN index shape (REQ-DB-015). The interval column is
+///             invariant in the PK; removing it collapses 1m and 1d into one row. (Contrast
+///             CoinQuote below, whose coin_quotes table is still RANGE-partitioned.)
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CoinCandle {
     pub coin_id: String,

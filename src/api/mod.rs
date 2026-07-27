@@ -477,6 +477,232 @@ mod tests {
         }
     }
 
+    // ── SPEC-API-005 M8 (F-59, REQ-API-417): per-operation parameter parity ──────
+    //
+    // Assert that every query parameter documented in api/crypto-collector.yaml has a matching
+    // field on the corresponding Rust param struct — the guard that would have caught F-29
+    // (the yaml documented vs_currency on the quote reads while the structs lacked the field).
+    //
+    // The struct field set is reflected via serde (the param structs derive Serialize), so the
+    // check is bound to the actual structs: constructing each struct literal is compile-enforced
+    // to match its fields, and serializing yields the true serde field names. RED verification:
+    // temporarily remove vs_currency from ListQuotesParams (and its literal below) → this test
+    // fails on operation 'listCoinQuotes'; restoring it returns to green.
+
+    fn param_field_names<T: serde::Serialize>(v: &T) -> std::collections::BTreeSet<String> {
+        match serde_json::to_value(v).expect("param struct must serialize") {
+            serde_json::Value::Object(m) => m.keys().cloned().collect(),
+            other => panic!("param struct must serialize to a JSON object, got {other:?}"),
+        }
+    }
+
+    // operationId → the serde field set of its Rust query-param struct.
+    fn operation_struct_fields(
+    ) -> std::collections::BTreeMap<&'static str, std::collections::BTreeSet<String>> {
+        use super::{candles, coin_market, coins, cycle_overlay, metadata, quotes};
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "listCoins",
+            param_field_names(&coins::ListCoinsParams {
+                cursor: None,
+                limit: None,
+            }),
+        );
+        m.insert(
+            "searchCoins",
+            param_field_names(&coins::SearchCoinsParams {
+                q: None,
+                limit: None,
+            }),
+        );
+        m.insert(
+            "getCoinMetadata",
+            param_field_names(&metadata::GetMetadataParams { as_of: None }),
+        );
+        m.insert(
+            "getCoinMarketLatest",
+            param_field_names(&coin_market::GetCoinMarketLatestParams { vs_currency: None }),
+        );
+        m.insert(
+            "listCoinMarket",
+            param_field_names(&coin_market::ListCoinMarketParams {
+                vs_currency: None,
+                cursor: None,
+                limit: None,
+                start: None,
+                end: None,
+            }),
+        );
+        m.insert(
+            "listLatestCoinQuotes",
+            param_field_names(&quotes::ListLatestQuotesParams { vs_currency: None }),
+        );
+        m.insert(
+            "getLatestCoinQuote",
+            param_field_names(&quotes::GetLatestQuoteParams { vs_currency: None }),
+        );
+        m.insert(
+            "listCoinQuotes",
+            param_field_names(&quotes::ListQuotesParams {
+                vs_currency: None,
+                cursor: None,
+                limit: None,
+                start: None,
+                end: None,
+            }),
+        );
+        m.insert(
+            "listCoinCandles",
+            param_field_names(&candles::ListCandlesParams {
+                interval: None,
+                vs_currency: None,
+                cursor: None,
+                limit: None,
+                start: None,
+                end: None,
+            }),
+        );
+        m.insert(
+            "listCycleProjection",
+            param_field_names(&cycle_overlay::ListCycleOverlayParams {
+                vs_currency: None,
+                cycle: None,
+                cursor: None,
+                limit: None,
+                as_of: None,
+            }),
+        );
+        m
+    }
+
+    // Parse components/parameters → ref_key -> parameter `name`, for `in: query` refs only.
+    fn parse_component_query_refs(comp: &str) -> std::collections::BTreeMap<String, String> {
+        let mut map = std::collections::BTreeMap::new();
+        let Some(pidx) = comp.find("\n  parameters:") else {
+            return map;
+        };
+        let rest = &comp[pidx + "\n  parameters:".len()..];
+        let end = ["\n  responses:", "\n  schemas:", "\n  requestBodies:"]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .unwrap_or(rest.len());
+        let block = &rest[..end];
+
+        let (mut cur_key, mut cur_name, mut cur_in): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = (None, None, None);
+        let mut flush = |k: &Option<String>, n: &Option<String>, i: &Option<String>| {
+            if let (Some(k), Some(n), Some(i)) = (k, n, i) {
+                if i == "query" {
+                    map.insert(k.clone(), n.clone());
+                }
+            }
+        };
+        for line in block.lines() {
+            if let Some(after4) = line.strip_prefix("    ") {
+                if !after4.starts_with(' ') && after4.ends_with(':') && !after4.contains(' ') {
+                    flush(&cur_key, &cur_name, &cur_in);
+                    cur_key = Some(after4.trim_end_matches(':').to_string());
+                    cur_name = None;
+                    cur_in = None;
+                    continue;
+                }
+            }
+            if let Some(after6) = line.strip_prefix("      ") {
+                if let Some(n) = after6.strip_prefix("name: ") {
+                    cur_name = Some(n.trim().to_string());
+                } else if let Some(i) = after6.strip_prefix("in: ") {
+                    cur_in = Some(i.trim().to_string());
+                }
+            }
+        }
+        flush(&cur_key, &cur_name, &cur_in);
+        map
+    }
+
+    // Parse the paths section → operationId -> documented query parameter names.
+    fn parse_operation_query_params(
+        paths: &str,
+        ref_query_names: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+        let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        let mut cur_op: Option<String> = None;
+        let mut pending_name: Option<String> = None;
+        for line in paths.lines() {
+            let t = line.trim_start();
+            if let Some(op) = t.strip_prefix("operationId: ") {
+                cur_op = Some(op.trim().to_string());
+                pending_name = None;
+                out.entry(cur_op.clone().unwrap()).or_default();
+            } else if let Some(name) = t.strip_prefix("- name: ") {
+                pending_name = Some(name.trim().to_string());
+            } else if let Some(rest) = t.strip_prefix("- $ref: ") {
+                if let Some(ref_key) = rest.trim().trim_matches('\'').rsplit('/').next() {
+                    if let (Some(op), Some(qname)) = (cur_op.as_ref(), ref_query_names.get(ref_key))
+                    {
+                        out.entry(op.clone()).or_default().insert(qname.clone());
+                    }
+                }
+                pending_name = None;
+            } else if t == "in: query" {
+                if let (Some(op), Some(name)) = (cur_op.as_ref(), pending_name.take()) {
+                    out.entry(op.clone()).or_default().insert(name);
+                }
+            } else if t == "in: path" || t == "in: header" || t == "in: cookie" {
+                pending_name = None;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn openapi_query_params_have_matching_struct_fields() {
+        let yaml = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("api/crypto-collector.yaml"),
+        )
+        .expect("api/crypto-collector.yaml must exist");
+
+        let comp_idx = yaml.find("\ncomponents:").expect("components section");
+        let ref_query_names = parse_component_query_refs(&yaml[comp_idx..]);
+        let documented = parse_operation_query_params(&yaml[..comp_idx], &ref_query_names);
+        let struct_fields = operation_struct_fields();
+
+        // Parser sanity: the F-29 case is actually observed (guard is not a silent no-op).
+        assert!(
+            documented
+                .get("listCoinQuotes")
+                .is_some_and(|s| s.contains("vs_currency")),
+            "parser sanity: listCoinQuotes must document a vs_currency query param"
+        );
+        assert!(
+            documented
+                .get("listCoinCandles")
+                .is_some_and(|s| s.contains("interval") && s.contains("vs_currency")),
+            "parser sanity: listCoinCandles must document interval + vs_currency"
+        );
+
+        // Every operation with a mapped param struct must have a field for each documented query
+        // parameter (the F-29 guard).
+        for (op_id, fields) in &struct_fields {
+            let params = documented.get(*op_id).unwrap_or_else(|| {
+                panic!(
+                    "operation '{op_id}' has a param struct but is absent from the OpenAPI paths"
+                )
+            });
+            for p in params {
+                assert!(
+                    fields.contains(p),
+                    "operation '{op_id}' documents query parameter '{p}' but the Rust param \
+                     struct has no matching field (F-59); struct fields = {fields:?}"
+                );
+            }
+        }
+    }
+
     // Scenario 34 (REQ-CYCLE-098/099): the removed listCycleOverlay operationId and the
     // deleted /cycle-overlay path must be entirely absent from the document.
     #[test]

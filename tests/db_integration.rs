@@ -21,46 +21,37 @@ async fn setup() -> PgPool {
         .expect("Failed to connect and apply migrations")
 }
 
-// Helper: insert a tracked_coin and tracked_market, return the market id.
-async fn insert_test_market(pool: &PgPool, suffix: &str) -> i64 {
+// Helper: insert a tracked_coin (the coin-keyed FK parent for coin_quotes/coin_candles/
+// backfill_jobs), returning the coin_id. Migration 0011 removed tracked_markets, so the schema
+// is coin-keyed end-to-end (SPEC-API-005 F-58).
+async fn insert_test_coin(pool: &PgPool, suffix: &str) -> String {
     let coin_id = format!("test-coin-{suffix}");
-    let base = format!("TBASE{suffix}");
-    let quote = "USD";
-
     sqlx::query(
         "INSERT INTO tracked_coins (coin_id, symbol, name, status)
          VALUES ($1, $2, $3, 'active')
          ON CONFLICT (coin_id) DO NOTHING",
     )
     .bind(&coin_id)
-    .bind(&base)
+    .bind(format!("TB{suffix}"))
     .bind(format!("Test Coin {suffix}"))
     .execute(pool)
     .await
     .expect("insert tracked_coin");
-
-    sqlx::query_scalar::<_, i64>(
-        "INSERT INTO tracked_markets (base, quote, kind, status, coin_id)
-         VALUES ($1, $2, 'spot', 'active', $3)
-         ON CONFLICT (base, quote, COALESCE(venue, '')) DO UPDATE SET status = 'active'
-         RETURNING id",
-    )
-    .bind(&base)
-    .bind(quote)
-    .bind(&coin_id)
-    .fetch_one(pool)
-    .await
-    .expect("insert tracked_market")
+    coin_id
 }
 
-// ── Scenario 1: Two registries created with correct keys (REQ-DB-001/002) ────
+// ── Scenario 1: Coin-keyed registries exist with correct keys (REQ-DB-001/002) ────
+//
+// SPEC-API-005 F-58: rewritten from the pre-0011 form that asserted the removed tracked_markets
+// table. Migration 0011 dropped tracked_markets and created the coin-keyed coin_quotes /
+// coin_candles time-series tables; tracked_coins remains the coin-id registry (PK coin_id).
 
 #[tokio::test]
 #[ignore]
 async fn scenario_01_registries_exist_with_correct_pk() {
     let pool = setup().await;
 
-    // tracked_coins: coin_id is PK
+    // tracked_coins: coin_id is the text PK.
     let row = sqlx::query(
         "SELECT column_name, data_type
          FROM information_schema.columns
@@ -72,101 +63,34 @@ async fn scenario_01_registries_exist_with_correct_pk() {
     .expect("tracked_coins.coin_id must exist");
     assert_eq!(row.get::<String, _>("data_type"), "text");
 
-    // tracked_markets: surrogate id pk, base/quote not null, kind, venue nullable
-    let cols: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT column_name, data_type, is_nullable
-         FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'tracked_markets'
-         ORDER BY ordinal_position",
+    // The coin-keyed time-series tables (post-0011) exist and are keyed by coin_id.
+    for table in ["coin_quotes", "coin_candles"] {
+        let has_coin_id: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=$1 AND column_name='coin_id'
+             )",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .expect("coin_id column check");
+        assert!(has_coin_id, "{table} must be coin-keyed (coin_id column)");
+    }
+
+    // The removed market-keyed registry must NOT exist (0011 dropped it).
+    let has_tracked_markets: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema='public' AND table_name='tracked_markets'
+         )",
     )
-    .fetch_all(&pool)
+    .fetch_one(&pool)
     .await
-    .expect("query");
-
-    let col_map: std::collections::HashMap<_, _> = cols
-        .iter()
-        .map(|(name, dtype, nullable)| (name.as_str(), (dtype.as_str(), nullable.as_str())))
-        .collect();
-
-    assert!(col_map.contains_key("id"), "tracked_markets must have id");
+    .expect("tracked_markets existence check");
     assert!(
-        col_map.contains_key("base"),
-        "tracked_markets must have base"
-    );
-    assert!(
-        col_map.contains_key("quote"),
-        "tracked_markets must have quote"
-    );
-    assert!(
-        col_map.contains_key("venue"),
-        "tracked_markets must have venue"
-    );
-    assert!(
-        col_map.contains_key("coin_id"),
-        "tracked_markets must have coin_id FK"
-    );
-    assert!(
-        col_map.contains_key("kind"),
-        "tracked_markets must have kind"
-    );
-
-    // venue and coin_id must be nullable
-    assert_eq!(col_map["venue"].1, "YES", "venue must be nullable");
-    assert_eq!(col_map["coin_id"].1, "YES", "coin_id must be nullable");
-    // base and quote must be NOT NULL
-    assert_eq!(col_map["base"].1, "NO", "base must be NOT NULL");
-    assert_eq!(col_map["quote"].1, "NO", "quote must be NOT NULL");
-}
-
-// ── Scenario 2: NULL-venue + named-venue coexistence, duplicate rejected (REQ-DB-003) ──
-
-#[tokio::test]
-#[ignore]
-async fn scenario_02_pair_uniqueness_coalesce_venue() {
-    let pool = setup().await;
-
-    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
-    let base = format!("SC2{suffix}");
-
-    // Insert coin
-    sqlx::query(
-        "INSERT INTO tracked_coins (coin_id, symbol, name, status) VALUES ($1, $2, $3, 'active')",
-    )
-    .bind(format!("sc2coin-{suffix}"))
-    .bind(&base)
-    .bind(format!("Scenario2 {suffix}"))
-    .execute(&pool)
-    .await
-    .expect("insert coin");
-
-    // First insert: NULL venue (aggregator row) — must succeed
-    sqlx::query(
-        "INSERT INTO tracked_markets (base, quote, venue, kind, status) VALUES ($1, 'USD', NULL, 'spot', 'active')",
-    )
-    .bind(&base)
-    .execute(&pool)
-    .await
-    .expect("first insert (NULL venue) must succeed");
-
-    // Second insert: named venue — must succeed (aggregator + venue coexist)
-    sqlx::query(
-        "INSERT INTO tracked_markets (base, quote, venue, kind, status) VALUES ($1, 'USD', 'binance', 'spot', 'active')",
-    )
-    .bind(&base)
-    .execute(&pool)
-    .await
-    .expect("second insert (named venue) must succeed");
-
-    // Third insert: second NULL venue — must fail (duplicate)
-    let result = sqlx::query(
-        "INSERT INTO tracked_markets (base, quote, venue, kind, status) VALUES ($1, 'USD', NULL, 'spot', 'active')",
-    )
-    .bind(&base)
-    .execute(&pool)
-    .await;
-    assert!(
-        result.is_err(),
-        "second NULL-venue insert for the same pair must be rejected by unique index (REQ-DB-003)"
+        !has_tracked_markets,
+        "tracked_markets was removed by migration 0011 and must not exist"
     );
 }
 
@@ -223,21 +147,20 @@ async fn scenario_03_no_equities_tables() {
     }
 }
 
-// ── Scenario 4: Time-series tables RANGE-partitioned with btree + BRIN (REQ-DB-014/015) ──
+// ── Scenario 4: Time-series index/partition contract (REQ-DB-014/015) ──
+//
+// SPEC-API-005 F-58: rewritten for the current schema. coin_quotes and coin_market_snapshots
+// are still monthly RANGE-partitioned; coin_candles was de-partitioned into a plain table by
+// migration 0020 (F-57) but retains its btree + BRIN indexes. The pre-0011 live_quotes /
+// candles / derivatives_quotes tables were dropped and are no longer checked.
 
 #[tokio::test]
 #[ignore]
 async fn scenario_04_partitioned_tables_with_indexes() {
     let pool = setup().await;
 
-    let tables = [
-        "live_quotes",
-        "candles",
-        "coin_market_snapshots",
-        "derivatives_quotes",
-    ];
-    for table in &tables {
-        // Verify RANGE partitioning via pg_catalog
+    // Still RANGE-partitioned with btree(ts DESC) + BRIN + monthly partitions.
+    for table in ["coin_quotes", "coin_market_snapshots"] {
         let is_partitioned: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1 FROM pg_class c
@@ -254,13 +177,9 @@ async fn scenario_04_partitioned_tables_with_indexes() {
             "Table '{table}' must be RANGE-partitioned (REQ-DB-014)"
         );
 
-        // Verify BRIN index exists on parent
         let has_brin: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1 FROM pg_indexes
-                WHERE schemaname = 'public' AND tablename = $1
-                  AND indexdef ILIKE '%using brin%'
-             )",
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes
+                WHERE schemaname='public' AND tablename=$1 AND indexdef ILIKE '%using brin%')",
         )
         .bind(table)
         .fetch_one(&pool)
@@ -268,16 +187,12 @@ async fn scenario_04_partitioned_tables_with_indexes() {
         .expect("brin index check");
         assert!(
             has_brin,
-            "Table '{table}' must have a BRIN index on ts (REQ-DB-015)"
+            "Table '{table}' must have a BRIN index (REQ-DB-015)"
         );
 
-        // Verify btree index on ts DESC exists
         let has_btree_ts: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                SELECT 1 FROM pg_indexes
-                WHERE schemaname = 'public' AND tablename = $1
-                  AND indexdef ILIKE '%ts desc%'
-             )",
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes
+                WHERE schemaname='public' AND tablename=$1 AND indexdef ILIKE '%ts desc%')",
         )
         .bind(table)
         .fetch_one(&pool)
@@ -288,7 +203,6 @@ async fn scenario_04_partitioned_tables_with_indexes() {
             "Table '{table}' must have a btree index with ts DESC (REQ-DB-015)"
         );
 
-        // Verify at least one monthly partition exists
         let partition_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_class c
              JOIN pg_inherits i ON i.inhrelid = c.oid
@@ -301,115 +215,115 @@ async fn scenario_04_partitioned_tables_with_indexes() {
         .expect("partition count");
         assert!(
             partition_count >= 12,
-            "Table '{table}' must have at least 12 monthly partitions (REQ-DB-016), found {partition_count}"
+            "Table '{table}' must have >= 12 monthly partitions (REQ-DB-016), found {partition_count}"
+        );
+    }
+
+    // coin_candles: de-partitioned by 0020 (F-57) → a PLAIN table (NOT partitioned) that still
+    // keeps its btree + BRIN indexes (REQ-DB-015).
+    let candles_partitioned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_class c
+            JOIN pg_partitioned_table pt ON pt.partrelid = c.oid
+            WHERE c.relname = 'coin_candles'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("coin_candles partition check");
+    assert!(
+        !candles_partitioned,
+        "coin_candles must be a flat (non-partitioned) table after migration 0020 (F-57)"
+    );
+
+    for pat in ["%using brin%", "%ts desc%"] {
+        let has_idx: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes
+                WHERE schemaname='public' AND tablename='coin_candles' AND indexdef ILIKE $1)",
+        )
+        .bind(pat)
+        .fetch_one(&pool)
+        .await
+        .expect("coin_candles index check");
+        assert!(
+            has_idx,
+            "flat coin_candles must retain its index matching '{pat}' (REQ-DB-015)"
         );
     }
 }
 
-// ── Scenario 5: Candle PK includes interval; volume nullable (REQ-DB-011) ────
+// ── Scenario 5: coin_candles PK includes interval; volume nullable (REQ-DB-011) ────
+//
+// SPEC-API-005 F-58: rewritten from the pre-0011 market-keyed `candles` table to the coin-keyed
+// `coin_candles` table (PK (coin_id, vs_currency, interval, ts)).
 
 #[tokio::test]
 #[ignore]
 async fn scenario_05_candle_pk_and_nullable_volume() {
     let pool = setup().await;
-    let market_id = insert_test_market(&pool, "s05").await;
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
+    let coin_id = insert_test_coin(&pool, &format!("s05-{suffix}")).await;
 
     let ts = "2026-06-01 12:00:00+00";
 
-    // Insert 1m candle
-    sqlx::query(
-        "INSERT INTO candles (market_id, interval, ts, open, high, low, close, vs_currency, source)
-         VALUES ($1, '1m', $2::timestamptz, 42000, 42100, 41900, 42050, 'usd', 'test')
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(market_id)
-    .bind(ts)
-    .execute(&pool)
-    .await
-    .expect("1m candle insert");
+    // 1m and 1d candles at the same (coin_id, vs_currency, ts) coexist — PK includes interval.
+    for (interval, o, h, l, c) in [
+        ("1m", 42000, 42100, 41900, 42050),
+        ("1d", 40000, 43000, 39500, 42050),
+    ] {
+        sqlx::query(
+            "INSERT INTO coin_candles (coin_id, vs_currency, interval, ts, open, high, low, close, source)
+             VALUES ($1, 'usd', $2, $3::timestamptz, $4, $5, $6, $7, 'test')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&coin_id)
+        .bind(interval)
+        .bind(ts)
+        .bind(o)
+        .bind(h)
+        .bind(l)
+        .bind(c)
+        .execute(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{interval} candle insert must succeed: {e}"));
+    }
 
-    // Insert 1d candle for same (market_id, ts) — PK includes interval so they coexist
+    // NULL volume candle (CoinGecko OHLC: no volume) — REQ-DB-011.
     sqlx::query(
-        "INSERT INTO candles (market_id, interval, ts, open, high, low, close, vs_currency, source)
-         VALUES ($1, '1d', $2::timestamptz, 40000, 43000, 39500, 42050, 'usd', 'test')
+        "INSERT INTO coin_candles (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source)
+         VALUES ($1, 'usd', '1h', '2026-06-01 13:00:00+00'::timestamptz, 42000, 42100, 41900, 42050, NULL, 'coingecko')
          ON CONFLICT DO NOTHING",
     )
-    .bind(market_id)
-    .bind(ts)
-    .execute(&pool)
-    .await
-    .expect("1d candle insert must succeed — different interval coexists");
-
-    // Insert candle with NULL volume (CoinGecko OHLC: no volume)
-    let ts2 = "2026-06-01 13:00:00+00";
-    sqlx::query(
-        "INSERT INTO candles (market_id, interval, ts, open, high, low, close, volume, vs_currency, source)
-         VALUES ($1, '1h', $2::timestamptz, 42000, 42100, 41900, 42050, NULL, 'usd', 'coingecko')
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(market_id)
-    .bind(ts2)
+    .bind(&coin_id)
     .execute(&pool)
     .await
     .expect("NULL volume candle insert must succeed (REQ-DB-011)");
 
-    // Verify both intervals exist for original ts
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM candles WHERE market_id = $1 AND ts = $2::timestamptz AND interval IN ('1m', '1d')")
-            .bind(market_id)
-            .bind(ts)
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-    assert_eq!(
-        count, 2,
-        "1m and 1d candles must coexist for same (market_id, ts)"
-    );
-}
-
-// ── Scenario 6: Derivatives observables in one tick (REQ-DB-013) ─────────────
-
-#[tokio::test]
-#[ignore]
-async fn scenario_06_derivatives_single_tick_all_columns() {
-    let pool = setup().await;
-
-    let required_cols = [
-        "funding_rate",
-        "open_interest",
-        "open_interest_usd",
-        "mark_price",
-        "index_price",
-        "basis",
-    ];
-    for col in &required_cols {
-        let row = sqlx::query(
-            "SELECT data_type FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = 'derivatives_quotes' AND column_name = $1",
-        )
-        .bind(col)
-        .fetch_optional(&pool)
-        .await
-        .expect("catalog query")
-        .unwrap_or_else(|| panic!("derivatives_quotes must have column '{col}' (REQ-DB-013)"));
-        assert_eq!(
-            row.get::<String, _>("data_type"),
-            "numeric",
-            "derivatives_quotes.{col} must be NUMERIC (REQ-DB-040)"
-        );
-    }
-
-    // Assert no separate funding_rate_history or open_interest_history table
-    let has_separate_funding: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='funding_rates')",
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM coin_candles
+         WHERE coin_id = $1 AND ts = $2::timestamptz AND interval IN ('1m', '1d')",
     )
+    .bind(&coin_id)
+    .bind(ts)
     .fetch_one(&pool)
     .await
-    .expect("catalog query");
-    assert!(
-        !has_separate_funding,
-        "funding rates must live in derivatives_quotes, not a separate table (REQ-DB-013)"
+    .expect("count");
+    assert_eq!(
+        count, 2,
+        "1m and 1d candles must coexist for the same (coin_id, vs_currency, ts)"
     );
+
+    // Teardown (child before parent).
+    sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
+        .bind(&coin_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+        .bind(&coin_id)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ── Scenario 7: Coin aggregates are time-series, not revisions (REQ-DB-012/022) ──
@@ -606,40 +520,41 @@ async fn scenario_09_collection_queue_dedup_and_claim_indexes() {
     );
 }
 
-// ── Scenario 10: Backfill idempotent enqueue + lease columns (REQ-DB-033) ────
+// ── Scenario 10: Coin-keyed backfill idempotent enqueue + lease columns (REQ-DB-033) ────
+//
+// SPEC-API-005 F-58: rewritten from the pre-0011 market-keyed backfill_jobs to the coin-keyed
+// replacement created by migration 0012 (UNIQUE (coin_id, dataset)).
 
 #[tokio::test]
 #[ignore]
 async fn scenario_10_backfill_idempotent_enqueue_and_lease_columns() {
     let pool = setup().await;
-    let market_id = insert_test_market(&pool, "s10").await;
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
+    let coin_id = insert_test_coin(&pool, &format!("s10-{suffix}")).await;
 
     let dataset = "candles:1h";
 
-    // First enqueue
-    sqlx::query(
-        "INSERT INTO backfill_jobs (market_id, dataset, status) VALUES ($1, $2, 'pending')",
-    )
-    .bind(market_id)
-    .bind(dataset)
-    .execute(&pool)
-    .await
-    .expect("first backfill job insert");
+    sqlx::query("INSERT INTO backfill_jobs (coin_id, dataset, status) VALUES ($1, $2, 'pending')")
+        .bind(&coin_id)
+        .bind(dataset)
+        .execute(&pool)
+        .await
+        .expect("first backfill job insert");
 
-    // Second enqueue with same (market_id, dataset) — must be no-op due to UNIQUE
+    // Duplicate (coin_id, dataset) — rejected by UNIQUE (REQ-DB-033).
     let result = sqlx::query(
-        "INSERT INTO backfill_jobs (market_id, dataset, status) VALUES ($1, $2, 'pending')",
+        "INSERT INTO backfill_jobs (coin_id, dataset, status) VALUES ($1, $2, 'pending')",
     )
-    .bind(market_id)
+    .bind(&coin_id)
     .bind(dataset)
     .execute(&pool)
     .await;
     assert!(
         result.is_err(),
-        "duplicate backfill job must be rejected by UNIQUE(market_id, dataset) (REQ-DB-033)"
+        "duplicate backfill job must be rejected by UNIQUE(coin_id, dataset) (REQ-DB-033)"
     );
 
-    // Verify backfill_chunks has all required lease columns
+    // backfill_chunks retains all required lease columns.
     let required_chunk_cols = [
         "range_start",
         "range_end",
@@ -666,6 +581,18 @@ async fn scenario_10_backfill_idempotent_enqueue_and_lease_columns() {
             "backfill_chunks must have column '{col}' (REQ-DB-033)"
         );
     }
+
+    // Teardown (child before parent; backfill_jobs FK → tracked_coins ON DELETE CASCADE).
+    sqlx::query("DELETE FROM backfill_jobs WHERE coin_id = $1")
+        .bind(&coin_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+        .bind(&coin_id)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ── Scenario 11: Per-provider pacer seeded (REQ-DB-034/035) ──────────────────
@@ -741,30 +668,21 @@ async fn scenario_11_pacer_seeded_with_four_providers() {
 async fn scenario_12_precision_and_time_type_sweep() {
     let pool = setup().await;
 
-    // All monetary/quantity columns must be NUMERIC
+    // All monetary/quantity columns must be NUMERIC. SPEC-API-005 F-58: rewritten to the current
+    // coin-keyed tables (the pre-0011 live_quotes / candles / derivatives_quotes were dropped).
     let monetary_cols = [
-        ("live_quotes", "price"),
-        ("live_quotes", "bid"),
-        ("live_quotes", "ask"),
-        ("live_quotes", "volume_24h"),
-        ("candles", "open"),
-        ("candles", "high"),
-        ("candles", "low"),
-        ("candles", "close"),
-        ("candles", "volume"),
+        ("coin_quotes", "price"),
+        ("coin_candles", "open"),
+        ("coin_candles", "high"),
+        ("coin_candles", "low"),
+        ("coin_candles", "close"),
+        ("coin_candles", "volume"),
         ("coin_market_snapshots", "price"),
         ("coin_market_snapshots", "market_cap"),
         ("coin_market_snapshots", "fully_diluted_valuation"),
         ("coin_market_snapshots", "circulating_supply"),
         ("coin_market_snapshots", "total_supply"),
         ("coin_market_snapshots", "volume_24h"),
-        ("derivatives_quotes", "funding_rate"),
-        ("derivatives_quotes", "open_interest"),
-        ("derivatives_quotes", "open_interest_usd"),
-        ("derivatives_quotes", "mark_price"),
-        ("derivatives_quotes", "index_price"),
-        ("derivatives_quotes", "basis"),
-        ("derivatives_quotes", "volume_24h"),
         ("coin_metadata", "max_supply"),
     ];
 
@@ -788,7 +706,7 @@ async fn scenario_12_precision_and_time_type_sweep() {
         // (some nullable columns like bid/ask/volume might only fail if they exist with wrong type)
     }
 
-    // All timestamp columns must be TIMESTAMPTZ
+    // All timestamp columns must be TIMESTAMPTZ (current coin-keyed schema; F-58).
     let ts_cols: Vec<(String, String)> = sqlx::query_as(
         "SELECT table_name, column_name
          FROM information_schema.columns
@@ -796,8 +714,8 @@ async fn scenario_12_precision_and_time_type_sweep() {
            AND column_name LIKE '%_at' OR column_name = 'ts' OR column_name = 'as_of'
            AND data_type NOT IN ('timestamp with time zone', 'interval')
            AND table_name IN (
-               'tracked_coins', 'tracked_markets', 'live_quotes', 'candles',
-               'coin_market_snapshots', 'derivatives_quotes', 'coin_metadata',
+               'tracked_coins', 'coin_quotes', 'coin_candles',
+               'coin_market_snapshots', 'coin_metadata',
                'collection_queue', 'backfill_jobs', 'backfill_chunks', 'upstream_request_pacer'
            )",
     )
@@ -816,26 +734,37 @@ async fn scenario_12_precision_and_time_type_sweep() {
 }
 
 // ── Scenario 13: Unseeded-month write fails loudly (REQ-DB-017) ───────────────
+//
+// SPEC-API-005 F-58: rewritten from the pre-0011 market-keyed live_quotes to the coin-keyed
+// coin_quotes table, which is still RANGE-partitioned through 2027-12 (0011). coin_candles is
+// NOT used here — it was de-partitioned by 0020 and accepts any ts.
 
 #[tokio::test]
 #[ignore]
 async fn scenario_13_write_to_unseeded_partition_fails() {
     let pool = setup().await;
-    let market_id = insert_test_market(&pool, "s13").await;
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
+    let coin_id = insert_test_coin(&pool, &format!("s13-{suffix}")).await;
 
-    // ts = 2028-06-15 is beyond the last partition (2027-12-31)
+    // ts = 2028-06-15 is beyond the last coin_quotes partition (2027-12 → 2028-01-01 boundary).
     let result = sqlx::query(
-        "INSERT INTO live_quotes (market_id, ts, price, vs_currency, source)
-         VALUES ($1, '2028-06-15 00:00:00+00'::timestamptz, 42000.0, 'usd', 'test')",
+        "INSERT INTO coin_quotes (coin_id, vs_currency, ts, price, source)
+         VALUES ($1, 'usd', '2028-06-15 00:00:00+00'::timestamptz, 42000, 'test')",
     )
-    .bind(market_id)
+    .bind(&coin_id)
     .execute(&pool)
     .await;
 
     assert!(
         result.is_err(),
-        "Write to unseeded partition (2028-06) must fail loudly, not silently drop (REQ-DB-017)"
+        "Write to unseeded coin_quotes partition (2028-06) must fail loudly, not silently drop (REQ-DB-017)"
     );
+
+    sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+        .bind(&coin_id)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 // ── Scenario 14: Migrations idempotent on re-apply (REQ-DB-043) ───────────────
@@ -855,6 +784,10 @@ async fn scenario_14_migrations_idempotent() {
 }
 
 // ── Scenario 15: Live-poller contract columns and claim index (REQ-DB-002/005) ──
+//
+// SPEC-API-005 F-58: rewritten from the pre-0011 tracked_markets to tracked_coins, which is
+// where the per-coin live-poller columns live (added by migration 0010) after 0011 removed
+// tracked_markets.
 
 #[tokio::test]
 #[ignore]
@@ -869,31 +802,34 @@ async fn scenario_15_live_poller_contract_columns_and_index() {
     for (col, expected_type) in &required {
         let dtype: String = sqlx::query_scalar(
             "SELECT data_type FROM information_schema.columns
-             WHERE table_schema='public' AND table_name='tracked_markets' AND column_name=$1",
+             WHERE table_schema='public' AND table_name='tracked_coins' AND column_name=$1",
         )
         .bind(col)
         .fetch_one(&pool)
         .await
-        .unwrap_or_else(|_| panic!("tracked_markets.{col} must exist (REQ-DB-002)"));
+        .unwrap_or_else(|_| panic!("tracked_coins.{col} must exist (REQ-DB-002)"));
         assert_eq!(
             &dtype, expected_type,
-            "tracked_markets.{col} must be '{expected_type}' (REQ-DB-002/041)"
+            "tracked_coins.{col} must be '{expected_type}' (REQ-DB-002/041)"
         );
     }
 
-    // status must restrict to active/paused/error
+    // status must restrict to active/paused/error.
+    let suffix = uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string();
     sqlx::query(
-        "INSERT INTO tracked_markets (base, quote, kind, status) VALUES ('S15TST', 'USD', 'spot', 'invalid_status')",
+        "INSERT INTO tracked_coins (coin_id, symbol, name, status)
+         VALUES ($1, 'S15', 'Scenario15', 'invalid_status')",
     )
+    .bind(format!("s15-{suffix}"))
     .execute(&pool)
     .await
     .expect_err("invalid status must be rejected by CHECK constraint (REQ-DB-002)");
 
-    // Partial claim index WHERE status='active' must exist
+    // Partial claim index on tracked_coins (last_polled_at) WHERE status='active' must exist.
     let has_idx: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM pg_indexes
-            WHERE schemaname='public' AND tablename='tracked_markets'
+            WHERE schemaname='public' AND tablename='tracked_coins'
               AND indexdef ILIKE '%last_polled_at%'
               AND indexdef ILIKE '%active%'
          )",
@@ -903,7 +839,7 @@ async fn scenario_15_live_poller_contract_columns_and_index() {
     .expect("index check");
     assert!(
         has_idx,
-        "tracked_markets must have partial index on last_polled_at WHERE status='active' (REQ-DB-005)"
+        "tracked_coins must have partial index on last_polled_at WHERE status='active' (REQ-DB-005)"
     );
 }
 
