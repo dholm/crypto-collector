@@ -85,10 +85,35 @@ impl HealthState {
         self.inner.shutting_down.store(true, Ordering::Release);
     }
 
-    // @MX:WARN: [AUTO] check_readiness uses dual async RwLock (cache + ready/shutdown flags); read→write upgrade on cache miss
-    // @MX:REASON: 2 s TTL bounds DB query rate under concurrent health probes; upgrade is non-atomic — brief re-check possible but harmless
+    // @MX:WARN: [AUTO] check_readiness consults the shutting_down/ready atomics BEFORE the 2 s
+    //           DB-ping cache fast-path; only the DB-ping result is cached (REQ-OBS-070 / F-44)
+    // @MX:REASON: caching the flags would let a warm 200 lag the 503-on-shutdown guarantee
+    //             (REQ-OBS-004) for up to the TTL. Flags are cheap atomics — never cache them;
+    //             cache only the DB ping, whose rate the 2 s TTL exists to bound.
+    // @MX:SPEC: SPEC-OBS-002 REQ-OBS-070 SPEC-OBS-001 REQ-OBS-004
     async fn check_readiness(&self) -> ReadinessResult {
-        // Fast path: serve cached result within TTL.
+        // Flags FIRST (REQ-OBS-070 / F-44): consult the shutting_down / ready atomics before
+        // the cache fast-path so a warm cache cannot lag the 503-on-shutdown guarantee
+        // (REQ-OBS-004). These are cheap atomic loads and are never cached.
+
+        // Shutdown grace window forces 503 first (REQ-OBS-004).
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return ReadinessResult {
+                ok: false,
+                failed: vec!["shutting_down: graceful shutdown in progress".to_string()],
+            };
+        }
+
+        // Readiness flag — set after startup prerequisites complete (REQ-OBS-003).
+        if !self.inner.ready.load(Ordering::Acquire) {
+            return ReadinessResult {
+                ok: false,
+                failed: vec!["startup: initialization not yet complete".to_string()],
+            };
+        }
+
+        // DB-ping fast path: serve the cached DB-ping result within TTL. Only the DB ping is
+        // cached (the flags above are always re-evaluated live).
         {
             let cache = self.inner.cache.read().await;
             if let (Some(result), Some(checked_at)) = (&cache.result, cache.checked_at) {
@@ -98,24 +123,11 @@ impl HealthState {
             }
         }
 
+        // Cache miss: run the DB ping (REQ-OBS-003).
         let mut failed = Vec::new();
-
-        // Shutdown grace window forces 503 first (REQ-OBS-004).
-        if self.inner.shutting_down.load(Ordering::Acquire) {
-            failed.push("shutting_down: graceful shutdown in progress".to_string());
-        }
-
-        // Readiness flag — set after startup prerequisites complete (REQ-OBS-003).
-        if !self.inner.ready.load(Ordering::Acquire) {
-            failed.push("startup: initialization not yet complete".to_string());
-        }
-
-        // DB ping — only if no prior failure (avoids DB call during early startup).
-        if failed.is_empty() {
-            if let Some(ref pool) = self.inner.pool {
-                if let Err(e) = sqlx::query("SELECT 1").fetch_one(pool).await {
-                    failed.push(format!("postgres: {e}"));
-                }
+        if let Some(ref pool) = self.inner.pool {
+            if let Err(e) = sqlx::query("SELECT 1").fetch_one(pool).await {
+                failed.push(format!("postgres: {e}"));
             }
         }
 
@@ -124,6 +136,7 @@ impl HealthState {
             failed,
         };
 
+        // Cache ONLY the DB-ping result (never the flags — REQ-OBS-070).
         let mut cache = self.inner.cache.write().await;
         cache.result = Some(result.clone());
         cache.checked_at = Some(Instant::now());
@@ -257,6 +270,42 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "/healthz/ready must return 503 during shutdown grace (REQ-OBS-004)"
         );
+    }
+
+    // ── AC-OBS-070 (F-44): flags-before-cache — 503 on shutdown despite a warm cache ──
+
+    #[tokio::test]
+    async fn readiness_503_on_shutdown_even_with_warm_cache() {
+        let state = HealthState::for_test();
+        state.set_ready();
+        // Prime the DB-ping cache with a fresh 200 (pool = None → ping passes).
+        let primed = state.check_readiness().await;
+        assert!(primed.ok, "cache primed with a ready 200");
+        // Enter shutdown; the DB-ping cache is still warm (< 2 s TTL).
+        state.set_shutting_down();
+        let after = state.check_readiness().await;
+        assert!(
+            !after.ok,
+            "must be 503 immediately on shutdown despite the warm cache (REQ-OBS-070)"
+        );
+        assert!(
+            after.failed.iter().any(|f| f.contains("shutting_down")),
+            "the 503 must cite shutting_down, not a stale cached 200"
+        );
+    }
+
+    #[tokio::test]
+    async fn readiness_flags_are_never_served_from_cache() {
+        // A cache primed while ready must not mask a later not-ready flag transition:
+        // the ready atomic is consulted live before the cache fast-path (REQ-OBS-070).
+        let state = HealthState::for_test();
+        state.set_ready();
+        let primed = state.check_readiness().await;
+        assert!(primed.ok);
+        // set_shutting_down is the observable live-flag transition (ready is monotonic at
+        // startup); assert the warm cache does not serve a stale ok result.
+        state.set_shutting_down();
+        assert!(!state.check_readiness().await.ok);
     }
 
     // ── Readiness body shape ────────────────────────────────────────────────────

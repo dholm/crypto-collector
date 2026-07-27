@@ -399,11 +399,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Step 10: Flip readiness (all prerequisites satisfied) (REQ-OBS-040) ───
-    health_state.set_ready();
-    info!("crypto-collector: service is ready");
-
-    // ── Step 11: Bind API listener (REQ-OBS-001) ──────────────────────────────
+    // ── Step 10: Spawn relays + bind the API listener BEFORE flipping readiness ─
+    // F-43 (REQ-OBS-069): readiness must not report Ready until the API listener is bound
+    // and accepting connections. The relay spawn and `TcpListener::bind` therefore happen
+    // first; `set_ready()` moves to just before `axum::serve` (below), so only serving
+    // follows readiness. This reorders ONLY within the existing Step 10-11 — the documented
+    // health-before-DB-retry (Step 6) and readiness-503-before-grace (shutdown) ordering
+    // guarantees are unchanged.
     let search_provider = provider_names
         .first()
         .cloned()
@@ -456,6 +458,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind API port {api_port}"))?;
     info!("crypto-collector: API server listening on port {api_port}");
+
+    // ── Step 11: Flip readiness — the API listener is now bound and the relays are spawned,
+    // so Ready is never reported before the listener is accepting connections (REQ-OBS-040/069,
+    // F-43). Only `axum::serve` follows.
+    health_state.set_ready();
+    info!("crypto-collector: service is ready");
 
     info!("crypto-collector: metrics server listening on port {metrics_port}");
 
@@ -802,6 +810,42 @@ mod tests {
         assert!(
             code.contains("tokio::time::timeout(Duration::from_secs(drain_secs), supervisor)"),
             "the drain must be bounded above via tokio::time::timeout (REQ-OBS-066)"
+        );
+    }
+
+    // ── AC-OBS-069: bind-before-ready (SPEC-OBS-002 F-43) ──────────────────────
+
+    /// AC-OBS-069: the API `TcpListener::bind` and the relay spawn complete BEFORE
+    /// `set_ready()`; only `axum::serve` follows. Verified by source order in main() — the
+    /// documented Step 6 health-before-DB-retry ordering is unchanged (this only reorders
+    /// within Steps 10-11).
+    #[test]
+    fn readiness_flips_only_after_api_bind_and_relay_spawn() {
+        let src = std::fs::read_to_string("src/main.rs").expect("read main.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let relay_spawn = code
+            .find("PG LISTEN/NOTIFY relays started")
+            .expect("relay spawn present");
+        let api_bind = code
+            .find("API server listening on port")
+            .expect("API bind present");
+        let set_ready = code
+            .find("health_state.set_ready()")
+            .expect("set_ready call present");
+        let serve = code
+            .find("axum::serve(api_listener")
+            .expect("API serve present");
+        assert!(
+            relay_spawn < set_ready,
+            "relays must spawn before set_ready (REQ-OBS-069)"
+        );
+        assert!(
+            api_bind < set_ready,
+            "the API listener must bind before set_ready (REQ-OBS-069)"
+        );
+        assert!(
+            set_ready < serve,
+            "only axum::serve may follow set_ready (REQ-OBS-069)"
         );
     }
 
