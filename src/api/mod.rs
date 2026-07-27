@@ -41,7 +41,8 @@ use crate::providers::Provider;
 /// Shared Axum application state for all `/v1` handlers.
 // @MX:ANCHOR: [AUTO] AppState — shared across all /v1 handlers and WebSocket upgraders
 // @MX:REASON: fan_in >= 3: all handler modules + listener.rs + main.rs.
-//             Adding fields here requires updating test_server() in all test modules.
+//             Adding fields here requires updating the single AppState::test() constructor
+//             (SPEC-REFACTOR-001 M5 / REQ-REFACTOR-054) that every test module builds from.
 //             broadcast senders must outlive the router; they are cloned cheaply into handlers.
 // @MX:SPEC: SPEC-API-001 SPEC-API-002 REQ-API-148
 #[derive(Clone)]
@@ -52,16 +53,37 @@ pub struct AppState {
     pub chain: Arc<Vec<Arc<dyn Provider>>>,
     /// Provider name to use for search calls (typically the first in the chain).
     pub search_provider: String,
-    /// CoinGecko base URL for search API calls.
-    pub coingecko_base_url: String,
-    /// HTTP client for outbound search calls.
-    pub http_client: reqwest::Client,
     /// Broadcast sender for coin spot quotes — WebSocket fan-out (REQ-API-148).
     /// Driven by `src/listener.rs` which relays PG NOTIFY `coin_quote_updated`.
     pub coin_quote_tx: broadcast::Sender<String>,
     /// Broadcast sender for coin OHLCV candles — WebSocket fan-out (REQ-API-148).
     /// Driven by `src/listener.rs` which relays PG NOTIFY `coin_candle_updated`.
     pub coin_candle_tx: broadcast::Sender<String>,
+}
+
+// SPEC-REFACTOR-001 M5 (REQ-REFACTOR-053): the former `coingecko_base_url` / `http_client`
+// fields were removed — no handler ever read them (search routes through the provider chain),
+// so they were dead state populated only by constructors.
+
+#[cfg(test)]
+impl AppState {
+    /// Shared test-state constructor (SPEC-REFACTOR-001 M5 / REQ-REFACTOR-054).
+    ///
+    /// Collapses the previously-duplicated per-module `AppState` test builders into one:
+    /// an empty provider chain, `search_provider = "coingecko"`, and fresh broadcast channels.
+    /// The caller supplies the pool (a lazy pool for router-only tests, or a real
+    /// `DATABASE_URL`-backed pool for DB-gated tests). Modules needing a non-default field
+    /// (e.g. a stub provider chain, or an externally-held `coin_quote_tx`) override it via
+    /// struct-update syntax: `AppState { chain, ..AppState::test(pool) }`.
+    pub(crate) fn test(pool: PgPool) -> Self {
+        AppState {
+            pool,
+            chain: Arc::new(vec![]),
+            search_provider: "coingecko".to_string(),
+            coin_quote_tx: broadcast::channel(16).0,
+            coin_candle_tx: broadcast::channel(16).0,
+        }
+    }
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -150,6 +172,25 @@ impl From<PathRejection> for ApiError {
 
 /// Shorthand `Result` alias used by all handlers.
 pub type ApiResult<T> = Result<T, ApiError>;
+
+// ── Shared handler helpers ──────────────────────────────────────────────────────
+
+/// Check that a coin_id exists in `tracked_coins`; return 404 if not.
+///
+/// SPEC-REFACTOR-001 M5 (REQ-REFACTOR-050): the single shared implementation, replacing the
+/// two verbatim copies previously in `quotes.rs` and `metadata.rs`. Called by the quotes,
+/// candles, market, and metadata read handlers before serving coin-scoped data.
+pub async fn ensure_coin_exists(pool: &sqlx::PgPool, coin_id: &str) -> ApiResult<()> {
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT coin_id FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .fetch_optional(pool)
+            .await?;
+    if exists.is_none() {
+        return Err(ApiError::NotFound(format!("coin '{coin_id}' not found")));
+    }
+    Ok(())
+}
 
 // ── Router assembly ───────────────────────────────────────────────────────────
 

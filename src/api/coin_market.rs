@@ -9,11 +9,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    cursor::{decode_keyset_cursor, validate_limit, TsKey},
+    cursor::{decode_keyset_cursor, paginate, validate_limit, TsKey},
     dto::{CoinMarketSnapshotDto, Page},
+    ensure_coin_exists,
     extract::{ApiPath, ApiQuery},
-    metadata::ensure_coin_exists,
-    quotes::paginate_ts,
     ApiError, ApiResult, AppState,
 };
 
@@ -117,7 +116,7 @@ pub async fn list_coin_market(
     .fetch_all(&state.pool)
     .await?;
 
-    let (items, next_cursor) = paginate_ts(items, limit, |s| s.ts);
+    let (items, next_cursor) = paginate(items, limit, |s| TsKey { ts: s.ts });
     Ok(Json(Page {
         items: items.into_iter().map(CoinMarketSnapshotDto::from).collect(),
         next_cursor,
@@ -135,19 +134,9 @@ mod tests {
         use axum_test::TestServer;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
-        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
-        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = crate::api::AppState {
+        let server = TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
             pool,
-            chain: std::sync::Arc::new(vec![]),
-
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        let server = TestServer::new(crate::api::build_api_router(state));
+        )));
         let resp = server.get("/v1/coins/no-such-coin-xyz/market/latest").await;
         assert_eq!(resp.status_code(), 404);
     }

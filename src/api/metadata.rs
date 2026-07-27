@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     dto::CoinMetadataDto,
+    ensure_coin_exists,
     extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
 };
@@ -80,21 +81,6 @@ pub async fn get_metadata(
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Check that a coin_id exists in tracked_coins; return 404 if not.
-pub async fn ensure_coin_exists(pool: &sqlx::PgPool, coin_id: &str) -> ApiResult<()> {
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT coin_id FROM tracked_coins WHERE coin_id = $1")
-            .bind(coin_id)
-            .fetch_optional(pool)
-            .await?;
-    if exists.is_none() {
-        return Err(ApiError::NotFound(format!("coin '{coin_id}' not found")));
-    }
-    Ok(())
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -142,19 +128,9 @@ mod tests {
         use axum_test::TestServer;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
-        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
-        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = crate::api::AppState {
+        let server = TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
             pool,
-            chain: std::sync::Arc::new(vec![]),
-
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        let server = TestServer::new(crate::api::build_api_router(state));
+        )));
         let resp = server.get("/v1/coins/no-such-coin-metadata/metadata").await;
         assert_eq!(resp.status_code(), 404);
     }
@@ -197,18 +173,7 @@ mod tests {
         .await
         .unwrap();
 
-        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
-        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = crate::api::AppState {
-            pool: pool.clone(),
-            chain: std::sync::Arc::new(vec![]),
-
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
+        let state = crate::api::AppState::test(pool.clone());
         let server = TestServer::new(crate::api::build_api_router(state));
 
         // Latest → revision 1

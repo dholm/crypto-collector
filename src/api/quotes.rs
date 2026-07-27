@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
+    cursor::{decode_keyset_cursor, paginate, validate_limit, TsKey},
     dto::{CoinQuoteDto, CoinQuoteOverviewDto, CoinQuoteOverviewPage, Page},
+    ensure_coin_exists,
     extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
 };
@@ -157,7 +158,7 @@ pub async fn list_quotes(
             .await?
         };
 
-    let (items, next_cursor) = paginate_ts(items, limit, |q| q.ts);
+    let (items, next_cursor) = paginate(items, limit, |q| TsKey { ts: q.ts });
     Ok(Json(Page {
         items: items.into_iter().map(CoinQuoteDto::from).collect(),
         next_cursor,
@@ -225,37 +226,6 @@ pub async fn list_latest_quotes(
     Ok(Json(CoinQuoteOverviewPage { quotes }))
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Check that a coin_id exists; return 404 if not.
-pub async fn ensure_coin_exists(pool: &sqlx::PgPool, coin_id: &str) -> ApiResult<()> {
-    let exists: Option<(String,)> =
-        sqlx::query_as("SELECT coin_id FROM tracked_coins WHERE coin_id = $1")
-            .bind(coin_id)
-            .fetch_optional(pool)
-            .await?;
-    if exists.is_none() {
-        return Err(ApiError::NotFound(format!("coin '{coin_id}' not found")));
-    }
-    Ok(())
-}
-
-/// Generic keyset paginator for time-series rows ordered `ts DESC`.
-pub fn paginate_ts<T, F>(mut items: Vec<T>, limit: i64, get_ts: F) -> (Vec<T>, Option<String>)
-where
-    F: Fn(&T) -> DateTime<Utc>,
-{
-    let has_more = items.len() as i64 > limit;
-    if has_more {
-        items.truncate(limit as usize);
-    }
-    let next_cursor = has_more.then(|| {
-        let last = items.last().expect("non-empty when has_more");
-        encode_keyset_cursor(&TsKey { ts: get_ts(last) })
-    });
-    (items, next_cursor)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -279,7 +249,7 @@ mod tests {
         }
     }
 
-    // paginate_ts: has_more → next_cursor encodes last item ts
+    // paginate (TsKey): has_more → next_cursor encodes last item ts
     #[test]
     fn paginate_ts_has_more_returns_cursor() {
         let items = vec![
@@ -288,7 +258,7 @@ mod tests {
             make_coin_quote(10, "98"),
         ];
 
-        let (trimmed, next_cursor) = paginate_ts(items, 2, |q| q.ts);
+        let (trimmed, next_cursor) = paginate(items, 2, |q| TsKey { ts: q.ts });
         assert_eq!(trimmed.len(), 2);
         assert!(next_cursor.is_some());
         let key: TsKey = decode_keyset_cursor(next_cursor.as_ref().unwrap()).unwrap();
@@ -298,22 +268,14 @@ mod tests {
     #[test]
     fn paginate_ts_no_more_returns_null_cursor() {
         let items = vec![make_coin_quote(12, "100")];
-        let (_, next_cursor) = paginate_ts(items, 100, |q| q.ts);
+        let (_, next_cursor) = paginate(items, 100, |q| TsKey { ts: q.ts });
         assert!(next_cursor.is_none());
     }
 
     // Build an AppState with empty provider chain for DB-gated router tests.
     #[cfg(test)]
     fn test_state(pool: sqlx::PgPool) -> crate::api::AppState {
-        crate::api::AppState {
-            pool,
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx: tokio::sync::broadcast::channel(16).0,
-            coin_candle_tx: tokio::sync::broadcast::channel(16).0,
-        }
+        crate::api::AppState::test(pool)
     }
 
     // DB-gated integration tests

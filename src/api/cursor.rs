@@ -101,12 +101,95 @@ pub fn validate_limit(limit: Option<i64>) -> anyhow::Result<i64> {
     }
 }
 
+// ── Generic keyset paginator ────────────────────────────────────────────────────
+
+/// Truncate a `limit + 1`-sized fetch to `limit` rows and derive the next keyset cursor.
+///
+/// SPEC-REFACTOR-001 M5 (REQ-REFACTOR-052): the single generic paginator, replacing the three
+/// per-endpoint copies (`paginate_coins`, `paginate_ts`, `paginate_cycle_overlay`). The
+/// truncate-and-encode cursor semantics are byte-identical for every endpoint: a caller fetches
+/// `limit + 1` rows; when more than `limit` were returned there is a next page, so the list is
+/// truncated to `limit` and the cursor encodes the ordering key of the last returned row via
+/// `key_fn`; otherwise there is no next page and the cursor is `None`.
+///
+// @MX:NOTE: [AUTO] paginate — shared keyset paginator for every /v1 list endpoint (fan_in >= 3:
+//           coins / quotes / candles / coin_market / cycle_overlay). The `key_fn` closure is the
+//           only per-endpoint variation; the truncate/has_more/encode logic is identical.
+pub fn paginate<T, K, F>(mut items: Vec<T>, limit: i64, key_fn: F) -> (Vec<T>, Option<String>)
+where
+    K: Serialize,
+    F: Fn(&T) -> K,
+{
+    let has_more = items.len() as i64 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = has_more.then(|| {
+        let last = items.last().expect("non-empty when has_more");
+        encode_keyset_cursor(&key_fn(last))
+    });
+    (items, next_cursor)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    // SPEC-REFACTOR-001 M5 (REQ-REFACTOR-052): generic paginator characterization — the shared
+    // truncate/has_more/encode contract that the three prior paginators each hand-rolled.
+    #[test]
+    fn paginate_has_more_truncates_and_encodes_last_key() {
+        // 3 rows fetched with limit 2 → has_more: truncate to 2, cursor encodes the 2nd row's key.
+        let rows = vec!["bitcoin", "ethereum", "litecoin"];
+        let (page, next_cursor) = paginate(rows, 2, |c| CoinListKey {
+            coin_id: (*c).to_string(),
+        });
+        assert_eq!(page, vec!["bitcoin", "ethereum"]);
+        let key: CoinListKey = decode_keyset_cursor(next_cursor.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            key.coin_id, "ethereum",
+            "cursor encodes the last returned row"
+        );
+    }
+
+    #[test]
+    fn paginate_exact_limit_returns_null_cursor() {
+        // Exactly `limit` rows fetched → no next page.
+        let rows = vec!["bitcoin", "ethereum"];
+        let (page, next_cursor) = paginate(rows, 2, |c| CoinListKey {
+            coin_id: (*c).to_string(),
+        });
+        assert_eq!(page.len(), 2);
+        assert!(next_cursor.is_none());
+    }
+
+    #[test]
+    fn paginate_under_limit_returns_null_cursor() {
+        let rows = vec!["bitcoin"];
+        let (page, next_cursor) = paginate(rows, 100, |c| CoinListKey {
+            coin_id: (*c).to_string(),
+        });
+        assert_eq!(page.len(), 1);
+        assert!(next_cursor.is_none());
+    }
+
+    // Composite-key characterization (CycleOverlayKey): the generic paginator carries any
+    // Serialize key, so the composite (cycle_number, days_since_halving) cursor still round-trips.
+    #[test]
+    fn paginate_composite_key_encodes_last_row() {
+        let rows = vec![(3, 1), (3, 2), (3, 3)];
+        let (page, next_cursor) = paginate(rows, 2, |&(cycle, dsh)| CycleOverlayKey {
+            cycle_number: cycle,
+            days_since_halving: dsh,
+        });
+        assert_eq!(page.len(), 2);
+        let key: CycleOverlayKey = decode_keyset_cursor(next_cursor.as_ref().unwrap()).unwrap();
+        assert_eq!(key.cycle_number, 3);
+        assert_eq!(key.days_since_halving, 2);
+    }
 
     fn ts() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap()

@@ -377,7 +377,6 @@ async fn main() -> Result<()> {
         .first()
         .cloned()
         .unwrap_or_else(|| "coingecko".to_string());
-    let coingecko_base_url = config::coingecko_base_url();
 
     // Broadcast channels for WebSocket fan-out (SPEC-API-002 REQ-API-148).
     // Capacity 256 per channel — lagged receivers log a warning and skip to newest.
@@ -429,8 +428,6 @@ async fn main() -> Result<()> {
         pool: pool.clone(),
         chain: chain.clone(),
         search_provider,
-        coingecko_base_url,
-        http_client: reqwest::Client::new(),
         coin_quote_tx,
         coin_candle_tx,
     };

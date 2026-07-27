@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 use super::{
-    cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CycleOverlayKey},
+    cursor::{decode_keyset_cursor, paginate, validate_limit, CycleOverlayKey},
     dto::{CycleOverlayPointDto, CycleProjectionModelDto, CycleProjectionModelsDto, Page},
     extract::{ApiPath, ApiQuery},
     ApiError, ApiResult, AppState,
@@ -258,7 +258,10 @@ async fn list_overlay_for_model(
         }
     };
 
-    let (items, next_cursor) = paginate_cycle_overlay(items, limit);
+    let (items, next_cursor) = paginate(items, limit, |p| CycleOverlayKey {
+        cycle_number: p.cycle_number,
+        days_since_halving: p.days_since_halving,
+    });
 
     Ok(Json(Page {
         items: items.into_iter().map(CycleOverlayPointDto::from).collect(),
@@ -272,7 +275,7 @@ async fn list_overlay_for_model(
 /// `ts <= as_of` (via the shared `load_daily_series`, same loader the periodic recompute uses
 /// — REQ-CYCLE-075), re-runs the existing pure functions per request, then applies — over the
 /// in-memory result — the same `cycle` filter, keyset ordering/cursor, and `limit + 1` fetch
-/// shape as the table-backed SQL path (REQ-CYCLE-078), so `paginate_cycle_overlay` can be reused
+/// shape as the table-backed SQL path (REQ-CYCLE-078), so the shared `cursor::paginate` can be reused
 /// unchanged by the caller.
 #[allow(clippy::too_many_arguments)]
 async fn compute_as_of_page(
@@ -346,7 +349,7 @@ fn project_as_of_for_model(
 /// Pure in-memory paginate/filter/order step of the as-of path (REQ-CYCLE-078): applies the
 /// optional `cycle` filter, the strict-tuple keyset cursor advance, and
 /// `(cycle_number ASC, days_since_halving ASC)` ordering, then truncates to `limit + 1` — the
-/// same shape `paginate_cycle_overlay` expects from the SQL path.
+/// same shape the shared `cursor::paginate` expects from the SQL path.
 fn build_as_of_page(
     real: Vec<OverlayPoint>,
     projected: Vec<OverlayPoint>,
@@ -374,7 +377,7 @@ fn build_as_of_page(
 
 /// Stamp a pure `OverlayPoint` (from `crate::collectors::cycle_overlay`) with `coin_id`/
 /// `vs_currency` to produce the same model shape the table-backed SELECT returns, so
-/// `CycleOverlayPointDto::from` and `paginate_cycle_overlay` are reused unchanged.
+/// `CycleOverlayPointDto::from` and the shared `cursor::paginate` are reused unchanged.
 fn overlay_point_to_model(p: OverlayPoint, coin_id: &str, vs_currency: &str) -> CycleOverlayPoint {
     CycleOverlayPoint {
         coin_id: coin_id.to_string(),
@@ -393,28 +396,6 @@ fn overlay_point_to_model(p: OverlayPoint, coin_id: &str, vs_currency: &str) -> 
     }
 }
 
-/// Truncate a `limit + 1`-sized fetch to `limit` items and derive the next cursor.
-///
-/// Mirrors `quotes::paginate_ts`'s len-based heuristic, but over the composite
-/// `(cycle_number, days_since_halving)` keyset key (REQ-CYCLE-051).
-fn paginate_cycle_overlay(
-    mut items: Vec<CycleOverlayPoint>,
-    limit: i64,
-) -> (Vec<CycleOverlayPoint>, Option<String>) {
-    if items.len() as i64 > limit {
-        items.truncate(limit as usize);
-        let next_cursor = items.last().map(|p| {
-            encode_keyset_cursor(&CycleOverlayKey {
-                cycle_number: p.cycle_number,
-                days_since_halving: p.days_since_halving,
-            })
-        });
-        (items, next_cursor)
-    } else {
-        (items, None)
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -425,27 +406,12 @@ mod tests {
 
     fn test_server() -> TestServer {
         use crate::api::{build_api_router, AppState};
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/crypto_collector_test")
             .expect("lazy pool");
 
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-
-        let state = AppState {
-            pool,
-            chain: Arc::new(vec![]),
-            search_provider: "coingecko".to_string(),
-            coingecko_base_url: "https://api.coingecko.com".to_string(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-
-        TestServer::new(build_api_router(state))
+        TestServer::new(build_api_router(AppState::test(pool)))
     }
 
     fn point(cycle: i32, dsh: i32) -> CycleOverlayPoint {
@@ -470,7 +436,10 @@ mod tests {
     #[test]
     fn paginate_cycle_overlay_truncates_and_derives_cursor() {
         let items = vec![point(3, 1), point(3, 2), point(3, 3)];
-        let (page, next_cursor) = paginate_cycle_overlay(items, 2);
+        let (page, next_cursor) = paginate(items, 2, |p| CycleOverlayKey {
+            cycle_number: p.cycle_number,
+            days_since_halving: p.days_since_halving,
+        });
         assert_eq!(page.len(), 2);
         assert!(next_cursor.is_some());
         let decoded: CycleOverlayKey = decode_keyset_cursor(&next_cursor.unwrap()).unwrap();
@@ -482,7 +451,10 @@ mod tests {
     #[test]
     fn paginate_cycle_overlay_exhausted_returns_null_cursor() {
         let items = vec![point(3, 1), point(3, 2)];
-        let (page, next_cursor) = paginate_cycle_overlay(items, 2);
+        let (page, next_cursor) = paginate(items, 2, |p| CycleOverlayKey {
+            cycle_number: p.cycle_number,
+            days_since_halving: p.days_since_halving,
+        });
         assert_eq!(page.len(), 2);
         assert!(next_cursor.is_none());
     }
@@ -669,24 +641,13 @@ mod tests {
     // ── DB-gated tests (require live DATABASE_URL) ────────────────────────────
 
     fn db_test_server() -> TestServer {
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for DB tests");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(&url)
             .expect("lazy pool from DATABASE_URL");
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        let state = crate::api::AppState {
+        TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
             pool,
-            chain: Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        TestServer::new(crate::api::build_api_router(state))
+        )))
     }
 
     // Scenario 28 (REQ-CYCLE-090): the replay data route is wired end-to-end against a live DB
@@ -954,7 +915,10 @@ mod tests {
             (None, None),
             2,
         );
-        let (page1_items, next_cursor) = paginate_cycle_overlay(page1, 2);
+        let (page1_items, next_cursor) = paginate(page1, 2, |p| CycleOverlayKey {
+            cycle_number: p.cycle_number,
+            days_since_halving: p.days_since_halving,
+        });
         assert_eq!(page1_items.len(), 2);
         assert!(next_cursor.is_some());
         let cursor_key: CycleOverlayKey = decode_keyset_cursor(&next_cursor.unwrap()).unwrap();
@@ -972,7 +936,10 @@ mod tests {
             ),
             10,
         );
-        let (page2_items, next_cursor2) = paginate_cycle_overlay(page2, 10);
+        let (page2_items, next_cursor2) = paginate(page2, 10, |p| CycleOverlayKey {
+            cycle_number: p.cycle_number,
+            days_since_halving: p.days_since_halving,
+        });
         assert!(next_cursor2.is_none(), "page 2 exhausts the result");
 
         let concatenated: Vec<(i32, i32)> = page1_items

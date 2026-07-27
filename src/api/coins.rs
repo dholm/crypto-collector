@@ -17,17 +17,92 @@ use crate::pacer::AcquireSlotError;
 use crate::providers::ProviderError;
 
 use super::{
-    cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
+    cursor::{decode_keyset_cursor, paginate, validate_limit, CoinListKey},
     dto::{CoinDto, CoinSearchPage, Page, RegisterCoinRequest, UpdateCoinRequest},
     extract::{ApiJson, ApiPath, ApiQuery},
     poll_interval, ApiError, ApiResult, AppState,
 };
 
-// ── SELECT column list ─────────────────────────────────────────────────────────
+// ── tracked_coins column list (SPEC-REFACTOR-001 M5, REQ-REFACTOR-051) ──────────
 //
-// sqlx 0.9 SqlSafeStr requires &'static str — format!() yields &String which does not
-// implement that bound. The column list is inlined in every query literal instead.
-// live_poll_interval::TEXT casts INTERVAL → Option<String> on TrackedCoin (REQ-API-112).
+// The full `tracked_coins` projection column list — previously inlined verbatim at every
+// SELECT/RETURNING site. `live_poll_interval::TEXT` casts INTERVAL → Option<String> on
+// TrackedCoin (REQ-API-112).
+//
+// sqlx 0.9 requires `&'static str` (the `SqlSafeStr` bound), so each full query below is a
+// static literal assembled by `concat!`. `concat!` accepts only literals — a `const` identifier
+// cannot be embedded — so the shared column list is kept as a `macro_rules!` that expands to the
+// literal (the same technique db/upserts.rs uses for the shared UNNEST base). This makes the
+// column list a single source of truth reused across all seven query literals.
+macro_rules! tracked_coin_columns {
+    () => {
+        "coin_id, symbol, name, status, registered_at, last_collected_at, error, \
+         live_poll_interval::TEXT AS live_poll_interval"
+    };
+}
+
+/// `GET /v1/coins` first page (no cursor).
+const SELECT_TRACKED_COINS_SQL: &str = concat!(
+    "SELECT ",
+    tracked_coin_columns!(),
+    " FROM tracked_coins ORDER BY coin_id ASC LIMIT $1"
+);
+
+/// `GET /v1/coins` subsequent page (keyset `coin_id > $1`).
+const SELECT_TRACKED_COINS_AFTER_SQL: &str = concat!(
+    "SELECT ",
+    tracked_coin_columns!(),
+    " FROM tracked_coins WHERE coin_id > $1 ORDER BY coin_id ASC LIMIT $2"
+);
+
+/// Single-coin projection by id — shared by `get_coin` and the `register_coin` conflict re-select.
+const SELECT_TRACKED_COIN_BY_ID_SQL: &str = concat!(
+    "SELECT ",
+    tracked_coin_columns!(),
+    " FROM tracked_coins WHERE coin_id = $1"
+);
+
+/// Idempotent `register_coin` insert (ON CONFLICT DO NOTHING RETURNING the projection).
+const INSERT_TRACKED_COIN_SQL: &str = concat!(
+    "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at, live_poll_interval) \
+     VALUES ($1, $2, $3, 'active', now(), $4::interval) \
+     ON CONFLICT (coin_id) DO NOTHING \
+     RETURNING ",
+    tracked_coin_columns!()
+);
+
+/// `update_coin` — status/error only (live_poll_interval field absent from the request).
+const UPDATE_TRACKED_COIN_STATUS_SQL: &str = concat!(
+    "UPDATE tracked_coins \
+     SET status = COALESCE($2, status), error = COALESCE($3, error) \
+     WHERE coin_id = $1 \
+     RETURNING ",
+    tracked_coin_columns!()
+);
+
+/// `update_coin` — reset per-coin interval to NULL (global default) + reset poller cursors.
+const UPDATE_TRACKED_COIN_RESET_INTERVAL_SQL: &str = concat!(
+    "UPDATE tracked_coins \
+     SET status = COALESCE($2, status), error = COALESCE($3, error), \
+         live_poll_interval = NULL, \
+         last_polled_at = NULL, \
+         live_poll_claimed_until = NULL \
+     WHERE coin_id = $1 \
+     RETURNING ",
+    tracked_coin_columns!()
+);
+
+/// `update_coin` — set a new per-coin interval + reset poller cursors.
+const UPDATE_TRACKED_COIN_SET_INTERVAL_SQL: &str = concat!(
+    "UPDATE tracked_coins \
+     SET status = COALESCE($2, status), error = COALESCE($3, error), \
+         live_poll_interval = $4::interval, \
+         last_polled_at = NULL, \
+         live_poll_claimed_until = NULL \
+     WHERE coin_id = $1 \
+     RETURNING ",
+    tracked_coin_columns!()
+);
 
 // ── Query parameter types ─────────────────────────────────────────────────────
 
@@ -61,28 +136,25 @@ pub async fn list_coins(
         .transpose()
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
-    let items =
-        match cursor_coin_id {
-            None => sqlx::query_as::<_, crate::models::coin::TrackedCoin>(
-                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-             live_poll_interval::TEXT AS live_poll_interval \
-             FROM tracked_coins ORDER BY coin_id ASC LIMIT $1",
-            )
-            .bind(limit + 1)
-            .fetch_all(&state.pool)
-            .await?,
-            Some(ref after_coin_id) => sqlx::query_as::<_, crate::models::coin::TrackedCoin>(
-                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-             live_poll_interval::TEXT AS live_poll_interval \
-             FROM tracked_coins WHERE coin_id > $1 ORDER BY coin_id ASC LIMIT $2",
-            )
-            .bind(after_coin_id)
-            .bind(limit + 1)
-            .fetch_all(&state.pool)
-            .await?,
-        };
+    let items = match cursor_coin_id {
+        None => {
+            sqlx::query_as::<_, crate::models::coin::TrackedCoin>(SELECT_TRACKED_COINS_SQL)
+                .bind(limit + 1)
+                .fetch_all(&state.pool)
+                .await?
+        }
+        Some(ref after_coin_id) => {
+            sqlx::query_as::<_, crate::models::coin::TrackedCoin>(SELECT_TRACKED_COINS_AFTER_SQL)
+                .bind(after_coin_id)
+                .bind(limit + 1)
+                .fetch_all(&state.pool)
+                .await?
+        }
+    };
 
-    let (items, next_cursor) = paginate_coins(items, limit);
+    let (items, next_cursor) = paginate(items, limit, |c| CoinListKey {
+        coin_id: c.coin_id.clone(),
+    });
     Ok(Json(Page {
         items: items.into_iter().map(CoinDto::from).collect(),
         next_cursor,
@@ -119,31 +191,23 @@ pub async fn register_coin(
     // fresh insert and zero rows on a conflict. Under concurrency the losing INSERT waits for the
     // winner to commit, then returns nothing → the re-select (READ COMMITTED, fresh snapshot per
     // statement) sees the committed row → 200. Never a 500 PK violation.
-    let inserted: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
-        "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at, live_poll_interval) \
-         VALUES ($1, $2, $3, 'active', now(), $4::interval) \
-         ON CONFLICT (coin_id) DO NOTHING \
-         RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-         live_poll_interval::TEXT AS live_poll_interval",
-    )
-    .bind(&req.coin_id)
-    .bind(&req.symbol)
-    .bind(&req.name)
-    .bind(pg_interval)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let inserted: Option<crate::models::coin::TrackedCoin> =
+        sqlx::query_as(INSERT_TRACKED_COIN_SQL)
+            .bind(&req.coin_id)
+            .bind(&req.symbol)
+            .bind(&req.name)
+            .bind(pg_interval)
+            .fetch_optional(&mut *tx)
+            .await?;
 
     let coin = match inserted {
         // Conflict (coin already registered): re-select the existing row and return 200.
         None => {
-            let existing: crate::models::coin::TrackedCoin = sqlx::query_as(
-                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-                 live_poll_interval::TEXT AS live_poll_interval \
-                 FROM tracked_coins WHERE coin_id = $1",
-            )
-            .bind(&req.coin_id)
-            .fetch_one(&mut *tx)
-            .await?;
+            let existing: crate::models::coin::TrackedCoin =
+                sqlx::query_as(SELECT_TRACKED_COIN_BY_ID_SQL)
+                    .bind(&req.coin_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
             tx.commit().await?;
             return Ok((StatusCode::OK, Json(CoinDto::from(existing))).into_response());
         }
@@ -217,14 +281,11 @@ pub async fn get_coin(
     State(state): State<AppState>,
     ApiPath(coin_id): ApiPath<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let coin: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
-        "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-         live_poll_interval::TEXT AS live_poll_interval \
-         FROM tracked_coins WHERE coin_id = $1",
-    )
-    .bind(&coin_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let coin: Option<crate::models::coin::TrackedCoin> =
+        sqlx::query_as(SELECT_TRACKED_COIN_BY_ID_SQL)
+            .bind(&coin_id)
+            .fetch_optional(&state.pool)
+            .await?;
 
     match coin {
         Some(c) => Ok(Json(CoinDto::from(c)).into_response()),
@@ -250,37 +311,22 @@ pub async fn update_coin(
     let coin: Option<crate::models::coin::TrackedCoin> = match req.live_poll_interval {
         // Field absent: update only status/error; leave live_poll_interval unchanged.
         None => {
-            sqlx::query_as(
-                "UPDATE tracked_coins \
-             SET status = COALESCE($2, status), error = COALESCE($3, error) \
-             WHERE coin_id = $1 \
-             RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-             live_poll_interval::TEXT AS live_poll_interval",
-            )
-            .bind(&coin_id)
-            .bind(&req.status)
-            .bind(&req.error)
-            .fetch_optional(&state.pool)
-            .await?
+            sqlx::query_as(UPDATE_TRACKED_COIN_STATUS_SQL)
+                .bind(&coin_id)
+                .bind(&req.status)
+                .bind(&req.error)
+                .fetch_optional(&state.pool)
+                .await?
         }
 
         // Field is null: reset per-coin interval to NULL (global default); reset poller cursors.
         Some(None) => {
-            sqlx::query_as(
-                "UPDATE tracked_coins \
-             SET status = COALESCE($2, status), error = COALESCE($3, error), \
-                 live_poll_interval = NULL, \
-                 last_polled_at = NULL, \
-                 live_poll_claimed_until = NULL \
-             WHERE coin_id = $1 \
-             RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-             live_poll_interval::TEXT AS live_poll_interval",
-            )
-            .bind(&coin_id)
-            .bind(&req.status)
-            .bind(&req.error)
-            .fetch_optional(&state.pool)
-            .await?
+            sqlx::query_as(UPDATE_TRACKED_COIN_RESET_INTERVAL_SQL)
+                .bind(&coin_id)
+                .bind(&req.status)
+                .bind(&req.error)
+                .fetch_optional(&state.pool)
+                .await?
         }
 
         // Field is a string: parse, validate, set new interval; reset poller cursors.
@@ -291,22 +337,13 @@ pub async fn update_coin(
             let d = poll_interval::parse_live_poll_duration(iv, min_secs, max_secs, global_secs)?;
             let pg_interval = poll_interval::duration_to_pg_interval(d);
 
-            sqlx::query_as(
-                "UPDATE tracked_coins \
-                 SET status = COALESCE($2, status), error = COALESCE($3, error), \
-                     live_poll_interval = $4::interval, \
-                     last_polled_at = NULL, \
-                     live_poll_claimed_until = NULL \
-                 WHERE coin_id = $1 \
-                 RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-                 live_poll_interval::TEXT AS live_poll_interval",
-            )
-            .bind(&coin_id)
-            .bind(&req.status)
-            .bind(&req.error)
-            .bind(&pg_interval)
-            .fetch_optional(&state.pool)
-            .await?
+            sqlx::query_as(UPDATE_TRACKED_COIN_SET_INTERVAL_SQL)
+                .bind(&coin_id)
+                .bind(&req.status)
+                .bind(&req.error)
+                .bind(&pg_interval)
+                .fetch_optional(&state.pool)
+                .await?
         }
     };
 
@@ -347,23 +384,6 @@ pub async fn delete_coin(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn paginate_coins(
-    mut items: Vec<crate::models::coin::TrackedCoin>,
-    limit: i64,
-) -> (Vec<crate::models::coin::TrackedCoin>, Option<String>) {
-    let has_more = items.len() as i64 > limit;
-    if has_more {
-        items.truncate(limit as usize);
-    }
-    let next_cursor = has_more.then(|| {
-        let last = items.last().expect("non-empty when has_more");
-        encode_keyset_cursor(&CoinListKey {
-            coin_id: last.coin_id.clone(),
-        })
-    });
-    (items, next_cursor)
-}
-
 fn validate_coin_id(coin_id: &str) -> ApiResult<()> {
     if coin_id.trim().is_empty() {
         return Err(ApiError::UnprocessableEntity(
@@ -391,27 +411,12 @@ mod tests {
 
     fn test_server() -> TestServer {
         use crate::api::{build_api_router, AppState};
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/crypto_collector_test")
             .expect("lazy pool");
 
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-
-        let state = AppState {
-            pool,
-            chain: Arc::new(vec![]),
-            search_provider: "coingecko".to_string(),
-            coingecko_base_url: "https://api.coingecko.com".to_string(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-
-        TestServer::new(build_api_router(state))
+        TestServer::new(build_api_router(AppState::test(pool)))
     }
 
     #[tokio::test]
@@ -570,23 +575,16 @@ mod tests {
     fn search_stub_server(behavior: SearchBehavior) -> TestServer {
         use crate::api::{build_api_router, AppState};
         use std::sync::Arc;
-        use tokio::sync::broadcast;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/crypto_collector_test")
             .expect("lazy pool");
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
+        // Override the empty default chain with the search stub; reuse AppState::test for the rest.
         let state = AppState {
-            pool,
             chain: Arc::new(vec![
                 Arc::new(SearchStubProvider { behavior }) as Arc<dyn crate::providers::Provider>
             ]),
-            search_provider: "coingecko".to_string(),
-            coingecko_base_url: "https://api.coingecko.com".to_string(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
+            ..AppState::test(pool)
         };
         TestServer::new(build_api_router(state))
     }
@@ -675,7 +673,9 @@ mod tests {
                 live_poll_interval: None,
             });
         }
-        let (trimmed, next_cursor) = paginate_coins(items, 2);
+        let (trimmed, next_cursor) = paginate(items, 2, |c| CoinListKey {
+            coin_id: c.coin_id.clone(),
+        });
         assert_eq!(trimmed.len(), 2);
         assert!(next_cursor.is_some());
         let key: CoinListKey = decode_keyset_cursor(next_cursor.as_ref().unwrap()).unwrap();
@@ -695,7 +695,9 @@ mod tests {
             error: None,
             live_poll_interval: None,
         }];
-        let (trimmed, next_cursor) = paginate_coins(items, 100);
+        let (trimmed, next_cursor) = paginate(items, 100, |c| CoinListKey {
+            coin_id: c.coin_id.clone(),
+        });
         assert_eq!(trimmed.len(), 1);
         assert!(next_cursor.is_none());
     }
@@ -706,19 +708,9 @@ mod tests {
     async fn db_register_coin_returns_201_and_200_on_repeat() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
-        use tokio::sync::broadcast;
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        let state = crate::api::AppState {
-            pool: pool.clone(),
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        let server = TestServer::new(crate::api::build_api_router(state));
+        let server = TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
+            pool.clone(),
+        )));
 
         let resp = server
             .post("/v1/coins")
@@ -750,18 +742,7 @@ mod tests {
 
     #[cfg(test)]
     fn register_state(pool: sqlx::PgPool) -> crate::api::AppState {
-        use tokio::sync::broadcast;
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        crate::api::AppState {
-            pool,
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        }
+        crate::api::AppState::test(pool)
     }
 
     // AC-API-407 [DB-backed]: two CONCURRENT registrations of the same coin_id yield exactly one
@@ -871,19 +852,9 @@ mod tests {
     async fn db_get_coin_not_found_returns_404() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
-        use tokio::sync::broadcast;
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        let state = crate::api::AppState {
+        let server = TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
             pool,
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        let server = TestServer::new(crate::api::build_api_router(state));
+        )));
         let resp = server.get("/v1/coins/no-such-coin-xyz-9999").await;
         assert_eq!(resp.status_code(), 404);
     }

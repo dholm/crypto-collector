@@ -148,18 +148,14 @@ mod tests {
     }
 
     fn ws_test_state(coin_quote_tx: broadcast::Sender<String>) -> AppState {
-        let (coin_candle_tx, _) = broadcast::channel(16);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/crypto_collector_test")
             .expect("lazy pool");
+        // Reuse the shared test constructor, but keep the caller-supplied quote sender so the
+        // test can drive the broadcast and observe receiver_count (REQ-API-413).
         AppState {
-            pool,
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
             coin_quote_tx,
-            coin_candle_tx,
+            ..AppState::test(pool)
         }
     }
 

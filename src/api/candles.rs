@@ -20,10 +20,10 @@ use super::{
         aggregate_candles, bucket_start, interval_to_seconds, select_source_interval,
         IntervalCoverage,
     },
-    cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
+    cursor::{decode_keyset_cursor, encode_keyset_cursor, paginate, validate_limit, TsKey},
     dto::{CoinCandleDto, Page},
+    ensure_coin_exists,
     extract::{ApiPath, ApiQuery},
-    quotes::paginate_ts,
     ApiError, ApiResult, AppState,
 };
 use crate::models::quote::CoinCandle;
@@ -95,7 +95,7 @@ pub async fn list_candles(
         .unwrap_or("usd")
         .to_lowercase();
 
-    super::quotes::ensure_coin_exists(&state.pool, &coin_id).await?;
+    ensure_coin_exists(&state.pool, &coin_id).await?;
 
     // ── Native precedence probe (REQ-API-200/201, OR-API3-2) ─────────────────
     //
@@ -140,7 +140,7 @@ pub async fn list_candles(
         .fetch_all(&state.pool)
         .await?;
 
-        let (items, next_cursor) = paginate_ts(items, limit, |c| c.ts);
+        let (items, next_cursor) = paginate(items, limit, |c| TsKey { ts: c.ts });
         return Ok(Json(Page {
             items: items.into_iter().map(CoinCandleDto::from).collect(),
             next_cursor,
@@ -299,7 +299,7 @@ pub async fn list_candles(
             .map(|ts| encode_keyset_cursor(&TsKey { ts }));
         (agg, next_cursor)
     } else {
-        paginate_ts(agg, limit, |c| c.ts)
+        paginate(agg, limit, |c| TsKey { ts: c.ts })
     };
 
     Ok(Json(Page {
@@ -331,27 +331,12 @@ mod tests {
 
     fn test_server() -> TestServer {
         use crate::api::{build_api_router, AppState};
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/crypto_collector_test")
             .expect("lazy pool");
 
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-
-        let state = AppState {
-            pool,
-            chain: Arc::new(vec![]),
-            search_provider: "coingecko".to_string(),
-            coingecko_base_url: "https://api.coingecko.com".to_string(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-
-        TestServer::new(build_api_router(state))
+        TestServer::new(build_api_router(AppState::test(pool)))
     }
 
     // ── Existing tests (REQ-API-215 regression / T-010) ─────────────────────
@@ -551,23 +536,11 @@ mod tests {
 
     // DB-gated helper: build a test server backed by the real DATABASE_URL.
     fn db_test_server() -> (TestServer, crate::api::AppState) {
-        use std::sync::Arc;
-        use tokio::sync::broadcast;
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for DB tests");
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(&url)
             .expect("lazy pool from DATABASE_URL");
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        let state = crate::api::AppState {
-            pool,
-            chain: Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
+        let state = crate::api::AppState::test(pool);
         let server = TestServer::new(crate::api::build_api_router(state.clone()));
         (server, state)
     }
@@ -578,19 +551,9 @@ mod tests {
     async fn db_list_candles_unknown_coin_returns_404() {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let pool = crate::db::connect(&url).await.expect("db connect");
-        use tokio::sync::broadcast;
-        let (coin_quote_tx, _) = broadcast::channel(16);
-        let (coin_candle_tx, _) = broadcast::channel(16);
-        let state = crate::api::AppState {
+        let server = TestServer::new(crate::api::build_api_router(crate::api::AppState::test(
             pool,
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
-        let server = TestServer::new(crate::api::build_api_router(state));
+        )));
         let resp = server
             .get("/v1/coins/no-such-coin-xyz/candles")
             .add_query_param("interval", "1h")
@@ -985,17 +948,7 @@ mod tests {
             m4_seed_1h_candle(&pool, &coin, now - Duration::hours(h + 1)).await;
         }
 
-        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
-        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = crate::api::AppState {
-            pool: pool.clone(),
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
+        let state = crate::api::AppState::test(pool.clone());
         let server = TestServer::new(crate::api::build_api_router(state));
 
         // Small limit → small row cap; without the end-bound the recent rows would fill it and
@@ -1054,17 +1007,7 @@ mod tests {
             m4_seed_1h_candle(&pool, &coin, base - Duration::hours(4 * b)).await;
         }
 
-        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
-        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = crate::api::AppState {
-            pool: pool.clone(),
-            chain: std::sync::Arc::new(vec![]),
-            search_provider: "coingecko".into(),
-            coingecko_base_url: "https://api.coingecko.com".into(),
-            http_client: reqwest::Client::new(),
-            coin_quote_tx,
-            coin_candle_tx,
-        };
+        let state = crate::api::AppState::test(pool.clone());
         let server = TestServer::new(crate::api::build_api_router(state));
 
         let resp = server
