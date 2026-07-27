@@ -418,24 +418,46 @@ async fn main() -> Result<()> {
     let (coin_quote_tx, _) = broadcast::channel::<String>(256);
     let (coin_candle_tx, _) = broadcast::channel::<String>(256);
 
-    // Spawn PG LISTEN/NOTIFY relays for cross-replica WebSocket delivery.
+    // Spawn PG LISTEN/NOTIFY relays for cross-replica WebSocket delivery, each under the
+    // generic supervisor (REQ-OBS-063/064 / F-39): an initial connect/listen failure returns
+    // Err and is retried with capped backoff, so a transient DB hiccup at spawn does not
+    // permanently disable cross-replica delivery (REQ-API-148). registry = None — relays are
+    // not tracked by the worker-crash-looping signal.
     {
         let pool_ql = pool.clone();
         let tx_ql = coin_quote_tx.clone();
         let rx_ql = shutdown_rx.clone();
-        tokio::spawn(async move {
-            crypto_collector::listener::run_coin_quote_listener(pool_ql, tx_ql, rx_ql).await;
-        });
+        tokio::spawn(crypto_collector::collectors::run_supervised(
+            "coin_quote_relay",
+            None,
+            shutdown_rx.clone(),
+            move || {
+                crypto_collector::listener::run_coin_quote_listener(
+                    pool_ql.clone(),
+                    tx_ql.clone(),
+                    rx_ql.clone(),
+                )
+            },
+        ));
     }
     {
         let pool_cl = pool.clone();
         let tx_cl = coin_candle_tx.clone();
         let rx_cl = shutdown_rx.clone();
-        tokio::spawn(async move {
-            crypto_collector::listener::run_coin_candle_listener(pool_cl, tx_cl, rx_cl).await;
-        });
+        tokio::spawn(crypto_collector::collectors::run_supervised(
+            "coin_candle_relay",
+            None,
+            shutdown_rx.clone(),
+            move || {
+                crypto_collector::listener::run_coin_candle_listener(
+                    pool_cl.clone(),
+                    tx_cl.clone(),
+                    rx_cl.clone(),
+                )
+            },
+        ));
     }
-    info!("crypto-collector: PG LISTEN/NOTIFY relays started");
+    info!("crypto-collector: PG LISTEN/NOTIFY relays started (supervised)");
 
     let api_state = crypto_collector::api::AppState {
         pool: pool.clone(),

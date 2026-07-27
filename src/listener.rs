@@ -22,55 +22,62 @@
 //             Without the shutdown_rx guard they block graceful shutdown.
 // @MX:SPEC: SPEC-API-002 SPEC-OBS-001
 
+use anyhow::Context;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use tokio::sync::{broadcast, watch};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// Relay PG NOTIFY `coin_quote_updated` → `coin_quote_tx`.
 ///
-/// Runs until `shutdown_rx` fires or the DB connection is permanently lost.
+/// Returns `Ok(())` on a clean shutdown-signal exit; returns `Err` on an initial connect /
+/// `listen()` failure so the supervisor restarts it with capped backoff (REQ-OBS-064).
 pub async fn run_coin_quote_listener(
     pool: PgPool,
     tx: broadcast::Sender<String>,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
-    run_listener(pool, "coin_quote_updated", tx, &mut shutdown_rx).await;
+) -> anyhow::Result<()> {
+    run_listener(pool, "coin_quote_updated", tx, &mut shutdown_rx).await
 }
 
 /// Relay PG NOTIFY `coin_candle_updated` → `coin_candle_tx`.
 ///
-/// Runs until `shutdown_rx` fires or the DB connection is permanently lost.
+/// Returns `Ok(())` on a clean shutdown-signal exit; returns `Err` on an initial connect /
+/// `listen()` failure so the supervisor restarts it with capped backoff (REQ-OBS-064).
 pub async fn run_coin_candle_listener(
     pool: PgPool,
     tx: broadcast::Sender<String>,
     mut shutdown_rx: watch::Receiver<bool>,
-) {
-    run_listener(pool, "coin_candle_updated", tx, &mut shutdown_rx).await;
+) -> anyhow::Result<()> {
+    run_listener(pool, "coin_candle_updated", tx, &mut shutdown_rx).await
 }
 
 /// Shared relay loop.
 ///
-/// On reconnect errors, backs off and retries up to a bounded count.
+/// Returns `Ok(())` on a clean shutdown-signal exit. Returns `Err` if the initial
+/// `PgListener::connect_with` or `listen()` fails — the caller supervises this relay via
+/// `collectors::run_supervised`, which restarts it with capped exponential backoff
+/// (REQ-OBS-063/064), so a transient DB hiccup at spawn does NOT permanently disable
+/// cross-replica WebSocket delivery (REQ-API-148). Mid-stream connection drops are handled
+/// internally by `PgListener` (it reconnects on the next `recv()`); only an initial-setup
+/// failure surfaces as an `Err` to trigger a supervised restart.
 async fn run_listener(
     pool: PgPool,
     channel: &'static str,
     tx: broadcast::Sender<String>,
     shutdown_rx: &mut watch::Receiver<bool>,
-) {
+) -> anyhow::Result<()> {
     info!(channel, "PG listener starting");
 
-    let mut listener = match PgListener::connect_with(&pool).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(channel, error = %e, "PG listener failed to connect; exiting");
-            return;
-        }
-    };
-    if let Err(e) = listener.listen(channel).await {
-        error!(channel, error = %e, "PG listener failed to subscribe; exiting");
-        return;
-    }
+    // An initial connect/listen failure returns Err (not a permanent early return) so the
+    // supervisor restarts the relay with capped backoff (REQ-OBS-064 / F-39).
+    let mut listener = PgListener::connect_with(&pool)
+        .await
+        .with_context(|| format!("PG listener {channel} failed to connect"))?;
+    listener
+        .listen(channel)
+        .await
+        .with_context(|| format!("PG listener {channel} failed to subscribe"))?;
 
     loop {
         tokio::select! {
@@ -107,6 +114,7 @@ async fn run_listener(
     }
 
     info!(channel, "PG listener stopped");
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -132,6 +140,38 @@ mod tests {
         assert!(
             !code.contains(&uncaptured),
             "no un-captured shutdown_rx.changed() arm may remain (REQ-OBS-068)"
+        );
+    }
+
+    /// AC-OBS-064 (F-39): a relay whose initial connect fails returns `Err` (NOT a permanent
+    /// silent early-return), so the supervisor restarts it with capped backoff and a transient
+    /// DB hiccup at spawn does not permanently disable cross-replica delivery (REQ-API-148).
+    /// Uses an unreachable lazy pool — no live DB needed.
+    #[tokio::test]
+    async fn relay_returns_err_on_initial_connect_failure() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy("postgres://127.0.0.1:1/does_not_exist")
+            .expect("lazy pool");
+        let (tx, _rx) = broadcast::channel::<String>(4);
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let result = run_coin_quote_listener(pool, tx, sd_rx).await;
+        assert!(
+            result.is_err(),
+            "an initial connect failure must return Err so the supervisor retries (REQ-OBS-064)"
+        );
+    }
+
+    /// AC-OBS-064: the run_listener doc describes the supervised capped-backoff retry now
+    /// implemented (F-39 doc/code drift closed), not the old permanent-return behavior.
+    #[test]
+    fn run_listener_doc_describes_supervised_retry() {
+        let src = std::fs::read_to_string("src/listener.rs").expect("read listener.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        assert!(
+            code.contains("run_supervised") && code.contains("capped"),
+            "run_listener doc must describe the supervised capped-backoff retry (REQ-OBS-064 / F-39)"
         );
     }
 

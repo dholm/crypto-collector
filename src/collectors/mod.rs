@@ -27,7 +27,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::alarm::reconciler::{run_reconciler, Reconciler};
 use crate::alarm::{AlarmClient, HealthRegistry};
@@ -136,60 +136,112 @@ pub async fn spawn_workers(
 ) -> tokio::task::JoinHandle<()> {
     let registry = alarm.as_ref().map(|a| a.registry.clone());
 
-    let pool_lp = pool.clone();
-    let chain_lp = chain.clone();
-    let cfg_lp = cfg.clone();
-    let shutdown_lp = shutdown_rx.clone();
-    let registry_lp = registry.clone();
-
-    let pool_cq = pool.clone();
-    let chain_cq = chain.clone();
-    let cfg_cq = cfg.clone();
-    let shutdown_cq = shutdown_rx.clone();
-    let registry_cq = registry.clone();
-
-    let pool_bf = pool.clone();
-    let chain_bf = chain.clone();
-    let cfg_bf = cfg.clone();
-    let shutdown_bf = shutdown_rx.clone();
-    let registry_bf = registry.clone();
-
-    let pool_rc = pool.clone();
-    let shutdown_rc = shutdown_rx.clone();
-
     tokio::spawn(async move {
-        let live_poller = tokio::spawn(run_supervised_live_poller(
-            pool_lp,
-            chain_lp,
-            cfg_lp,
-            shutdown_lp,
-            registry_lp,
-        ));
-        let queue_worker = tokio::spawn(run_supervised_queue_worker(
-            pool_cq,
-            chain_cq,
-            cfg_cq,
-            shutdown_cq,
-            registry_cq,
-        ));
-        let backfill_worker = tokio::spawn(run_supervised_backfill_worker(
-            pool_bf,
-            chain_bf,
-            cfg_bf,
-            shutdown_bf,
-            registry_bf,
-        ));
+        // Three supervised workers + (optionally) the reconciler, all routed through the
+        // single generic `run_supervised` (REQ-OBS-065). Each `make_future` closure re-clones
+        // its captures on every restart so a fresh worker future is produced each cycle.
+        let live_poller = {
+            let pool = pool.clone();
+            let chain = chain.clone();
+            let cfg = cfg.clone();
+            let inner_shutdown = shutdown_rx.clone();
+            let inner_registry = registry.clone();
+            tokio::spawn(run_supervised(
+                "live_poller",
+                registry.clone(),
+                shutdown_rx.clone(),
+                move || {
+                    live_poller::run_live_poller(
+                        pool.clone(),
+                        chain.clone(),
+                        cfg.live_quote_poll_interval_secs,
+                        cfg.live_poll_claim_ttl_secs,
+                        cfg.live_poll_claim_batch_limit,
+                        cfg.live_poller_tick,
+                        inner_shutdown.clone(),
+                        inner_registry.clone(),
+                    )
+                },
+            ))
+        };
 
-        // Fourth supervised worker: the reconciler, ONLY when the alarm feature is
-        // configured (REQ-ALARM-001/002/010).
+        let queue_worker = {
+            let pool = pool.clone();
+            let chain = chain.clone();
+            let cfg = cfg.clone();
+            let inner_shutdown = shutdown_rx.clone();
+            let inner_registry = registry.clone();
+            tokio::spawn(run_supervised(
+                "collection_queue",
+                registry.clone(),
+                shutdown_rx.clone(),
+                move || {
+                    collection_queue::run_collection_queue_worker(
+                        pool.clone(),
+                        chain.clone(),
+                        cfg.replica_id.clone(),
+                        cfg.collection_lease_secs,
+                        cfg.collection_heartbeat_interval_secs,
+                        cfg.collection_max_attempts,
+                        cfg.collection_idle_sleep,
+                        inner_shutdown.clone(),
+                        inner_registry.clone(),
+                    )
+                },
+            ))
+        };
+
+        let backfill_worker = {
+            let pool = pool.clone();
+            let chain = chain.clone();
+            let cfg = cfg.clone();
+            let inner_shutdown = shutdown_rx.clone();
+            let inner_registry = registry.clone();
+            tokio::spawn(run_supervised(
+                "backfill",
+                registry.clone(),
+                shutdown_rx.clone(),
+                move || {
+                    backfill::run_backfill_worker(
+                        pool.clone(),
+                        chain.clone(),
+                        cfg.replica_id.clone(),
+                        cfg.backfill_lease_secs,
+                        cfg.backfill_heartbeat_interval_secs,
+                        cfg.backfill_max_attempts,
+                        cfg.backfill_idle_sleep,
+                        inner_shutdown.clone(),
+                        inner_registry.clone(),
+                    )
+                },
+            ))
+        };
+
+        // Fourth supervised task: the reconciler, ONLY when the alarm feature is configured
+        // (REQ-ALARM-001/002/010). Its inner future returns `()`, so we wrap it as `Ok(())`;
+        // supervisor restarts are not recorded for it (registry = None) — it is itself the
+        // crash-loop detector and does not track its own restarts.
         let reconciler_task = alarm.map(|components| {
             let reconciler = Arc::new(Reconciler::new(
                 components.client,
                 components.registry,
-                pool_rc,
+                pool.clone(),
                 components.reconcile_interval,
             ));
-            tokio::spawn(run_supervised_reconciler(reconciler, shutdown_rc))
+            let inner_shutdown = shutdown_rx.clone();
+            tokio::spawn(run_supervised(
+                "reconciler",
+                None,
+                shutdown_rx.clone(),
+                move || {
+                    let reconciler = reconciler.clone();
+                    let inner_shutdown = inner_shutdown.clone();
+                    async move {
+                        run_reconciler(reconciler, inner_shutdown).await;
+                        Ok(())
+                    }
+                },
+            ))
         });
 
         // Wait for shutdown signal, then wait for all workers.
@@ -204,43 +256,70 @@ pub async fn spawn_workers(
     })
 }
 
-// ── Supervised runner functions ───────────────────────────────────────────────
-//
-// Each runner loops: spawns the inner worker future, watches for panics and errors,
-// restarts on failure, and exits cleanly when the shutdown channel fires.
+// ── Generic supervisor (REQ-OBS-063/064/065) ──────────────────────────────────
 
-async fn run_supervised_live_poller(
-    pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
-    cfg: WorkerConfig,
-    shutdown: watch::Receiver<bool>,
+/// Capped-exponential-backoff bounds for supervised restarts (REQ-OBS-063), mirroring the
+/// `migrate_with_retry` precedent (`src/db/pool.rs`): start small, cap the delay.
+const SUPERVISE_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const SUPERVISE_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// A task that stays up at least this long is considered healthy — its restart backoff resets
+/// to the initial delay (REQ-OBS-063 "resets after a healthy-run period"), so a task that runs
+/// fine for a while then fails once restarts promptly, while a deterministic crasher backs off.
+const SUPERVISE_HEALTHY_RESET: Duration = Duration::from_secs(60);
+
+/// Pure: the next restart backoff (capped exponential doubling).
+fn next_backoff(current: Duration) -> Duration {
+    (current * 2).min(SUPERVISE_MAX_BACKOFF)
+}
+
+/// Pure REQ-OBS-063 backoff decision: given the current backoff and the just-finished run's
+/// uptime, return `(delay_to_sleep_now, next_backoff)`. A healthy run (uptime >= the reset
+/// window) resets the delay to the initial value; a fast crash uses the current backoff and
+/// grows it (capped) for the following restart.
+fn supervise_next_delay(current: Duration, uptime: Duration) -> (Duration, Duration) {
+    let delay = if uptime >= SUPERVISE_HEALTHY_RESET {
+        SUPERVISE_INITIAL_BACKOFF
+    } else {
+        current
+    };
+    (delay, next_backoff(delay))
+}
+
+// @MX:ANCHOR: [AUTO] run_supervised — the single generic supervisor for every background task
+//             (the 3 workers + the reconciler + both PG LISTEN relays). One restart+backoff
+//             policy, one shutdown contract, replacing the 4 copy-pasted supervisors (F-46).
+// @MX:REASON: fan_in >= 3 — live_poller, collection_queue, backfill, reconciler, and both
+//             relays all route through it; diverging the policy per task re-introduces the
+//             copy-paste drift and the fixed-delay restart storm.
+// @MX:WARN: [AUTO] the SUPERVISE_HEALTHY_RESET window gates restart-storm protection: too short
+//           makes a deterministic crasher reset every cycle and storm at the initial delay.
+// @MX:REASON: the backoff MUST actually grow across consecutive fast failures — a wrong reset
+//             window re-introduces the deterministic-crasher restart storm F-46 set out to fix.
+// @MX:SPEC: SPEC-OBS-002 REQ-OBS-063 REQ-OBS-064 REQ-OBS-065
+///
+/// Supervise a background task: run `make_future()` in its own `tokio::spawn` for panic
+/// isolation, and on a returned error OR a panic restart it after a capped exponential
+/// backoff that resets after a healthy run (REQ-OBS-063). Exits cleanly when the inner future
+/// returns `Ok(())` (a clean shutdown) or when the shutdown watch fires. Both PG LISTEN relays
+/// (REQ-OBS-064) and the three workers + reconciler (REQ-OBS-065) route through this one
+/// function. Log severity is identical between the error arm and the panic arm.
+pub async fn run_supervised<F, Fut>(
+    name: &'static str,
     registry: Option<Arc<HealthRegistry>>,
-) {
+    shutdown: watch::Receiver<bool>,
+    mut make_future: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let mut backoff = SUPERVISE_INITIAL_BACKOFF;
     loop {
         if *shutdown.borrow() {
             break;
         }
 
-        let pool_inner = pool.clone();
-        let chain_inner = chain.clone();
-        let shutdown_inner = shutdown.clone();
-        let cfg_inner = cfg.clone();
-        let registry_inner = registry.clone();
-
-        let result = tokio::spawn(async move {
-            live_poller::run_live_poller(
-                pool_inner,
-                chain_inner,
-                cfg_inner.live_quote_poll_interval_secs,
-                cfg_inner.live_poll_claim_ttl_secs,
-                cfg_inner.live_poll_claim_batch_limit,
-                cfg_inner.live_poller_tick,
-                shutdown_inner,
-                registry_inner,
-            )
-            .await
-        })
-        .await;
+        let started = tokio::time::Instant::now();
+        let result = tokio::spawn(make_future()).await;
 
         match result {
             Ok(Ok(())) => break, // clean shutdown
@@ -248,173 +327,29 @@ async fn run_supervised_live_poller(
                 if *shutdown.borrow() {
                     break;
                 }
-                error!("live_poller crashed with error: {e}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("live_poller");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                error!(worker = name, error = %e, "supervised task returned an error; restarting after backoff");
             }
             Err(join_err) => {
                 if *shutdown.borrow() {
                     break;
                 }
-                warn!("live_poller panicked: {join_err}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("live_poller");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Same severity as the error arm (REQ-OBS-065): a panic is not less severe.
+                error!(worker = name, panic = %join_err, "supervised task panicked; restarting after backoff");
             }
         }
-    }
-}
 
-async fn run_supervised_queue_worker(
-    pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
-    cfg: WorkerConfig,
-    shutdown: watch::Receiver<bool>,
-    registry: Option<Arc<HealthRegistry>>,
-) {
-    loop {
-        if *shutdown.borrow() {
-            break;
+        if let Some(reg) = &registry {
+            reg.record_worker_restart(name);
         }
 
-        let pool_inner = pool.clone();
-        let chain_inner = chain.clone();
-        let shutdown_inner = shutdown.clone();
-        let cfg_inner = cfg.clone();
-        let registry_inner = registry.clone();
-
-        let result = tokio::spawn(async move {
-            collection_queue::run_collection_queue_worker(
-                pool_inner,
-                chain_inner,
-                cfg_inner.replica_id.clone(),
-                cfg_inner.collection_lease_secs,
-                cfg_inner.collection_heartbeat_interval_secs,
-                cfg_inner.collection_max_attempts,
-                cfg_inner.collection_idle_sleep,
-                shutdown_inner,
-                registry_inner,
-            )
-            .await
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => break,
-            Ok(Err(e)) => {
-                if *shutdown.borrow() {
-                    break;
-                }
-                error!("collection_queue_worker crashed with error: {e}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("collection_queue");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(join_err) => {
-                if *shutdown.borrow() {
-                    break;
-                }
-                warn!("collection_queue_worker panicked: {join_err}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("collection_queue");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-async fn run_supervised_backfill_worker(
-    pool: PgPool,
-    chain: Arc<Vec<Arc<dyn Provider>>>,
-    cfg: WorkerConfig,
-    shutdown: watch::Receiver<bool>,
-    registry: Option<Arc<HealthRegistry>>,
-) {
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-
-        let pool_inner = pool.clone();
-        let chain_inner = chain.clone();
-        let shutdown_inner = shutdown.clone();
-        let cfg_inner = cfg.clone();
-        let registry_inner = registry.clone();
-
-        let result = tokio::spawn(async move {
-            backfill::run_backfill_worker(
-                pool_inner,
-                chain_inner,
-                cfg_inner.replica_id.clone(),
-                cfg_inner.backfill_lease_secs,
-                cfg_inner.backfill_heartbeat_interval_secs,
-                cfg_inner.backfill_max_attempts,
-                cfg_inner.backfill_idle_sleep,
-                shutdown_inner,
-                registry_inner,
-            )
-            .await
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => break,
-            Ok(Err(e)) => {
-                if *shutdown.borrow() {
-                    break;
-                }
-                error!("backfill_worker crashed with error: {e}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("backfill");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            Err(join_err) => {
-                if *shutdown.borrow() {
-                    break;
-                }
-                warn!("backfill_worker panicked: {join_err}; restarting in 5s");
-                if let Some(reg) = &registry {
-                    reg.record_worker_restart("backfill");
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
-    }
-}
-
-/// Supervised runner for the SPEC-ALARM-001 reconciler (REQ-ALARM-010): restarted on
-/// panic identically to the other three workers. `run_reconciler` itself only returns
-/// on a clean shutdown (`Ok(())`), so a panic is the only restart trigger here.
-async fn run_supervised_reconciler(reconciler: Arc<Reconciler>, shutdown: watch::Receiver<bool>) {
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-
-        let reconciler_inner = reconciler.clone();
-        let shutdown_inner = shutdown.clone();
-
-        let result = tokio::spawn(async move {
-            run_reconciler(reconciler_inner, shutdown_inner).await;
-        })
-        .await;
-
-        match result {
-            Ok(()) => break, // clean shutdown (REQ-ALARM-018: no mass-clear, just stop)
-            Err(join_err) => {
-                if *shutdown.borrow() {
-                    break;
-                }
-                warn!("reconciler panicked: {join_err}; restarting in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-        }
+        let (delay, next) = supervise_next_delay(backoff, started.elapsed());
+        backoff = next;
+        info!(
+            worker = name,
+            backoff_secs = delay.as_secs(),
+            "supervised task restarting after backoff"
+        );
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -423,6 +358,56 @@ async fn run_supervised_reconciler(reconciler: Arc<Reconciler>, shutdown: watch:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SPEC-OBS-002 generic supervisor (F-46 / REQ-OBS-063/065) ────────────────
+
+    #[test]
+    fn supervise_backoff_grows_caps_and_resets() {
+        // AC-OBS-063: a deterministic fast crasher (uptime below the reset window) grows the
+        // restart delay exponentially and caps at the ceiling.
+        let fast = Duration::from_millis(10);
+        let mut backoff = SUPERVISE_INITIAL_BACKOFF;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            let (delay, next) = supervise_next_delay(backoff, fast);
+            delays.push(delay);
+            backoff = next;
+        }
+        assert_eq!(delays[0], Duration::from_secs(1));
+        assert_eq!(delays[1], Duration::from_secs(2));
+        assert_eq!(delays[2], Duration::from_secs(4));
+        assert_eq!(delays[3], Duration::from_secs(8));
+        assert_eq!(delays[4], Duration::from_secs(16));
+        assert_eq!(delays[5], Duration::from_secs(30)); // 32 capped to 30
+        assert_eq!(delays[6], Duration::from_secs(30)); // stays capped
+        assert!(
+            delays.iter().all(|d| *d <= SUPERVISE_MAX_BACKOFF),
+            "restart delay must never exceed the configured cap"
+        );
+
+        // A healthy run (uptime >= the reset window) resets the delay to the initial value.
+        let (delay, next) = supervise_next_delay(SUPERVISE_MAX_BACKOFF, SUPERVISE_HEALTHY_RESET);
+        assert_eq!(
+            delay, SUPERVISE_INITIAL_BACKOFF,
+            "a healthy run resets the backoff to the initial delay (REQ-OBS-063)"
+        );
+        assert_eq!(next, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn only_one_generic_supervisor_no_underscore_variants() {
+        // AC-OBS-065: the four former per-worker supervised-runner functions (live poller,
+        // queue worker, backfill worker, reconciler) are gone — everything routes through the
+        // single generic run_supervised. The needle is concatenated so neither this assertion
+        // nor its message is itself a match for the external `grep` the AC runs.
+        let src = std::fs::read_to_string("src/collectors/mod.rs").expect("read collectors/mod.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let per_worker_variant = format!("run_supervised{}", "_");
+        assert!(
+            !code.contains(&per_worker_variant),
+            "no per-worker supervised-runner variant may remain — use the single generic supervisor (REQ-OBS-065)"
+        );
+    }
 
     #[test]
     fn worker_config_from_env_has_sensible_defaults() {
