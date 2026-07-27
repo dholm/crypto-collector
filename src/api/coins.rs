@@ -89,7 +89,13 @@ pub async fn list_coins(
     }))
 }
 
-/// `POST /v1/coins` — register a coin for collection (idempotent; REQ-API-010/011).
+/// `POST /v1/coins` — register a coin for collection (idempotent; REQ-API-010/011/407/408).
+///
+/// F-32: the insert uses `ON CONFLICT (coin_id) DO NOTHING RETURNING`, so two concurrent
+/// registrations of the same coin are idempotent (201 for the winner, 200 for the loser after a
+/// re-select) and never raise a 500 primary-key violation. The insert and the three initial
+/// collection enqueues run inside a single transaction, so a coin row is never committed without
+/// its enqueues and enqueues are never committed without the coin (REQ-API-408).
 pub async fn register_coin(
     State(state): State<AppState>,
     ApiJson(req): ApiJson<RegisterCoinRequest>,
@@ -107,24 +113,16 @@ pub async fn register_coin(
         None
     };
 
-    // Check for existing record (idempotency: REQ-API-011).
-    let existing: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
-        "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
-         live_poll_interval::TEXT AS live_poll_interval \
-         FROM tracked_coins WHERE coin_id = $1",
-    )
-    .bind(&req.coin_id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let mut tx = state.pool.begin().await?;
 
-    if let Some(coin) = existing {
-        return Ok((StatusCode::OK, Json(CoinDto::from(coin))).into_response());
-    }
-
-    // Insert new record.
-    let coin: crate::models::coin::TrackedCoin = sqlx::query_as(
+    // Idempotent insert (REQ-API-407): ON CONFLICT DO NOTHING RETURNING yields the new row on a
+    // fresh insert and zero rows on a conflict. Under concurrency the losing INSERT waits for the
+    // winner to commit, then returns nothing → the re-select (READ COMMITTED, fresh snapshot per
+    // statement) sees the committed row → 200. Never a 500 PK violation.
+    let inserted: Option<crate::models::coin::TrackedCoin> = sqlx::query_as(
         "INSERT INTO tracked_coins (coin_id, symbol, name, status, registered_at, live_poll_interval) \
          VALUES ($1, $2, $3, 'active', now(), $4::interval) \
+         ON CONFLICT (coin_id) DO NOTHING \
          RETURNING coin_id, symbol, name, status, registered_at, last_collected_at, error, \
          live_poll_interval::TEXT AS live_poll_interval",
     )
@@ -132,19 +130,38 @@ pub async fn register_coin(
     .bind(&req.symbol)
     .bind(&req.name)
     .bind(pg_interval)
-    .fetch_one(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    // Enqueue initial collection (REQ-API-010: SPEC-SCHED-001).
+    let coin = match inserted {
+        // Conflict (coin already registered): re-select the existing row and return 200.
+        None => {
+            let existing: crate::models::coin::TrackedCoin = sqlx::query_as(
+                "SELECT coin_id, symbol, name, status, registered_at, last_collected_at, error, \
+                 live_poll_interval::TEXT AS live_poll_interval \
+                 FROM tracked_coins WHERE coin_id = $1",
+            )
+            .bind(&req.coin_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            return Ok((StatusCode::OK, Json(CoinDto::from(existing))).into_response());
+        }
+        Some(c) => c,
+    };
+
+    // New coin: enqueue the three initial collections inside the SAME transaction (REQ-API-408:
+    // insert + enqueues are atomic — SPEC-SCHED-001).
     for kind in &["metadata", "market", "candles"] {
         sqlx::query(ENQUEUE_QUEUE_SQL)
             .bind("coin")
             .bind(&req.coin_id)
             .bind(kind)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await?;
     }
 
+    tx.commit().await?;
     Ok((StatusCode::CREATED, Json(CoinDto::from(coin))).into_response())
 }
 
@@ -724,6 +741,126 @@ mod tests {
         assert_eq!(resp2.status_code(), 200);
 
         sqlx::query("DELETE FROM tracked_coins WHERE coin_id = 'test-coin-api001'")
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    // ── SPEC-API-005 M5 (F-32, REQ-API-407/408): idempotent ON CONFLICT + atomic tx ──
+
+    #[cfg(test)]
+    fn register_state(pool: sqlx::PgPool) -> crate::api::AppState {
+        use tokio::sync::broadcast;
+        let (coin_quote_tx, _) = broadcast::channel(16);
+        let (coin_candle_tx, _) = broadcast::channel(16);
+        crate::api::AppState {
+            pool,
+            chain: std::sync::Arc::new(vec![]),
+            search_provider: "coingecko".into(),
+            coingecko_base_url: "https://api.coingecko.com".into(),
+            http_client: reqwest::Client::new(),
+            coin_quote_tx,
+            coin_candle_tx,
+        }
+    }
+
+    // AC-API-407 [DB-backed]: two CONCURRENT registrations of the same coin_id yield exactly one
+    // 201 and one 200 — never a 500 PK violation (ON CONFLICT DO NOTHING RETURNING + re-select).
+    #[tokio::test]
+    #[ignore]
+    async fn db_register_coin_concurrent_duplicate_no_500() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let sfx = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let coin = format!("test-coin-api005-conc-{sfx}");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(&coin)
+            .execute(&pool)
+            .await
+            .ok();
+
+        // Two servers on the same pool, fired concurrently.
+        let server_a = TestServer::new(crate::api::build_api_router(register_state(pool.clone())));
+        let server_b = TestServer::new(crate::api::build_api_router(register_state(pool.clone())));
+        let body = serde_json::json!({ "coin_id": coin, "symbol": "TST", "name": "Test Coin" });
+        let (ra, rb) = tokio::join!(
+            server_a.post("/v1/coins").json(&body),
+            server_b.post("/v1/coins").json(&body),
+        );
+        let codes = [ra.status_code().as_u16(), rb.status_code().as_u16()];
+        assert!(
+            !codes.contains(&500),
+            "concurrent duplicate registration must never 500; got {codes:?}"
+        );
+        assert!(
+            codes.contains(&201) && codes.contains(&200),
+            "concurrent duplicate must yield exactly one 201 and one 200; got {codes:?}"
+        );
+
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(&coin)
+            .execute(&pool)
+            .await
+            .ok();
+    }
+
+    // AC-API-408 [DB-backed]: a fresh registration commits the tracked_coins row AND its three
+    // collection_queue enqueues atomically — both present after a 201.
+    #[tokio::test]
+    #[ignore]
+    async fn db_register_coin_insert_and_enqueues_are_atomic() {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let sfx = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let coin = format!("test-coin-api005-atomic-{sfx}");
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(&coin)
+            .execute(&pool)
+            .await
+            .ok();
+
+        let server = TestServer::new(crate::api::build_api_router(register_state(pool.clone())));
+        let resp = server
+            .post("/v1/coins")
+            .json(&serde_json::json!({ "coin_id": coin, "symbol": "TST", "name": "Test Coin" }))
+            .await;
+        assert_eq!(resp.status_code(), 201);
+
+        // The coin row is committed.
+        let coin_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM tracked_coins WHERE coin_id = $1")
+                .bind(&coin)
+                .fetch_one(&pool)
+                .await
+                .expect("count coin");
+        assert_eq!(coin_rows, 1, "the tracked_coins row must be committed");
+
+        // The three initial enqueues (metadata, market, candles) are committed in the same tx.
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT kind FROM collection_queue \
+             WHERE target_kind = 'coin' AND target_id = $1 ORDER BY kind",
+        )
+        .bind(&coin)
+        .fetch_all(&pool)
+        .await
+        .expect("select enqueues");
+        assert_eq!(
+            kinds,
+            vec![
+                "candles".to_string(),
+                "market".to_string(),
+                "metadata".to_string()
+            ],
+            "insert + the three enqueues must commit atomically (REQ-API-408)"
+        );
+
+        sqlx::query("DELETE FROM collection_queue WHERE target_kind = 'coin' AND target_id = $1")
+            .bind(&coin)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(&coin)
             .execute(&pool)
             .await
             .ok();
