@@ -284,10 +284,9 @@ pub fn coingecko_api_key() -> Option<String> {
 /// Default: 500 ms. Override per-provider for stricter APIs (e.g. CoinGecko demo = 60 000 ms).
 pub fn pacer_cooldown_ms(provider: &str) -> u64 {
     let key = format!("PACER_{}_COOLDOWN_MS", provider.to_uppercase());
-    std::env::var(&key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500)
+    // Fail-fast on a present-but-unparseable value (REQ-OBS-072): a silent default cooldown
+    // is dangerous here (risks hammering the upstream + an API-key ban).
+    resolve_pacer_cooldown_ms(&key, std::env::var(&key).ok().as_deref(), 500)
 }
 
 // ── SPEC-PROV-002 provider HTTP client timeouts (REQ-PROV-055/056/057) ────────
@@ -494,12 +493,10 @@ pub fn deep_backfill_coins() -> Vec<String> {
 /// Env var: `DEEP_BACKFILL_START_DATE` (`YYYY-MM-DD`). Default: `2011-08-18`, the first
 /// day Bitstamp serves BTC/USD daily candles.
 pub fn deep_backfill_start_date() -> chrono::NaiveDate {
-    std::env::var("DEEP_BACKFILL_START_DATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            chrono::NaiveDate::from_ymd_opt(2011, 8, 18).expect("valid default deep-backfill date")
-        })
+    // Warn on a present-but-unparseable date rather than silently reverting (REQ-OBS-071).
+    let default =
+        chrono::NaiveDate::from_ymd_opt(2011, 8, 18).expect("valid default deep-backfill date");
+    parse_env_or_warn("DEEP_BACKFILL_START_DATE", default)
 }
 
 /// Date where native (exchange) daily history begins — the deep-history window's upper
@@ -516,12 +513,10 @@ pub fn deep_backfill_start_date() -> chrono::NaiveDate {
 /// prior day. The daily series is then contiguous: deep source below this date, native
 /// data from it onward.
 pub fn deep_backfill_end_date() -> chrono::NaiveDate {
-    std::env::var("DEEP_BACKFILL_END_DATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            chrono::NaiveDate::from_ymd_opt(2017, 8, 17).expect("valid default deep-backfill end")
-        })
+    // Warn on a present-but-unparseable date rather than silently reverting (REQ-OBS-071).
+    let default =
+        chrono::NaiveDate::from_ymd_opt(2017, 8, 17).expect("valid default deep-backfill end");
+    parse_env_or_warn("DEEP_BACKFILL_END_DATE", default)
 }
 
 // ── SPEC-CYCLE-001 halving-cycle overlay configuration (REQ-CYCLE-043) ────────
@@ -720,45 +715,136 @@ pub fn alarm_upsert_failure_streak() -> u32 {
 }
 
 // ── Internal env-var helpers ──────────────────────────────────────────────────
+//
+// @MX:NOTE: [AUTO] config-diagnostics policy split (SPEC-OBS-002 F-45):
+//   - WARN (REQ-OBS-071): a present-but-unparseable value routes through
+//     `parse_env_or_warn`, which emits a `tracing::warn!` naming the var + fallback and
+//     then uses the default. An ABSENT var is a silent default (documented behavior, not a
+//     misconfiguration). Applies to every `parse_env_*` caller + the deep-backfill dates.
+//   - FAIL-FAST (REQ-OBS-072): a present-but-unparseable value for a DANGEROUS-to-mis-set
+//     var (pacer cooldowns — a wrong cooldown risks hammering the upstream and an API-key
+//     ban) PANICS at resolution via `resolve_pacer_cooldown_ms`, rather than warn-and-continue.
+// @MX:SPEC: SPEC-OBS-002 REQ-OBS-071 REQ-OBS-072
+
+/// Pure core for the warn-on-unparseable policy (REQ-OBS-071): returns `(value, warned)`.
+/// `warned` is true ONLY when `raw` is present-but-unparseable (an absent var uses the
+/// default silently). Pure + no tracing subscriber, so the warn path is unit-assertable.
+fn parse_env_value<T: std::str::FromStr>(raw: Option<&str>, default: T) -> (T, bool) {
+    match raw {
+        Some(v) => match v.parse::<T>() {
+            Ok(parsed) => (parsed, false),
+            Err(_) => (default, true), // present but unparseable → warn
+        },
+        None => (default, false), // absent → silent default
+    }
+}
+
+/// Parse an env var, emitting a `tracing::warn!` naming the variable and the fallback used
+/// when it is present-but-unparseable (REQ-OBS-071) rather than silently reverting.
+fn parse_env_or_warn<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    let raw = std::env::var(name).ok();
+    let (value, warned) = parse_env_value(raw.as_deref(), default);
+    if warned {
+        tracing::warn!(
+            env_var = name,
+            value = raw.as_deref().unwrap_or(""),
+            fallback = %default,
+            "config: env var is present but unparseable; using fallback default (REQ-OBS-071)"
+        );
+    }
+    value
+}
+
+/// Pure fail-fast core for pacer-cooldown parsing (REQ-OBS-072). An absent var yields the
+/// (safe) default; a present-but-unparseable value PANICS rather than silently defaulting —
+/// a wrong pacer cooldown risks hammering the upstream provider and an API-key ban, so a
+/// silent default here is dangerous. Pure + no env, so the panic path is unit-assertable.
+fn resolve_pacer_cooldown_ms(key: &str, raw: Option<&str>, default: u64) -> u64 {
+    match raw {
+        None => default,
+        Some(v) => v.trim().parse().unwrap_or_else(|_| {
+            panic!(
+                "config: {key} is present but unparseable ({v:?}); refusing to start with a \
+                 silent default cooldown — a wrong pacer cooldown risks hammering the upstream \
+                 and an API-key ban (REQ-OBS-072). Set a valid milliseconds integer or unset it."
+            )
+        }),
+    }
+}
 
 fn parse_env_u16(name: &str, default: u16) -> u16 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env_or_warn(name, default)
 }
 
 fn parse_env_i64(name: &str, default: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env_or_warn(name, default)
 }
 
 fn parse_env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env_or_warn(name, default)
 }
 
 fn parse_env_i32(name: &str, default: i32) -> i32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env_or_warn(name, default)
 }
 
 fn parse_env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    parse_env_or_warn(name, default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SPEC-OBS-002 config diagnostics: warn + fail-fast (F-45) ─────────────
+
+    #[test]
+    fn parse_env_value_absent_uses_default_without_warning() {
+        // AC-OBS-071: an absent var is a silent default (not a misconfiguration) → no warn.
+        assert_eq!(parse_env_value::<u64>(None, 42), (42, false));
+    }
+
+    #[test]
+    fn parse_env_value_valid_parses_without_warning() {
+        assert_eq!(parse_env_value::<u64>(Some("100"), 42), (100, false));
+        assert_eq!(parse_env_value::<i32>(Some("-7"), 0), (-7, false));
+    }
+
+    #[test]
+    fn parse_env_value_present_but_unparseable_warns_and_defaults() {
+        // AC-OBS-071: present-but-unparseable → warn path taken (warned == true), default used.
+        assert_eq!(parse_env_value::<u64>(Some("garbage"), 42), (42, true));
+        // An explicitly-empty value is also present-but-unparseable for a numeric type.
+        assert_eq!(parse_env_value::<u64>(Some(""), 42), (42, true));
+    }
+
+    #[test]
+    fn resolve_pacer_cooldown_absent_uses_default() {
+        // AC-OBS-072: an unset pacer cooldown safely falls back to the default (500 ms).
+        assert_eq!(
+            resolve_pacer_cooldown_ms("PACER_X_COOLDOWN_MS", None, 500),
+            500
+        );
+    }
+
+    #[test]
+    fn resolve_pacer_cooldown_valid_parses() {
+        assert_eq!(
+            resolve_pacer_cooldown_ms("PACER_X_COOLDOWN_MS", Some("60000"), 500),
+            60_000
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "present but unparseable")]
+    fn resolve_pacer_cooldown_present_but_unparseable_fails_fast() {
+        // AC-OBS-072: a present-but-unparseable dangerous value fails fast (panic), NOT a
+        // silent default that could hammer the upstream and get the API key banned.
+        let _ = resolve_pacer_cooldown_ms("PACER_X_COOLDOWN_MS", Some("notanumber"), 500);
+    }
 
     // ── SPEC-DB-001 database URL assembly (ticker-collector pattern) ─────────
 
