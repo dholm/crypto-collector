@@ -19,6 +19,7 @@ pub mod backfill;
 pub mod collection_queue;
 pub mod cycle_overlay;
 pub mod cycle_projection;
+pub mod lease_worker;
 pub mod live_poller;
 pub mod retry;
 pub mod rollup;

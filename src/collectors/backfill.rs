@@ -35,11 +35,13 @@ use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
 use crate::collectors::collection_queue::pacer_should_skip_queue;
+use crate::collectors::lease_worker::{
+    run_lease_worker, HeartbeatStep, LeaseCycleOutcome, LeaseFut, LeaseItem,
+};
 use crate::collectors::retry::DispatchError;
 use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
-use crate::shutdown::shutdown_arm_should_break;
 
 /// Dataset tag used for the startup once-per-coin historical backfill job
 /// (`enqueue_startup_backfills`). Matches the `ON CONFLICT (coin_id, dataset)`
@@ -337,6 +339,12 @@ pub struct ClaimedChunk {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl LeaseItem for ClaimedChunk {
+    fn lease_id(&self) -> i64 {
+        self.id
+    }
 }
 
 // ── DB functions ──────────────────────────────────────────────────────────────
@@ -830,6 +838,12 @@ async fn process_chunk(
 }
 
 /// Run the backfill worker loop (REQ-SCHED-020/050/051).
+///
+/// The claim / heartbeat / complete / release lifecycle is the shared
+/// [`run_lease_worker`](crate::collectors::lease_worker::run_lease_worker) scaffold
+/// (SPEC-REFACTOR-001 M3, F-53b); this function supplies only the backfill specifics — the
+/// chunk claim, the heartbeat SQL, the page-processing step, and the cursor-advance +
+/// complete-or-release terminal transition.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_backfill_worker(
     pool: PgPool,
@@ -839,179 +853,192 @@ pub async fn run_backfill_worker(
     heartbeat_interval_secs: u64,
     max_attempts: i32,
     idle_sleep: StdDuration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
-    info!("backfill_worker: started (replica={claimed_by})");
-
-    loop {
-        if *shutdown.borrow() {
-            break;
+    // Claim one backfill chunk (REQ-SCHED-021/022).
+    let claim = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move || -> LeaseFut<Result<Option<ClaimedChunk>, sqlx::Error>> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move { claim_backfill_chunk(&pool, &claimed_by, lease_secs).await })
         }
+    };
 
-        let chunk = match claim_backfill_chunk(&pool, &claimed_by, lease_secs).await {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                // Chunk queue empty: idle until next check or shutdown. Break out of the
-                // loop when the shutdown sender is dropped (`changed()` → Err) rather than
-                // busy-spin on the immediate error (REQ-SCHED-065.3).
-                tokio::select! {
-                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                    _ = tokio::time::sleep(idle_sleep) => {}
-                }
-                continue;
-            }
-            Err(e) => {
-                error!("backfill_worker: claim error: {e}");
-                // Bounded pause raced against shutdown, not a bare sleep, so shutdown is
-                // prompt and a dropped sender breaks the loop (REQ-SCHED-062/065.3).
-                tokio::select! {
-                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                    _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
-                }
-                continue;
-            }
-        };
-
-        let chunk_id = chunk.id;
-        let claimed_by_clone = claimed_by.clone();
-        let pool_hb = pool.clone();
-        let lease_clone = lease_secs;
-
-        // Heartbeat task (REQ-SCHED-022).
-        let hb_handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(StdDuration::from_secs(heartbeat_interval_secs));
-            loop {
-                interval.tick().await;
-                match heartbeat_backfill_chunk(&pool_hb, chunk_id, &claimed_by_clone, lease_clone)
-                    .await
-                {
-                    Ok(true) => {}
+    // Heartbeat one owned chunk (REQ-SCHED-022). Log wording preserved verbatim.
+    let beat = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move |id: i64| -> LeaseFut<HeartbeatStep> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move {
+                match heartbeat_backfill_chunk(&pool, id, &claimed_by, lease_secs).await {
+                    Ok(true) => HeartbeatStep::Renewed,
                     Ok(false) => {
-                        warn!("backfill_worker: heartbeat fencing fired for chunk {chunk_id}");
-                        break;
+                        warn!("backfill_worker: heartbeat fencing fired for chunk {id}");
+                        HeartbeatStep::FencedOut
                     }
                     Err(e) => {
-                        error!("backfill_worker: heartbeat error for chunk {chunk_id}: {e}");
+                        error!("backfill_worker: heartbeat error for chunk {id}: {e}");
+                        HeartbeatStep::Errored
                     }
                 }
-            }
-        });
+            })
+        }
+    };
 
-        let result = process_chunk(&pool, &chain, &chunk, registry.as_deref()).await;
-        hb_handle.abort();
+    // Process one chunk page.
+    let work = {
+        let pool = pool.clone();
+        let chain = chain.clone();
+        let registry = registry.clone();
+        move |chunk: ClaimedChunk| -> LeaseFut<(ClaimedChunk, Result<ChunkOutcome, DispatchError>)> {
+            let pool = pool.clone();
+            let chain = chain.clone();
+            let registry = registry.clone();
+            Box::pin(async move {
+                let result = process_chunk(&pool, &chain, &chunk, registry.as_deref()).await;
+                (chunk, result)
+            })
+        }
+    };
 
-        // After a soft-skip or a retryable-failure release, pause before the next claim so
-        // a provider cooldown does not become a tight loop against the DB (REQ-SCHED-062).
-        let mut pause_before_next_claim = false;
+    // Terminal transition: cursor advance + complete-or-release / fail
+    // (classification preserved, REQ-REFACTOR-032).
+    let finalize = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move |chunk: ClaimedChunk,
+              result: Result<ChunkOutcome, DispatchError>|
+              -> LeaseFut<LeaseCycleOutcome> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move {
+                match result {
+                    Ok(ChunkOutcome::Progress {
+                        max_ts,
+                        interval_secs,
+                    }) => {
+                        // Empty-page forward-skip span: a fixed step tied to the candle
+                        // interval and the largest provider page cap (Binance: 1000 candles
+                        // per page) guarantees forward progress and termination even when a
+                        // single page is empty or fully filtered out of range (REQ-SCHED-024/025/026).
+                        let page_span_secs = interval_secs.max(1) * EMPTY_PAGE_SKIP_CANDLES;
 
-        match result {
-            Ok(ChunkOutcome::Progress {
-                max_ts,
-                interval_secs,
-            }) => {
-                // Empty-page forward-skip span: a fixed step tied to the candle
-                // interval and the largest provider page cap (Binance: 1000 candles
-                // per page) guarantees forward progress and termination even when a
-                // single page is empty or fully filtered out of range (REQ-SCHED-024/025/026).
-                let page_span_secs = interval_secs.max(1) * EMPTY_PAGE_SKIP_CANDLES;
+                        let start = resume_start(chunk.cursor, chunk.range_start);
+                        let (next_cursor, done) =
+                            next_cursor_for_page(start, chunk.range_end, max_ts, page_span_secs);
 
-                let start = resume_start(chunk.cursor, chunk.range_start);
-                let (next_cursor, done) =
-                    next_cursor_for_page(start, chunk.range_end, max_ts, page_span_secs);
+                        if let Some(cursor) = next_cursor {
+                            // Advance cursor (REQ-SCHED-024). Also covers the empty-page
+                            // forward-skip: the computed cursor still durably records progress.
+                            if let Err(e) =
+                                advance_cursor(&pool, chunk.id, &claimed_by, cursor).await
+                            {
+                                error!(
+                                    "backfill_worker: cursor advance error for chunk {}: {e}",
+                                    chunk.id
+                                );
+                            }
+                        }
 
-                if let Some(cursor) = next_cursor {
-                    // Advance cursor (REQ-SCHED-024). Also covers the empty-page
-                    // forward-skip: the computed cursor still durably records progress.
-                    if let Err(e) = advance_cursor(&pool, chunk.id, &claimed_by, cursor).await {
-                        error!(
-                            "backfill_worker: cursor advance error for chunk {}: {e}",
+                        if done {
+                            if let Err(e) =
+                                complete_backfill_chunk(&pool, chunk.id, &claimed_by).await
+                            {
+                                error!(
+                                    "backfill_worker: complete error for chunk {}: {e}",
+                                    chunk.id
+                                );
+                            }
+                            info!("backfill_worker: chunk {} done", chunk.id);
+                        } else {
+                            // More data in range (or an empty page was skipped forward): this is a
+                            // NON-failure release. Route through RELEASE_BACKFILL_SQL so the
+                            // claim-time attempts+1 is neutralized and a prior genuine last_error is
+                            // not overwritten — a multi-page walk never consumes the retry budget
+                            // (REQ-SCHED-060.1, F-01 root-cause fix). No pause: this is forward progress.
+                            if let Err(e) =
+                                release_backfill_chunk(&pool, chunk.id, &claimed_by).await
+                            {
+                                error!(
+                                    "backfill_worker: partial-release error for chunk {}: {e}",
+                                    chunk.id
+                                );
+                            }
+                        }
+                        LeaseCycleOutcome::Continue
+                    }
+                    Ok(ChunkOutcome::SoftSkip) => {
+                        // Pacer backpressure: administratively release WITHOUT consuming the retry
+                        // budget, then idle (REQ-SCHED-061). Mirrors the collection-queue soft-skip.
+                        if let Err(e) = release_backfill_chunk(&pool, chunk.id, &claimed_by).await {
+                            error!(
+                                "backfill_worker: soft-skip release error for chunk {}: {e}",
+                                chunk.id
+                            );
+                        }
+                        LeaseCycleOutcome::PauseBeforeNextClaim
+                    }
+                    Err(DispatchError::Permanent(msg)) => {
+                        // Terminal: fail immediately on the first attempt, independent of the retry
+                        // budget (REQ-SCHED-063.2). No pause — the next claim is a different chunk.
+                        warn!(
+                            "backfill_worker: chunk {} permanently failed: {msg}",
                             chunk.id
                         );
+                        if let Err(db_err) =
+                            fail_permanent_backfill_chunk(&pool, chunk.id, &claimed_by, &msg).await
+                        {
+                            error!(
+                                "backfill_worker: permanent-fail update error for chunk {}: {db_err}",
+                                chunk.id
+                            );
+                        }
+                        LeaseCycleOutcome::Continue
                     }
-                }
-
-                if done {
-                    if let Err(e) = complete_backfill_chunk(&pool, chunk.id, &claimed_by).await {
-                        error!(
-                            "backfill_worker: complete error for chunk {}: {e}",
-                            chunk.id
+                    Err(DispatchError::Transient(msg)) => {
+                        // Retryable: retry or fail at max_attempts (REQ-SCHED-027/063.3), then pause.
+                        warn!(
+                            "backfill_worker: chunk {} failed (attempts={}/{}): {msg}",
+                            chunk.id, chunk.attempts, max_attempts
                         );
-                    }
-                    info!("backfill_worker: chunk {} done", chunk.id);
-                } else {
-                    // More data in range (or an empty page was skipped forward): this is a
-                    // NON-failure release. Route through RELEASE_BACKFILL_SQL so the
-                    // claim-time attempts+1 is neutralized and a prior genuine last_error is
-                    // not overwritten — a multi-page walk never consumes the retry budget
-                    // (REQ-SCHED-060.1, F-01 root-cause fix). No pause: this is forward progress.
-                    if let Err(e) = release_backfill_chunk(&pool, chunk.id, &claimed_by).await {
-                        error!(
-                            "backfill_worker: partial-release error for chunk {}: {e}",
-                            chunk.id
-                        );
-                    }
-                }
-            }
-            Ok(ChunkOutcome::SoftSkip) => {
-                // Pacer backpressure: administratively release WITHOUT consuming the retry
-                // budget, then idle (REQ-SCHED-061). Mirrors the collection-queue soft-skip.
-                if let Err(e) = release_backfill_chunk(&pool, chunk.id, &claimed_by).await {
-                    error!(
-                        "backfill_worker: soft-skip release error for chunk {}: {e}",
-                        chunk.id
-                    );
-                }
-                pause_before_next_claim = true;
-            }
-            Err(DispatchError::Permanent(msg)) => {
-                // Terminal: fail immediately on the first attempt, independent of the retry
-                // budget (REQ-SCHED-063.2). No pause — the next claim is a different chunk.
-                warn!(
-                    "backfill_worker: chunk {} permanently failed: {msg}",
-                    chunk.id
-                );
-                if let Err(db_err) =
-                    fail_permanent_backfill_chunk(&pool, chunk.id, &claimed_by, &msg).await
-                {
-                    error!(
-                        "backfill_worker: permanent-fail update error for chunk {}: {db_err}",
-                        chunk.id
-                    );
-                }
-            }
-            Err(DispatchError::Transient(msg)) => {
-                // Retryable: retry or fail at max_attempts (REQ-SCHED-027/063.3), then pause.
-                warn!(
-                    "backfill_worker: chunk {} failed (attempts={}/{}): {msg}",
-                    chunk.id, chunk.attempts, max_attempts
-                );
-                if let Err(db_err) =
-                    fail_or_retry_backfill_chunk(&pool, chunk.id, &claimed_by, max_attempts, &msg)
+                        if let Err(db_err) = fail_or_retry_backfill_chunk(
+                            &pool,
+                            chunk.id,
+                            &claimed_by,
+                            max_attempts,
+                            &msg,
+                        )
                         .await
-                {
-                    error!(
-                        "backfill_worker: fail update error for chunk {}: {db_err}",
-                        chunk.id
-                    );
+                        {
+                            error!(
+                                "backfill_worker: fail update error for chunk {}: {db_err}",
+                                chunk.id
+                            );
+                        }
+                        LeaseCycleOutcome::PauseBeforeNextClaim
+                    }
                 }
-                pause_before_next_claim = true;
-            }
+            })
         }
+    };
 
-        if pause_before_next_claim {
-            // Bounded pause raced against shutdown (REQ-SCHED-062.1): shutdown stays prompt,
-            // and a dropped sender breaks the loop instead of busy-spinning (REQ-SCHED-065.3).
-            tokio::select! {
-                res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                _ = tokio::time::sleep(idle_sleep) => {}
-            }
-        }
-    }
-
-    info!("backfill_worker: stopped");
-    Ok(())
+    run_lease_worker(
+        "backfill_worker",
+        claimed_by,
+        heartbeat_interval_secs,
+        idle_sleep,
+        shutdown,
+        claim,
+        beat,
+        work,
+        finalize,
+    )
+    .await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1462,24 +1489,35 @@ mod tests {
         );
     }
 
-    // ── AC-SCHED-065c: guarded shutdown select! arm (mechanical) ──────────────
+    // ── AC-REFACTOR-030a / AC-SCHED-065c: delegation to the shared lease-queue scaffold ──
+    // After the M3 extraction (F-53b) the claim/heartbeat/complete/release loop — including the
+    // guarded shutdown select! arms (REQ-SCHED-065.3) and the watch-based heartbeat stop
+    // (REQ-REFACTOR-031) — lives in `lease_worker::run_lease_worker`. The guard invariant is
+    // now behavior-verified there; this worker must merely delegate to it.
 
     #[test]
-    fn worker_select_arms_guard_dropped_sender() {
+    fn worker_delegates_to_shared_lease_scaffold() {
         let src = std::fs::read_to_string("src/collectors/backfill.rs").expect("read backfill.rs");
         // Scan only the production code (before the test module) so this scan does not match
         // its own assertion-message string literals.
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let call = format!("{}(", "run_lease_worker");
         assert!(
-            code.contains("shutdown_arm_should_break"),
-            "worker loop select! arms must adopt the shared shutdown_arm_should_break helper — its \
-             break decision is behavior-verified by shutdown::tests::shutdown_arm_should_break_truth_table \
-             (REQ-SCHED-065.3)"
+            code.contains(&call),
+            "worker must delegate its claim/heartbeat/complete/release loop to the shared \
+             lease-queue scaffold (REQ-REFACTOR-030)"
         );
+        // Watch-based heartbeat stop (REQ-REFACTOR-031): no local heartbeat abort remains.
+        let abort = format!(".{}()", "abort");
         assert!(
-            !code.contains("_ = shutdown.changed()"),
-            "no un-captured `_ = shutdown.changed()` arm may remain — the result must be \
-             bound and is_err()-guarded (REQ-SCHED-065.3)"
+            !code.contains(&abort),
+            "heartbeat must stop via the shared watch signal, not abort (REQ-REFACTOR-031)"
+        );
+        // No un-guarded shutdown arm remains here — the guarded arms live in the scaffold.
+        let unguarded = format!("_ = shutdown{}", ".changed()");
+        assert!(
+            !code.contains(&unguarded),
+            "no un-captured shutdown.changed() arm may remain in the worker (REQ-SCHED-065.3)"
         );
     }
 

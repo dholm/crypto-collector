@@ -29,6 +29,9 @@ use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tracing::{error, info, warn};
 
+use crate::collectors::lease_worker::{
+    run_lease_worker, HeartbeatStep, LeaseCycleOutcome, LeaseFut, LeaseItem,
+};
 use crate::collectors::retry::DispatchError;
 use crate::db::upserts::{
     upsert_coin_candle, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_coin_quote,
@@ -36,7 +39,6 @@ use crate::db::upserts::{
 use crate::models::quote::CoinCandle;
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
-use crate::shutdown::shutdown_arm_should_break;
 
 // ── Pure scheduling functions (unit-testable, no I/O) ────────────────────────
 
@@ -193,6 +195,12 @@ pub struct ClaimedQueueItem {
     pub last_error: Option<String>,
     pub enqueued_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl LeaseItem for ClaimedQueueItem {
+    fn lease_id(&self) -> i64 {
+        self.id
+    }
 }
 
 // ── DB functions ──────────────────────────────────────────────────────────────
@@ -768,6 +776,11 @@ async fn dispatch_item(
 // ── Worker loop ───────────────────────────────────────────────────────────────
 
 /// Run the collection-queue worker loop (REQ-SCHED-010/051/050).
+///
+/// The claim / heartbeat / complete / release lifecycle is the shared
+/// [`run_lease_worker`](crate::collectors::lease_worker::run_lease_worker) scaffold
+/// (SPEC-REFACTOR-001 M3, F-53b); this function supplies only the collection-queue specifics —
+/// the claim query, the heartbeat SQL, the dispatch step, and the terminal transition.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_collection_queue_worker(
     pool: PgPool,
@@ -777,145 +790,153 @@ pub async fn run_collection_queue_worker(
     heartbeat_interval_secs: u64,
     max_attempts: i32,
     idle_sleep: StdDuration,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     registry: Option<Arc<crate::alarm::HealthRegistry>>,
 ) -> Result<()> {
-    info!("collection_queue_worker: started (replica={claimed_by})");
-
-    loop {
-        if *shutdown.borrow() {
-            break;
+    // Claim one collection_queue row (REQ-SCHED-010/014/015).
+    let claim = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move || -> LeaseFut<Result<Option<ClaimedQueueItem>, sqlx::Error>> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move { claim_queue_item(&pool, &claimed_by, lease_secs).await })
         }
+    };
 
-        let item = match claim_queue_item(&pool, &claimed_by, lease_secs).await {
-            Ok(Some(i)) => i,
-            Ok(None) => {
-                // Queue empty: idle until next check or shutdown signal. Break out of the
-                // loop when the shutdown sender is dropped (`changed()` → Err) rather than
-                // busy-spin on the immediate error (REQ-SCHED-065.3).
-                tokio::select! {
-                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                    _ = tokio::time::sleep(idle_sleep) => {}
-                }
-                continue;
-            }
-            Err(e) => {
-                error!("collection_queue_worker: claim error: {e}");
-                // Bounded pause raced against shutdown, not a bare sleep, so shutdown is
-                // prompt and a dropped sender breaks the loop (REQ-SCHED-062/065.3).
-                tokio::select! {
-                    res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                    _ = tokio::time::sleep(StdDuration::from_secs(1)) => {}
-                }
-                continue;
-            }
-        };
-
-        let item_id = item.id;
-        let claimed_by_clone = claimed_by.clone();
-        let pool_hb = pool.clone();
-        let lease_clone = lease_secs;
-
-        // Heartbeat task: renews lease periodically while work runs (REQ-SCHED-011).
-        let hb_handle = tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(StdDuration::from_secs(heartbeat_interval_secs));
-            loop {
-                interval.tick().await;
-                match heartbeat_queue_item(&pool_hb, item_id, &claimed_by_clone, lease_clone).await
-                {
-                    Ok(true) => {} // renewed
+    // Heartbeat one owned item: renews the lease, warns + fences out on a stolen lease
+    // (REQ-SCHED-011). Log wording preserved verbatim from the pre-refactor loop.
+    let beat = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move |id: i64| -> LeaseFut<HeartbeatStep> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move {
+                match heartbeat_queue_item(&pool, id, &claimed_by, lease_secs).await {
+                    Ok(true) => HeartbeatStep::Renewed,
                     Ok(false) => {
-                        warn!(
-                            "collection_queue_worker: heartbeat fencing fired for item {item_id}"
-                        );
-                        break;
+                        warn!("collection_queue_worker: heartbeat fencing fired for item {id}");
+                        HeartbeatStep::FencedOut
                     }
                     Err(e) => {
-                        error!("collection_queue_worker: heartbeat error for item {item_id}: {e}");
+                        error!("collection_queue_worker: heartbeat error for item {id}: {e}");
+                        HeartbeatStep::Errored
                     }
                 }
-            }
-        });
-
-        // Dispatch the work (REQ-SCHED-041: all upstream calls acquire pacer OUTSIDE tx).
-        let dispatch_result = dispatch_item(&pool, &chain, &item, registry.as_deref()).await;
-
-        hb_handle.abort();
-
-        // After a soft-skip or a retryable-failure release, pause before the next claim so
-        // a provider cooldown does not become a tight loop against the DB (REQ-SCHED-062).
-        let mut pause_before_next_claim = false;
-
-        match dispatch_result {
-            Ok(DispatchOutcome::Done) => {
-                // Success: mark done (REQ-SCHED-012).
-                if let Err(e) = complete_queue_item(&pool, item.id, &claimed_by).await {
-                    error!(
-                        "collection_queue_worker: complete error for item {}: {e}",
-                        item.id
-                    );
-                }
-                info!("collection_queue_worker: item {} done", item.id);
-            }
-            Ok(DispatchOutcome::SoftSkip) => {
-                // Pacer backpressure: administratively release WITHOUT consuming the retry
-                // budget and WITHOUT overwriting a prior genuine last_error (REQ-SCHED-060.2/061/065.1).
-                if let Err(e) = release_queue_item(&pool, item.id, &claimed_by).await {
-                    error!(
-                        "collection_queue_worker: skip-release error for item {}: {e}",
-                        item.id
-                    );
-                }
-                pause_before_next_claim = true;
-            }
-            Err(DispatchError::Permanent(msg)) => {
-                // Terminal: fail immediately on the first attempt, independent of the retry
-                // budget (REQ-SCHED-063.2). No pause — the next claim is a different item.
-                warn!(
-                    "collection_queue_worker: item {} permanently failed: {msg}",
-                    item.id
-                );
-                if let Err(db_err) =
-                    fail_permanent_queue_item(&pool, item.id, &claimed_by, &msg).await
-                {
-                    error!(
-                        "collection_queue_worker: permanent-fail update error for item {}: {db_err}",
-                        item.id
-                    );
-                }
-            }
-            Err(DispatchError::Transient(msg)) => {
-                // Retryable: increment counts (attempts already +1 at claim), retry or fail
-                // at max_attempts (REQ-SCHED-013/063.3), then pause (REQ-SCHED-062).
-                warn!(
-                    "collection_queue_worker: item {} failed (attempts={}/{}): {msg}",
-                    item.id, item.attempts, max_attempts
-                );
-                if let Err(db_err) =
-                    fail_or_retry_queue_item(&pool, item.id, &claimed_by, max_attempts, &msg).await
-                {
-                    error!(
-                        "collection_queue_worker: fail update error for item {}: {db_err}",
-                        item.id
-                    );
-                }
-                pause_before_next_claim = true;
-            }
+            })
         }
+    };
 
-        if pause_before_next_claim {
-            // Bounded pause raced against shutdown (REQ-SCHED-062.1): shutdown stays prompt,
-            // and a dropped sender breaks the loop instead of busy-spinning (REQ-SCHED-065.3).
-            tokio::select! {
-                res = shutdown.changed() => { if shutdown_arm_should_break(res.is_err(), *shutdown.borrow()) { break; } }
-                _ = tokio::time::sleep(idle_sleep) => {}
-            }
+    // Dispatch the work (REQ-SCHED-041: all upstream calls acquire pacer OUTSIDE tx).
+    let work = {
+        let pool = pool.clone();
+        let chain = chain.clone();
+        let registry = registry.clone();
+        move |item: ClaimedQueueItem| -> LeaseFut<(
+            ClaimedQueueItem,
+            Result<DispatchOutcome, DispatchError>,
+        )> {
+            let pool = pool.clone();
+            let chain = chain.clone();
+            let registry = registry.clone();
+            Box::pin(async move {
+                let result = dispatch_item(&pool, &chain, &item, registry.as_deref()).await;
+                (item, result)
+            })
         }
-    }
+    };
 
-    info!("collection_queue_worker: stopped");
-    Ok(())
+    // Terminal transition: complete / release / fail (classification preserved, REQ-REFACTOR-032).
+    let finalize = {
+        let pool = pool.clone();
+        let claimed_by = claimed_by.clone();
+        move |item: ClaimedQueueItem,
+              result: Result<DispatchOutcome, DispatchError>|
+              -> LeaseFut<LeaseCycleOutcome> {
+            let pool = pool.clone();
+            let claimed_by = claimed_by.clone();
+            Box::pin(async move {
+                match result {
+                    Ok(DispatchOutcome::Done) => {
+                        // Success: mark done (REQ-SCHED-012).
+                        if let Err(e) = complete_queue_item(&pool, item.id, &claimed_by).await {
+                            error!(
+                                "collection_queue_worker: complete error for item {}: {e}",
+                                item.id
+                            );
+                        }
+                        info!("collection_queue_worker: item {} done", item.id);
+                        LeaseCycleOutcome::Continue
+                    }
+                    Ok(DispatchOutcome::SoftSkip) => {
+                        // Pacer backpressure: administratively release WITHOUT consuming the retry
+                        // budget and WITHOUT overwriting a prior genuine last_error (REQ-SCHED-060.2/061/065.1).
+                        if let Err(e) = release_queue_item(&pool, item.id, &claimed_by).await {
+                            error!(
+                                "collection_queue_worker: skip-release error for item {}: {e}",
+                                item.id
+                            );
+                        }
+                        LeaseCycleOutcome::PauseBeforeNextClaim
+                    }
+                    Err(DispatchError::Permanent(msg)) => {
+                        // Terminal: fail immediately on the first attempt, independent of the retry
+                        // budget (REQ-SCHED-063.2). No pause — the next claim is a different item.
+                        warn!(
+                            "collection_queue_worker: item {} permanently failed: {msg}",
+                            item.id
+                        );
+                        if let Err(db_err) =
+                            fail_permanent_queue_item(&pool, item.id, &claimed_by, &msg).await
+                        {
+                            error!(
+                                "collection_queue_worker: permanent-fail update error for item {}: {db_err}",
+                                item.id
+                            );
+                        }
+                        LeaseCycleOutcome::Continue
+                    }
+                    Err(DispatchError::Transient(msg)) => {
+                        // Retryable: increment counts (attempts already +1 at claim), retry or fail
+                        // at max_attempts (REQ-SCHED-013/063.3), then pause (REQ-SCHED-062).
+                        warn!(
+                            "collection_queue_worker: item {} failed (attempts={}/{}): {msg}",
+                            item.id, item.attempts, max_attempts
+                        );
+                        if let Err(db_err) = fail_or_retry_queue_item(
+                            &pool,
+                            item.id,
+                            &claimed_by,
+                            max_attempts,
+                            &msg,
+                        )
+                        .await
+                        {
+                            error!(
+                                "collection_queue_worker: fail update error for item {}: {db_err}",
+                                item.id
+                            );
+                        }
+                        LeaseCycleOutcome::PauseBeforeNextClaim
+                    }
+                }
+            })
+        }
+    };
+
+    run_lease_worker(
+        "collection_queue_worker",
+        claimed_by,
+        heartbeat_interval_secs,
+        idle_sleep,
+        shutdown,
+        claim,
+        beat,
+        work,
+        finalize,
+    )
+    .await
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1104,25 +1125,37 @@ mod tests {
         );
     }
 
-    // ── AC-SCHED-065c: guarded shutdown select! arm (mechanical) ──────────────
+    // ── AC-REFACTOR-030a / AC-SCHED-065c: delegation to the shared lease-queue scaffold ──
+    // After the M3 extraction (F-53b) the claim/heartbeat/complete/release loop — including the
+    // guarded shutdown select! arms (REQ-SCHED-065.3) and the watch-based heartbeat stop
+    // (REQ-REFACTOR-031) — lives in `lease_worker::run_lease_worker`. The guard invariant is
+    // now behavior-verified there (lease_worker::tests::scaffold_guards_dropped_sender +
+    // heartbeat_stops_via_watch_signal_not_abort); this worker must merely delegate to it.
 
     #[test]
-    fn worker_select_arms_guard_dropped_sender() {
+    fn worker_delegates_to_shared_lease_scaffold() {
         let src = std::fs::read_to_string("src/collectors/collection_queue.rs")
             .expect("read collection_queue.rs");
         // Scan only the production code (before the test module) so this scan does not match
         // its own assertion-message string literals.
         let code = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let call = format!("{}(", "run_lease_worker");
         assert!(
-            code.contains("shutdown_arm_should_break"),
-            "worker loop select! arms must adopt the shared shutdown_arm_should_break helper — its \
-             break decision is behavior-verified by shutdown::tests::shutdown_arm_should_break_truth_table \
-             (REQ-SCHED-065.3)"
+            code.contains(&call),
+            "worker must delegate its claim/heartbeat/complete/release loop to the shared \
+             lease-queue scaffold (REQ-REFACTOR-030)"
         );
+        // Watch-based heartbeat stop (REQ-REFACTOR-031): no local heartbeat abort remains.
+        let abort = format!(".{}()", "abort");
         assert!(
-            !code.contains("_ = shutdown.changed()"),
-            "no un-captured `_ = shutdown.changed()` arm may remain — the result must be \
-             bound and is_err()-guarded (REQ-SCHED-065.3)"
+            !code.contains(&abort),
+            "heartbeat must stop via the shared watch signal, not abort (REQ-REFACTOR-031)"
+        );
+        // No un-guarded shutdown arm remains here — the guarded arms live in the scaffold.
+        let unguarded = format!("_ = shutdown{}", ".changed()");
+        assert!(
+            !code.contains(&unguarded),
+            "no un-captured shutdown.changed() arm may remain in the worker (REQ-SCHED-065.3)"
         );
     }
 
