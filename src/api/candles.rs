@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     candles_agg::{
-        aggregate_candles, interval_to_seconds, select_source_interval, IntervalCoverage,
+        aggregate_candles, bucket_start, interval_to_seconds, select_source_interval,
+        IntervalCoverage,
     },
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, TsKey},
     dto::{CoinCandleDto, Page},
@@ -221,6 +222,16 @@ pub async fn list_candles(
         .start
         .and_then(|s| s.checked_sub_signed(Duration::seconds(target_secs)));
 
+    // End upper bound (F-31/REQ-API-405): when `end` is present, bound the source read to
+    // `ts < end + one target-interval bucket` (one-bucket upper margin, symmetric with the
+    // `source_start` lower margin) so the boundary bucket at/before `end` has its full source
+    // set. Without this, a far-past `[start, end]` window fetches only the newest rows (ORDER BY
+    // ts DESC LIMIT cap) and post-aggregation retain drops them all → an empty page
+    // indistinguishable from "no data". With it, the far-past window is reachable.
+    let source_end: Option<DateTime<Utc>> = params
+        .end
+        .and_then(|e| e.checked_add_signed(Duration::seconds(target_secs)));
+
     let source_rows: Vec<CoinCandle> = sqlx::query_as(
         "SELECT coin_id, vs_currency, interval, ts, open, high, low, close, volume, source \
          FROM coin_candles \
@@ -229,19 +240,26 @@ pub async fn list_candles(
            AND interval = $3 \
            AND ($4::TIMESTAMPTZ IS NULL OR ts < $4) \
            AND ($5::TIMESTAMPTZ IS NULL OR ts >= $5) \
+           AND ($6::TIMESTAMPTZ IS NULL OR ts < $6) \
          ORDER BY ts DESC \
-         LIMIT $6",
+         LIMIT $7",
     )
     .bind(&coin_id)
     .bind(&vs_currency)
     .bind(source_interval)
     .bind(cursor_ts)
     .bind(source_start)
+    .bind(source_end)
     .bind(row_cap)
     .fetch_all(&state.pool)
     .await?;
 
     let source_hit_cap = source_rows.len() as i64 >= row_cap;
+
+    // Oldest fetched source row (ORDER BY ts DESC → last). Captured before the move into
+    // aggregate_candles so the cap-hit-but-empty branch can derive a continuation cursor from
+    // its bucket start (F-31/REQ-API-406) when aggregation emits no bucket.
+    let oldest_source_ts = source_rows.last().map(|c| c.ts);
 
     let mut agg = aggregate_candles(
         source_rows,
@@ -269,9 +287,16 @@ pub async fn list_candles(
     // `paginate_ts` heuristic (`len > limit`) would wrongly emit a null next_cursor in that
     // case. When the source cap was hit, we emit a cursor from the oldest emitted bucket.
     let (items, next_cursor) = if source_hit_cap && (agg.len() as i64) <= limit {
+        // The source read returned the full cap → older source rows remain in the DB. Continue
+        // pagination even when this page's buckets were gap-dropped: derive the cursor from the
+        // oldest emitted bucket, or — when aggregation emitted nothing (agg empty, so agg.last()
+        // is None) — from the oldest fetched source row's bucket start (F-31/REQ-API-406). Both
+        // are strictly older than any prior cursor, so pagination makes forward progress.
         let next_cursor = agg
             .last()
-            .map(|c| encode_keyset_cursor(&TsKey { ts: c.ts }));
+            .map(|c| c.ts)
+            .or_else(|| oldest_source_ts.map(|ts| bucket_start(ts, target_secs)))
+            .map(|ts| encode_keyset_cursor(&TsKey { ts }));
         (agg, next_cursor)
     } else {
         paginate_ts(agg, limit, |c| c.ts)
@@ -875,5 +900,191 @@ mod tests {
                 "Scenario 16 (REQ-API-214): ts {ts_str} must be in [start, end]"
             );
         }
+    }
+
+    // ── SPEC-API-005 M4 (F-31): aggregation reachability & cap-cursor ────────────
+
+    // Self-contained DB fixtures: seed the parent tracked_coins row first (FK) and a set of 1h
+    // coin_candles rows; teardown children before the parent.
+    #[cfg(test)]
+    async fn m4_seed_coin(pool: &sqlx::PgPool, coin_id: &str) {
+        sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query(
+            "INSERT INTO tracked_coins (coin_id, symbol, name, status) \
+             VALUES ($1, 'T', 'Test', 'active')",
+        )
+        .bind(coin_id)
+        .execute(pool)
+        .await
+        .expect("seed tracked_coins (FK parent)");
+    }
+
+    #[cfg(test)]
+    async fn m4_seed_1h_candle(pool: &sqlx::PgPool, coin_id: &str, ts: DateTime<Utc>) {
+        sqlx::query(
+            "INSERT INTO coin_candles \
+             (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source) \
+             VALUES ($1, 'usd', '1h', $2, 100, 110, 90, 105, 1, 'binance') \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(coin_id)
+        .bind(ts)
+        .execute(pool)
+        .await
+        .expect("seed 1h coin_candle");
+    }
+
+    #[cfg(test)]
+    async fn m4_teardown(pool: &sqlx::PgPool, coin_id: &str) {
+        sqlx::query("DELETE FROM coin_candles WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tracked_coins WHERE coin_id = $1")
+            .bind(coin_id)
+            .execute(pool)
+            .await
+            .ok();
+    }
+
+    // AC-API-405 [DB-backed]: a far-past [start, end] 4h window aggregated from 1h source is
+    // reachable (non-empty) even when many newer 1h rows would otherwise fill the row cap. The
+    // `ts < end + one bucket` source upper bound is what makes the far-past window fetchable.
+    #[tokio::test]
+    #[ignore]
+    async fn db_aggregation_far_past_window_is_reachable() {
+        use chrono::{Duration, DurationRound};
+
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let sfx = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let coin = format!("api5-farpast-{sfx}");
+        m4_seed_coin(&pool, &coin).await;
+
+        let now = chrono::Utc::now();
+        // Far-past target: two complete 4h buckets ~6 months ago (8 consecutive 1h candles),
+        // aligned to a 4h boundary so each bucket holds its full N=4 source candles.
+        let base = (now - Duration::days(180))
+            .duration_trunc(Duration::hours(4))
+            .expect("trunc");
+        for h in 0..8i64 {
+            m4_seed_1h_candle(&pool, &coin, base + Duration::hours(h)).await;
+        }
+        // Many recent 1h candles (newer than `end`) that would fill a small row cap first.
+        for h in 0..16i64 {
+            m4_seed_1h_candle(&pool, &coin, now - Duration::hours(h + 1)).await;
+        }
+
+        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
+        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
+        let state = crate::api::AppState {
+            pool: pool.clone(),
+            chain: std::sync::Arc::new(vec![]),
+            search_provider: "coingecko".into(),
+            coingecko_base_url: "https://api.coingecko.com".into(),
+            http_client: reqwest::Client::new(),
+            coin_quote_tx,
+            coin_candle_tx,
+        };
+        let server = TestServer::new(crate::api::build_api_router(state));
+
+        // Small limit → small row cap; without the end-bound the recent rows would fill it and
+        // the far-past window would post-filter to nothing.
+        let start = base.to_rfc3339();
+        let end = (base + Duration::hours(8)).to_rfc3339();
+        let resp = server
+            .get(&format!("/v1/coins/{coin}/candles"))
+            .add_query_param("interval", "4h")
+            .add_query_param("vs_currency", "usd")
+            .add_query_param("limit", "2")
+            .add_query_param("start", &start)
+            .add_query_param("end", &end)
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        let items = body["items"].as_array().expect("items");
+        assert!(
+            !items.is_empty(),
+            "far-past [start,end] 4h window must return aggregated buckets, not an empty page \
+             (REQ-API-405); got {body}"
+        );
+        for item in items {
+            let ts: DateTime<Utc> = item["ts"].as_str().unwrap().parse().unwrap();
+            assert!(
+                ts >= base && ts <= base + Duration::hours(8),
+                "aggregated bucket ts must fall inside the requested window"
+            );
+        }
+
+        m4_teardown(&pool, &coin).await;
+    }
+
+    // AC-API-406 [DB-backed]: when the source read hits the row cap but every fetched bucket is
+    // gap-dropped (agg empty), pagination continues via a cursor derived from the oldest fetched
+    // source row's bucket start — next_cursor is non-null rather than terminating.
+    #[tokio::test]
+    #[ignore]
+    async fn db_cap_hit_gap_dropped_page_continues() {
+        use chrono::{Duration, DurationRound};
+
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let pool = crate::db::connect(&url).await.expect("db connect");
+        let sfx = chrono::Utc::now().timestamp_nanos_opt().unwrap();
+        let coin = format!("api5-capcursor-{sfx}");
+        m4_seed_coin(&pool, &coin).await;
+
+        let now = chrono::Utc::now();
+        // Sparse 1h candles: one per distinct 4h bucket, all in the past (closed buckets). Each
+        // closed 4h bucket has 1 of N=4 source candles → gap-dropped → aggregation emits nothing.
+        // With limit=1 the row cap is (1+1)*4 = 8; seed 10 sparse candles so the cap is hit.
+        let base = (now - Duration::days(3))
+            .duration_trunc(Duration::hours(4))
+            .expect("trunc");
+        for b in 0..10i64 {
+            m4_seed_1h_candle(&pool, &coin, base - Duration::hours(4 * b)).await;
+        }
+
+        let (coin_quote_tx, _) = tokio::sync::broadcast::channel(16);
+        let (coin_candle_tx, _) = tokio::sync::broadcast::channel(16);
+        let state = crate::api::AppState {
+            pool: pool.clone(),
+            chain: std::sync::Arc::new(vec![]),
+            search_provider: "coingecko".into(),
+            coingecko_base_url: "https://api.coingecko.com".into(),
+            http_client: reqwest::Client::new(),
+            coin_quote_tx,
+            coin_candle_tx,
+        };
+        let server = TestServer::new(crate::api::build_api_router(state));
+
+        let resp = server
+            .get(&format!("/v1/coins/{coin}/candles"))
+            .add_query_param("interval", "4h")
+            .add_query_param("vs_currency", "usd")
+            .add_query_param("limit", "1")
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["items"].as_array().unwrap().is_empty(),
+            "every fetched bucket is gap-dropped → this page is empty"
+        );
+        assert!(
+            body["next_cursor"].is_string(),
+            "a cap-hit gap-dropped page must continue via a source-bucket cursor, not terminate \
+             with next_cursor: null (REQ-API-406); got {body}"
+        );
+
+        m4_teardown(&pool, &coin).await;
     }
 }
