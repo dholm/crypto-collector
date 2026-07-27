@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::collectors::collection_queue::ENQUEUE_QUEUE_SQL;
 use crate::config;
+use crate::pacer::AcquireSlotError;
+use crate::providers::ProviderError;
 
 use super::{
     cursor::{decode_keyset_cursor, encode_keyset_cursor, validate_limit, CoinListKey},
@@ -168,6 +170,18 @@ pub async fn search_coins(
 
     let items = match provider.search_coins(&q, cap).await {
         Ok(coins) => coins,
+        // F-34/D3 (REQ-API-411): a pacer cooldown / credit-exhaustion error means the provider
+        // is unavailable → 503 ServiceUnavailable, distinct from a genuine no-match (Ok(vec![])
+        // → 200-empty). Only this LOCKED set maps to 503; adjacent ProviderError variants stay
+        // degraded-to-empty (OR-API5-3: do not silently widen the LOCKED set).
+        Err(ProviderError::Pacer(
+            AcquireSlotError::Cooldown(..) | AcquireSlotError::CreditExhausted(..),
+        )) => {
+            return Err(ApiError::ServiceUnavailable(
+                "search provider is in cooldown or has exhausted its upstream credit; retry later"
+                    .into(),
+            ));
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
@@ -446,6 +460,146 @@ mod tests {
         let body: serde_json::Value = resp.json();
         assert_eq!(body["code"], "BAD_REQUEST");
         assert!(body["message"].is_string());
+    }
+
+    // ── SPEC-API-005 M3 (F-34, REQ-API-411): search 503 vs 200-empty ─────────────
+
+    // Minimal stub provider whose search_coins result is configurable, so search_coins can be
+    // exercised without a live upstream. Named "coingecko" to match AppState.search_provider.
+    enum SearchBehavior {
+        Cooldown,
+        CreditExhausted,
+        Empty,
+    }
+
+    struct SearchStubProvider {
+        behavior: SearchBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for SearchStubProvider {
+        fn name(&self) -> &str {
+            "coingecko"
+        }
+        fn supports(&self, _cap: crate::providers::Capability) -> bool {
+            true
+        }
+        async fn fetch_spot(
+            &self,
+            _m: &crate::providers::MarketQuery,
+        ) -> Result<crate::providers::SpotQuote, ProviderError> {
+            Err(ProviderError::NotSupported(
+                crate::providers::Capability::Spot,
+            ))
+        }
+        async fn fetch_ohlc(
+            &self,
+            _m: &crate::providers::MarketQuery,
+            _d: u32,
+            _i: i64,
+        ) -> Result<Vec<crate::providers::OhlcCandle>, ProviderError> {
+            Ok(vec![])
+        }
+        async fn fetch_coin_metadata(
+            &self,
+            _id: &str,
+        ) -> Result<crate::providers::CoinMeta, ProviderError> {
+            Err(ProviderError::NotSupported(
+                crate::providers::Capability::CoinMetadata,
+            ))
+        }
+        async fn fetch_coin_market(
+            &self,
+            _id: &str,
+            _vs: &str,
+        ) -> Result<crate::providers::CoinMarket, ProviderError> {
+            Err(ProviderError::NotSupported(
+                crate::providers::Capability::CoinMarket,
+            ))
+        }
+        async fn fetch_derivatives(
+            &self,
+            _m: &crate::providers::MarketQuery,
+        ) -> Result<crate::providers::DerivTick, ProviderError> {
+            Err(ProviderError::NotSupported(
+                crate::providers::Capability::Derivatives,
+            ))
+        }
+        async fn search_coins(
+            &self,
+            _q: &str,
+            _cap: usize,
+        ) -> Result<Vec<crate::providers::CoinSearchResult>, ProviderError> {
+            match self.behavior {
+                SearchBehavior::Cooldown => Err(ProviderError::Pacer(AcquireSlotError::Cooldown(
+                    "coingecko".to_string(),
+                    chrono::Utc::now(),
+                ))),
+                SearchBehavior::CreditExhausted => Err(ProviderError::Pacer(
+                    AcquireSlotError::CreditExhausted("coingecko".to_string()),
+                )),
+                SearchBehavior::Empty => Ok(vec![]),
+            }
+        }
+        async fn fetch_coin_tickers(
+            &self,
+            _coin_id: &str,
+            _cap: usize,
+        ) -> Result<Vec<crate::providers::MarketSearchResult>, ProviderError> {
+            Ok(vec![])
+        }
+    }
+
+    fn search_stub_server(behavior: SearchBehavior) -> TestServer {
+        use crate::api::{build_api_router, AppState};
+        use std::sync::Arc;
+        use tokio::sync::broadcast;
+
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/crypto_collector_test")
+            .expect("lazy pool");
+        let (coin_quote_tx, _) = broadcast::channel(16);
+        let (coin_candle_tx, _) = broadcast::channel(16);
+        let state = AppState {
+            pool,
+            chain: Arc::new(vec![
+                Arc::new(SearchStubProvider { behavior }) as Arc<dyn crate::providers::Provider>
+            ]),
+            search_provider: "coingecko".to_string(),
+            coingecko_base_url: "https://api.coingecko.com".to_string(),
+            http_client: reqwest::Client::new(),
+            coin_quote_tx,
+            coin_candle_tx,
+        };
+        TestServer::new(build_api_router(state))
+    }
+
+    // AC-API-411: a pacer cooldown error → 503 ServiceUnavailable with the {code, message} body.
+    #[tokio::test]
+    async fn search_pacer_cooldown_returns_503() {
+        let server = search_stub_server(SearchBehavior::Cooldown);
+        let resp = server.get("/v1/coins/search?q=btc").await;
+        assert_eq!(resp.status_code(), 503);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["code"], "SERVICE_UNAVAILABLE");
+    }
+
+    // AC-API-411: a credit-exhaustion error (the other LOCKED variant) → 503.
+    #[tokio::test]
+    async fn search_credit_exhausted_returns_503() {
+        let server = search_stub_server(SearchBehavior::CreditExhausted);
+        let resp = server.get("/v1/coins/search?q=btc").await;
+        assert_eq!(resp.status_code(), 503);
+    }
+
+    // AC-API-411: a genuine empty result → 200 with an empty result set (not 503).
+    #[tokio::test]
+    async fn search_empty_result_returns_200_empty() {
+        let server = search_stub_server(SearchBehavior::Empty);
+        let resp = server.get("/v1/coins/search?q=nomatch").await;
+        assert_eq!(resp.status_code(), 200);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["items"].as_array().unwrap().len(), 0);
     }
 
     #[test]
