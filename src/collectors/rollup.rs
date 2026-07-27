@@ -155,73 +155,38 @@ pub fn backward_repair_window(
 /// `(coin_id, vs_currency, interval, ts)` conflict target, so parity and idempotency with the
 /// row-at-a-time path are unaffected.
 ///
-// @MX:ANCHOR: [AUTO] batched_upsert_candles native-wins collision contract — the
-//             `ON CONFLICT ... DO UPDATE ... WHERE coin_candles.source LIKE 'rollup:%'` guard
-//             upgrades ONLY a prior rollup row; a colliding native provider row is left
-//             byte-identical (the WHERE is false → the conflict is a no-op). Every write path
-//             (forward recompute, full backfill, backward repair) routes through here, so this
-//             is the single enforcement point of Decision D1.
+// @MX:ANCHOR: [AUTO] batched_upsert_candles native-wins collision contract — delegates to the
+//             shared `db::batched_upsert_coin_candles` with `CandleConflictPolicy::RollupGuarded`,
+//             which appends the `ON CONFLICT ... DO UPDATE ... WHERE coin_candles.source LIKE
+//             'rollup:%'` guard: a rollup writer upgrades ONLY a prior rollup row; a colliding
+//             native provider row is left byte-identical (the WHERE is false → the conflict is a
+//             no-op). Every rollup write path (forward recompute, full backfill, backward repair)
+//             routes through here, so this is the single enforcement point of Decision D1 for the
+//             rollup path. The generalized native-write callers (candles dispatch, backfill) pass
+//             `NativeOverwrite` instead — the two policies MUST NOT be conflated.
 // @MX:REASON: fan_in >= 3 (backfill/repair walk, incremental recompute, DB tests) AND a
 //             data-integrity invariant: a derived materializer MUST NOT overwrite genuine
-//             provider data. Removing the WHERE re-opens the F-07 native-row-destruction path.
-// @MX:SPEC: SPEC-CANDLE-002 REQ-CANDLE-052
-// @MX:NOTE: [AUTO] batched_upsert_candles — must not fork candles_agg.rs folding; must
-//           preserve volume null-propagation. The batch is a single UNNEST-based INSERT (one
-//           round trip, one tx) rather than N single-row upserts — do not revert to a per-row
-//           loop for historical backfill sizes (thousands of `1d` + hundreds of `1w` rows per
-//           coin). coin_candles is a plain table since migration 0020, so no partition-ensure
-//           step is needed for `ts` values outside any static range.
+//             provider data. Passing `NativeOverwrite` here re-opens the F-07 native-row-destruction
+//             path.
+// @MX:SPEC: SPEC-CANDLE-002 REQ-CANDLE-052 SPEC-REFACTOR-001 REQ-REFACTOR-040 REQ-REFACTOR-041
+// @MX:NOTE: [AUTO] batched_upsert_candles — thin rollup-policy wrapper over the shared UNNEST
+//           batcher (REQ-REFACTOR-040). Rollup writes are silent (no pg_notify) — a rollup
+//           refresh must not broadcast. Must not fork candles_agg.rs folding; must preserve
+//           volume null-propagation. Do not revert to a per-row loop for historical backfill
+//           sizes (thousands of `1d` + hundreds of `1w` rows per coin). coin_candles is a plain
+//           table since migration 0020, so no partition-ensure step is needed.
 // @MX:SPEC: SPEC-CANDLE-001 REQ-CANDLE-013 REQ-CANDLE-040 REQ-CANDLE-043 SPEC-CANDLE-002 REQ-CANDLE-052
 pub async fn batched_upsert_candles(
     pool: &PgPool,
     candles: &[CoinCandle],
 ) -> Result<(), sqlx::Error> {
-    if candles.is_empty() {
-        return Ok(());
-    }
-
-    let coin_ids: Vec<&str> = candles.iter().map(|c| c.coin_id.as_str()).collect();
-    let vs_currencies: Vec<&str> = candles.iter().map(|c| c.vs_currency.as_str()).collect();
-    let intervals: Vec<&str> = candles.iter().map(|c| c.interval.as_str()).collect();
-    let tss: Vec<DateTime<Utc>> = candles.iter().map(|c| c.ts).collect();
-    let opens: Vec<rust_decimal::Decimal> = candles.iter().map(|c| c.open).collect();
-    let highs: Vec<rust_decimal::Decimal> = candles.iter().map(|c| c.high).collect();
-    let lows: Vec<rust_decimal::Decimal> = candles.iter().map(|c| c.low).collect();
-    let closes: Vec<rust_decimal::Decimal> = candles.iter().map(|c| c.close).collect();
-    let volumes: Vec<Option<rust_decimal::Decimal>> = candles.iter().map(|c| c.volume).collect();
-    let sources: Vec<&str> = candles.iter().map(|c| c.source.as_str()).collect();
-
-    sqlx::query(
-        "INSERT INTO coin_candles \
-            (coin_id, vs_currency, interval, ts, open, high, low, close, volume, source) \
-         SELECT * FROM UNNEST( \
-            $1::text[], $2::text[], $3::text[], $4::timestamptz[], \
-            $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], \
-            $9::numeric[], $10::text[] \
-         ) \
-         ON CONFLICT (coin_id, vs_currency, interval, ts) DO UPDATE SET \
-            open   = EXCLUDED.open, \
-            high   = EXCLUDED.high, \
-            low    = EXCLUDED.low, \
-            close  = EXCLUDED.close, \
-            volume = EXCLUDED.volume, \
-            source = EXCLUDED.source \
-         WHERE coin_candles.source LIKE 'rollup:%'",
+    crate::db::batched_upsert_coin_candles(
+        pool,
+        candles,
+        crate::db::CandleConflictPolicy::RollupGuarded,
+        crate::db::CandleNotifyPolicy::Silent,
     )
-    .bind(&coin_ids)
-    .bind(&vs_currencies)
-    .bind(&intervals)
-    .bind(&tss)
-    .bind(&opens)
-    .bind(&highs)
-    .bind(&lows)
-    .bind(&closes)
-    .bind(&volumes)
-    .bind(&sources)
-    .execute(pool)
-    .await?;
-
-    Ok(())
+    .await
 }
 
 // ── DB orchestration ───────────────────────────────────────────────────────────────────────

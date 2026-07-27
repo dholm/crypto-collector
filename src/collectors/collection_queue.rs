@@ -33,9 +33,7 @@ use crate::collectors::lease_worker::{
     run_lease_worker, HeartbeatStep, LeaseCycleOutcome, LeaseFut, LeaseItem,
 };
 use crate::collectors::retry::DispatchError;
-use crate::db::upserts::{
-    upsert_coin_candle, upsert_coin_market_snapshot, upsert_coin_metadata, upsert_coin_quote,
-};
+use crate::db::upserts::{upsert_coin_market_snapshot, upsert_coin_metadata, upsert_coin_quote};
 use crate::models::quote::CoinCandle;
 use crate::pacer::{acquire_slot, AcquireSlotError};
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
@@ -463,8 +461,13 @@ async fn dispatch_item(
             .record(fetch_dur);
             let candles = candles_result.map_err(|e| DispatchError::Transient(e.to_string()))?;
 
-            for c in &candles {
-                let candle = CoinCandle {
+            // SPEC-REFACTOR-001 M4 (F-52): route the candle-dispatch page through the shared
+            // batched UNNEST upsert instead of a per-row loop. This is the LIVE path, so it keeps
+            // per-event pg_notify (CandleNotifyPolicy::PerEvent, REQ-REFACTOR-042 — unchanged) and
+            // the unconditional native DO UPDATE (CandleConflictPolicy::NativeOverwrite, D1).
+            let batch: Vec<CoinCandle> = candles
+                .iter()
+                .map(|c| CoinCandle {
                     coin_id: coin_id.clone(),
                     vs_currency: c.vs_currency.clone(),
                     interval: c.interval.clone(),
@@ -475,21 +478,30 @@ async fn dispatch_item(
                     close: c.close,
                     volume: c.volume,
                     source: c.source.clone(),
-                };
-                match upsert_coin_candle(pool, &candle).await {
-                    Ok(()) => {
+                })
+                .collect();
+            match crate::db::batched_upsert_coin_candles(
+                pool,
+                &batch,
+                crate::db::CandleConflictPolicy::NativeOverwrite,
+                crate::db::CandleNotifyPolicy::PerEvent,
+            )
+            .await
+            {
+                Ok(()) => {
+                    if !batch.is_empty() {
                         if let Some(reg) = registry {
                             reg.record_upsert_success();
                         }
                     }
-                    Err(e) => {
-                        // REQ-ALARM-042: O(1) in-memory registry poke only, never a
-                        // network call — the reconciler derives db-upsert-failures.
-                        if let Some(reg) = registry {
-                            reg.record_upsert_failure();
-                        }
-                        return Err(DispatchError::Transient(e.to_string()));
+                }
+                Err(e) => {
+                    // REQ-ALARM-042: O(1) in-memory registry poke only, never a
+                    // network call — the reconciler derives db-upsert-failures.
+                    if let Some(reg) = registry {
+                        reg.record_upsert_failure();
                     }
+                    return Err(DispatchError::Transient(e.to_string()));
                 }
             }
 

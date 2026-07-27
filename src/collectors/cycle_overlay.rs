@@ -403,36 +403,73 @@ pub async fn recompute_cycle_overlay(
         .execute(&mut *tx)
         .await?;
 
+    // SPEC-REFACTOR-001 M4 (F-52, REQ-REFACTOR-043): each model group is inserted as ONE
+    // UNNEST-based INSERT inside this SAME single DELETE+INSERT transaction — the transaction
+    // boundary is unchanged (still one `pool.begin()` .. `tx.commit()` per call). The two scalar
+    // columns (coin_id, vs_currency) and the group tag (projection_model) are bound once each and
+    // projected as constants; the 11 per-point columns are bound as parallel arrays. Row values
+    // are byte-identical to the prior per-row INSERT, so the idempotent-rebuild parity holds.
     for (model, group) in [
         ("real", &points),
         ("replay", &replay),
         ("composite", &composite),
     ] {
-        for p in group {
-            sqlx::query(
-                "INSERT INTO cycle_overlay_points \
-                    (coin_id, vs_currency, cycle_number, halving_date, days_since_halving, \
-                     ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate, \
-                     projected, price_low, price_high, projection_model) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-            )
-            .bind(coin_id)
-            .bind(vs_currency)
-            .bind(p.cycle_number)
-            .bind(p.halving_date)
-            .bind(p.days_since_halving as i32)
-            .bind(p.ts)
-            .bind(p.price)
-            .bind(p.norm_halving)
-            .bind(p.norm_cycle_low)
-            .bind(p.halving_baseline_approximate)
-            .bind(p.projected)
-            .bind(p.price_low)
-            .bind(p.price_high)
-            .bind(model)
-            .execute(&mut *tx)
-            .await?;
+        if group.is_empty() {
+            continue;
         }
+
+        let cycle_numbers: Vec<i32> = group.iter().map(|p| p.cycle_number).collect();
+        let halving_dates: Vec<NaiveDate> = group.iter().map(|p| p.halving_date).collect();
+        let days_since: Vec<i32> = group.iter().map(|p| p.days_since_halving as i32).collect();
+        let tss: Vec<NaiveDate> = group.iter().map(|p| p.ts).collect();
+        let prices: Vec<Decimal> = group.iter().map(|p| p.price).collect();
+        let norm_halvings: Vec<Decimal> = group.iter().map(|p| p.norm_halving).collect();
+        let norm_cycle_lows: Vec<Decimal> = group.iter().map(|p| p.norm_cycle_low).collect();
+        let baseline_approx: Vec<bool> = group
+            .iter()
+            .map(|p| p.halving_baseline_approximate)
+            .collect();
+        let projecteds: Vec<bool> = group.iter().map(|p| p.projected).collect();
+        let price_lows: Vec<Option<Decimal>> = group.iter().map(|p| p.price_low).collect();
+        let price_highs: Vec<Option<Decimal>> = group.iter().map(|p| p.price_high).collect();
+
+        sqlx::query(
+            "INSERT INTO cycle_overlay_points \
+                (coin_id, vs_currency, cycle_number, halving_date, days_since_halving, \
+                 ts, price, norm_halving, norm_cycle_low, halving_baseline_approximate, \
+                 projected, price_low, price_high, projection_model) \
+             SELECT \
+                $1, $2, \
+                u.cycle_number, u.halving_date, u.days_since_halving, u.ts, u.price, \
+                u.norm_halving, u.norm_cycle_low, u.halving_baseline_approximate, \
+                u.projected, u.price_low, u.price_high, \
+                $14 \
+             FROM UNNEST( \
+                $3::int[], $4::date[], $5::int[], $6::date[], $7::numeric[], \
+                $8::numeric[], $9::numeric[], $10::bool[], $11::bool[], \
+                $12::numeric[], $13::numeric[] \
+             ) AS u( \
+                cycle_number, halving_date, days_since_halving, ts, price, \
+                norm_halving, norm_cycle_low, halving_baseline_approximate, \
+                projected, price_low, price_high \
+             )",
+        )
+        .bind(coin_id)
+        .bind(vs_currency)
+        .bind(&cycle_numbers)
+        .bind(&halving_dates)
+        .bind(&days_since)
+        .bind(&tss)
+        .bind(&prices)
+        .bind(&norm_halvings)
+        .bind(&norm_cycle_lows)
+        .bind(&baseline_approx)
+        .bind(&projecteds)
+        .bind(&price_lows)
+        .bind(&price_highs)
+        .bind(model)
+        .execute(&mut *tx)
+        .await?;
     }
 
     tx.commit().await?;

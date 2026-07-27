@@ -39,7 +39,6 @@ use crate::collectors::lease_worker::{
     run_lease_worker, HeartbeatStep, LeaseCycleOutcome, LeaseFut, LeaseItem,
 };
 use crate::collectors::retry::DispatchError;
-use crate::db::upserts::upsert_coin_candle;
 use crate::pacer::acquire_slot;
 use crate::providers::{Capability, MarketQuery, OhlcCandle, Provider, ProviderError};
 
@@ -798,9 +797,15 @@ async fn process_chunk(
         (None, None) => candles,
     };
 
-    // Idempotent upsert into coin_candles (REQ-SCHED-040).
-    for c in &filtered {
-        let coin_candle = crate::models::quote::CoinCandle {
+    // Idempotent upsert into coin_candles (REQ-SCHED-040). SPEC-REFACTOR-001 M4 (F-52): route the
+    // page through the shared batched UNNEST upsert instead of a per-row loop.
+    // [INTENDED CHANGE (b)] Backfill writes historical rows, so this path is SILENT — NO
+    // pg_notify (CandleNotifyPolicy::Silent, REQ-REFACTOR-042), so backfilled history never floods
+    // the WebSocket broadcast. Native provider rows use the unconditional DO UPDATE
+    // (CandleConflictPolicy::NativeOverwrite, D1 native path — no rollup:% guard).
+    let batch: Vec<crate::models::quote::CoinCandle> = filtered
+        .iter()
+        .map(|c| crate::models::quote::CoinCandle {
             coin_id: chunk.coin_id.clone(),
             vs_currency: c.vs_currency.clone(),
             interval: c.interval.clone(),
@@ -811,21 +816,30 @@ async fn process_chunk(
             close: c.close,
             volume: c.volume,
             source: c.source.clone(),
-        };
-        match upsert_coin_candle(pool, &coin_candle).await {
-            Ok(()) => {
+        })
+        .collect();
+    match crate::db::batched_upsert_coin_candles(
+        pool,
+        &batch,
+        crate::db::CandleConflictPolicy::NativeOverwrite,
+        crate::db::CandleNotifyPolicy::Silent,
+    )
+    .await
+    {
+        Ok(()) => {
+            if !batch.is_empty() {
                 if let Some(reg) = registry {
                     reg.record_upsert_success();
                 }
             }
-            Err(e) => {
-                // REQ-ALARM-042: O(1) in-memory registry poke only, never a network
-                // call — the reconciler derives db-upsert-failures.
-                if let Some(reg) = registry {
-                    reg.record_upsert_failure();
-                }
-                return Err(DispatchError::Transient(e.to_string()));
+        }
+        Err(e) => {
+            // REQ-ALARM-042: O(1) in-memory registry poke only, never a network
+            // call — the reconciler derives db-upsert-failures.
+            if let Some(reg) = registry {
+                reg.record_upsert_failure();
             }
+            return Err(DispatchError::Transient(e.to_string()));
         }
     }
 
