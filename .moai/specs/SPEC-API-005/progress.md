@@ -137,7 +137,7 @@ m1_to_mN_commit_strategy: per-milestone (M1..M8, one commit each; direct-to-main
 
 ```yaml
 sync_complete_at: 2026-07-27
-sync_commit_sha: pending-backfill-sync-commit   # backfilled in a follow-up commit (self-referential-hazard workaround, D3)
+sync_commit_sha: 4730ce5   # backfilled post-sync (self-referential-hazard workaround, D3)
 sync_status: implemented-pending-db   # held at `implemented`; NOT advanced to `completed`
 frontmatter_status_transitions:
   spec_md: in-progress -> implemented
