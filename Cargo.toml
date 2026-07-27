@@ -77,4 +77,7 @@ uuid = { version = "1", features = ["v4"] }
 # HTTP mock server for provider tests (tokio-native, no real network required).
 wiremock = "0.6"
 # In-process axum router testing (SPEC-API-001 handler tests).
-axum-test = "21"
+# `ws` feature: WebSocket client testing (SPEC-API-005 F-36 handle_stream Close-terminates test).
+# It pulls only crates already in the tree (axum/ws, tokio/time, uuid, base64, tokio-tungstenite,
+# futures-util) — no new crate is added (D10).
+axum-test = { version = "21", features = ["ws"] }
