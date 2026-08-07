@@ -75,11 +75,11 @@ cargo test                                                 # unit tests
 ### Deployment Commands
 
 ```bash
-make push-aarch64   # cross-compile → build aarch64 image → push to registry.helles.farm
-make deploy         # push-aarch64 + kubectl rollout restart + wait (namespace: finance)
+make push           # lint+test → build both release binaries → multiarch image → push to registry.helles.farm
+make deploy         # push + kubectl rollout restart + wait (namespace: finance)
 ```
 
-Cross-compilation uses `cross`. Container engine prefers `docker`, falls back to `podman`. Exports `CROSS_CONTAINER_ENGINE` for cross-compilation on podman-only hosts.
+One multiarch image (`linux/amd64` + `linux/arm64`) is published under a single tag (`:latest`, override with `TAG=`). The amd64 binary is built natively with `cargo`; the arm64 binary with `cross` — the Dockerfile is COPY-only, so no QEMU is involved. Container engine prefers `docker`, falls back to `podman`. Exports `CROSS_CONTAINER_ENGINE` for cross-compilation on podman-only hosts.
 
 ### Integration Tests
 

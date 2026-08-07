@@ -1,8 +1,8 @@
 .DEFAULT_GOAL := help
-.PHONY: help build build-release check lint fmt fmt-check test image push build-aarch64 image-aarch64 push-aarch64 clean
+.PHONY: help build build-release check lint fmt fmt-check test image push rust-build rust-build-amd64 rust-build-arm64 clean
 
-IMAGE         ?= registry.helles.farm/crypto-collector:latest
-IMAGE_AARCH64 ?= registry.helles.farm/crypto-collector:aarch64
+TAG       ?= latest
+IMAGE     ?= registry.helles.farm/crypto-collector:$(TAG)
 
 # Deploy target (override for other clusters/namespaces).
 KUBECTL    ?= kubectl
@@ -12,7 +12,7 @@ ROLLOUT_TIMEOUT ?= 180s
 
 # Container engine: prefer docker, fall back to podman (this project standardises
 # on podman). `cross` reads CROSS_CONTAINER_ENGINE to pick its build container,
-# defaulting to docker; exporting it keeps `build-aarch64` working on podman-only
+# defaulting to docker; exporting it keeps `rust-build-arm64` working on podman-only
 # hosts without manual configuration.
 CONTAINER_ENGINE ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo podman)
 export CROSS_CONTAINER_ENGINE ?= $(CONTAINER_ENGINE)
@@ -55,27 +55,29 @@ upgrade: ## Upgrade crates
 test: ## Run unit tests
 	cargo test
 
+# ── Release binaries (one per target platform) ───────────────────────────────
+# Both binaries are compiled on the host so the image build stays COPY-only and
+# never needs QEMU.
+
+rust-build-amd64: ## Compile release binary for x86_64 (native, no `cross` needed)
+	cargo build --release --target x86_64-unknown-linux-gnu
+
+rust-build-arm64: ## Cross-compile release binary for aarch64 (requires `cross`)
+	cross build --release --target aarch64-unknown-linux-gnu
+
+rust-build: rust-build-amd64 rust-build-arm64 ## Compile release binaries for both platforms
+
 # ── Container image ──────────────────────────────────────────────────────────
 
-image: ## Build container image (native arch)
-	$(CONTAINER_ENGINE) build -f Dockerfile -t $(IMAGE) .
+image: ## Build multiarch image (linux/amd64 + linux/arm64) into a local manifest
+	$(CONTAINER_ENGINE) build --platform linux/amd64,linux/arm64 \
+		--manifest $(IMAGE) -f Dockerfile .
 
-push: image ## Build and push native image
-	$(CONTAINER_ENGINE) push $(IMAGE)
-
-# ── aarch64 cross-compilation ────────────────────────────────────────────────
-
-build-aarch64: ## Cross-compile binary for aarch64 (requires `cross`)
-	cross build --target aarch64-unknown-linux-gnu --release
-
-image-aarch64: build-aarch64 ## Build aarch64 container image using pre-compiled binary (no QEMU required)
-	$(CONTAINER_ENGINE) build -f Dockerfile.aarch64 -t $(IMAGE_AARCH64) .
-
-push-aarch64: image-aarch64 ## Build and push aarch64 image
-	$(CONTAINER_ENGINE) push $(IMAGE_AARCH64)
+push: lint test rust-build image ## Gated build of both arches, then push the multiarch manifest
+	$(CONTAINER_ENGINE) manifest push --all $(IMAGE) docker://$(IMAGE)
 
 .PHONY: deploy
-deploy: push-aarch64 ## Gated build+push, then rollout restart and wait (fail-fast)
+deploy: push ## Gated build+push, then rollout restart and wait (fail-fast)
 	$(KUBECTL) -n $(NAMESPACE) rollout restart deploy/$(DEPLOYMENT)
 	$(KUBECTL) -n $(NAMESPACE) rollout status deploy/$(DEPLOYMENT) --timeout=$(ROLLOUT_TIMEOUT)
 

@@ -1,13 +1,18 @@
 .git/
-# Exclude build artefacts, but keep the cross-built aarch64 release binary that
-# Dockerfile.aarch64 copies into the runtime image (use per-level descent so the
-# re-include is honoured; a bare `target/` would stop podman/docker descending).
+# Exclude build artefacts, but keep the pre-built release binaries that the
+# unified Dockerfile copies into the runtime image (use per-level descent so the
+# re-includes are honoured; a bare `target/` would stop podman/docker descending).
 target/*
 !target/aarch64-unknown-linux-gnu
 target/aarch64-unknown-linux-gnu/*
 !target/aarch64-unknown-linux-gnu/release
 target/aarch64-unknown-linux-gnu/release/*
 !target/aarch64-unknown-linux-gnu/release/crypto-collector
+!target/x86_64-unknown-linux-gnu
+target/x86_64-unknown-linux-gnu/*
+!target/x86_64-unknown-linux-gnu/release
+target/x86_64-unknown-linux-gnu/release/*
+!target/x86_64-unknown-linux-gnu/release/crypto-collector
 .moai/
 .claude/
 *.md

@@ -1,35 +1,34 @@
 # syntax=docker/dockerfile:1
-# ── Stage 1: build ───────────────────────────────────────────────────────────
-FROM rust:1-slim-bookworm AS builder
+# Unified multiarch image (linux/amd64 + linux/arm64), COPY-only — zero RUN
+# commands, so a `--platform linux/amd64,linux/arm64` build never needs QEMU.
+#
+# Both release binaries must be pre-compiled on the host first:
+#   target/x86_64-unknown-linux-gnu/release/crypto-collector   (cargo, native)
+#   target/aarch64-unknown-linux-gnu/release/crypto-collector  (cross)
+#
+# Run `make rust-build` before `make image`.
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+ARG TARGETARCH
 
-WORKDIR /build
+# ── Per-arch binary selection ────────────────────────────────────────────────
+FROM scratch AS binary-amd64
+COPY target/x86_64-unknown-linux-gnu/release/crypto-collector /crypto-collector
 
-# Cache dependency layer — only rebuilds when Cargo.toml/Cargo.lock change.
-# The crate declares both a [lib] (src/lib.rs) and a [[bin]] (src/main.rs), so the
-# stub must provide both files or `cargo build` errors on the missing lib target.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs && touch src/lib.rs && \
-    cargo build --release && \
-    rm -f target/release/deps/crypto_collector* target/release/deps/crypto-collector* \
-          target/release/deps/libcrypto_collector*
+FROM scratch AS binary-arm64
+COPY target/aarch64-unknown-linux-gnu/release/crypto-collector /crypto-collector
 
-# Build the real binary.
-COPY src ./src
-COPY migrations ./migrations
-RUN cargo build --release
+FROM binary-${TARGETARCH} AS binary
 
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
-# distroless cc ships glibc, libssl/openssl, and ca-certificates; the :nonroot
-# tag runs as uid/gid 65532 with no shell or package manager.
+# ── Runtime ──────────────────────────────────────────────────────────────────
+# distroless cc ships glibc, libssl/openssl, and ca-certificates. The uid/gid
+# below matches the Helm chart's enforced securityContext (runAsUser/runAsGroup
+# 10001 in charts/crypto-collector/templates/deployment.yaml).
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 
-COPY --from=builder /build/target/release/crypto-collector /usr/local/bin/crypto-collector
-COPY --from=builder /build/migrations /migrations
+COPY --from=binary /crypto-collector /usr/local/bin/crypto-collector
+COPY migrations /migrations
 
-USER nonroot
+USER 10001:10001
 
 # API port / health port / Prometheus metrics port
 EXPOSE 8080 8081 9000

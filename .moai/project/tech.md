@@ -202,14 +202,16 @@ Crypto Collector is built on a proven async Rust stack inherited and adapted fro
 - Rationale: Standard Rust package manager.
 
 **Dockerfile Strategy: Multi-Stage**
-- Stage 1: Build in container with full Rust toolchain.
-- Stage 2: Runtime container with binary only (minimal attack surface).
-- Base image: `rust:latest` for build, `debian:bookworm-slim` or `distroless` for runtime.
+- Release binaries for both platforms are compiled on the host, then copied into a
+  COPY-only (zero-RUN) Dockerfile, so a multiarch build needs no QEMU.
+- Runtime container carries the binary only (minimal attack surface).
+- Base image: `gcr.io/distroless/cc-debian13:nonroot` for runtime.
 
 **Cross-Compilation: cross crate**
-- Dockerfile.aarch64 uses `cross` for aarch64 (ARM64) cross-compilation.
-- Builds on x86_64, targets aarch64 architecture.
-- Rationale: Crypto Collector cluster is aarch64; supports `make push-aarch64` target.
+- `make rust-build-amd64` builds natively with `cargo`; `make rust-build-arm64` uses `cross`.
+- Builds on x86_64, targets both x86_64 and aarch64.
+- Rationale: Crypto Collector cluster is aarch64; `make push` publishes one
+  `linux/amd64,linux/arm64` manifest under a single tag.
 
 **Container Registry: registry.helles.farm**
 - Images tagged as `registry.helles.farm/crypto-collector:<version>`.

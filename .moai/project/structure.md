@@ -73,9 +73,8 @@ crypto-collector/
 │       │   ├── secret.yaml    # PostgreSQL credentials (injected by CI/CD)
 │       │   └── hpa.yaml       # Horizontal Pod Autoscaler (optional)
 │       └── _helpers.tpl
-├── Dockerfile                 # Linux x86_64 container image
-├── Dockerfile.aarch64         # aarch64 (ARM64) cross-compiled image
-├── Makefile                   # build, lint, test, image, push + aarch64 targets
+├── Dockerfile                 # Unified multiarch (amd64 + arm64) container image
+├── Makefile                   # build, lint, test, rust-build, image, push targets
 ├── .gitignore
 ├── .moai/                     # MoAI configuration
 ├── CLAUDE.md
@@ -168,13 +167,13 @@ These simplifications make Crypto Collector lighter and more suitable for contin
 - Includes: Deployment with resource requests/limits, Service, ConfigMap for config, Secret for DB credentials, optional HPA for auto-scaling.
 - Deployed to namespace `finance` on the aarch64 cluster.
 
-**`Dockerfile` and `Dockerfile.aarch64`**
-- Dockerfile: Multi-stage Linux x86_64 build.
-- Dockerfile.aarch64: Cross-compiled aarch64 (ARM64) build using `cross` crate + prebuilt-binary strategy.
-- Images pushed to `registry.helles.farm/crypto-collector:<version>`.
+**`Dockerfile`**
+- Single COPY-only (zero-RUN) Dockerfile serving both `linux/amd64` and `linux/arm64`
+  via the `binary-${TARGETARCH}` stage-selection pattern over host-prebuilt binaries.
+- One multiarch manifest pushed to `registry.helles.farm/crypto-collector:<tag>`.
 
 **`Makefile`**
-- Targets: `build` (cargo build), `lint` (clippy, rustfmt), `test` (cargo test), `image` (build Docker image), `push` (push to registry), `push-aarch64` (cross-compile and push).
+- Targets: `build` (cargo build), `lint` (clippy, rustfmt), `test` (cargo test), `rust-build` (release binaries for both platforms), `image` (build multiarch manifest), `push` (gated build + push the manifest).
 - User commits to `main`; CI/CD pipeline triggered, which runs Makefile targets and deploys Helm chart.
 
 ## Design Patterns
