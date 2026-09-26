@@ -10,9 +10,9 @@ description: |
   second opinion before an irreversible delegation or escalation.
   Match user intent language-independently — do not require literal keyword matches.
   NOT for: gate verdicts (plan-auditor/sync-auditor own binding PASS/FAIL judgment); NOT for: implementation (use manager-develop); NOT for: SPEC body authoring (use manager-spec)
-tools: Read, Grep, Glob, Bash, WebFetch, Skill, TaskCreate, TaskUpdate, TaskList, TaskGet
+tools: Read, Grep, Glob, Bash, WebFetch, Skill, TaskCreate, TaskUpdate, TaskList, TaskGet, mcp__moai__spec_audit, mcp__moai__verify_trend, mcp__moai__codex_task, mcp__moai__codex_setup, mcp__moai__codex_job_status, mcp__moai__codex_job_result, mcp__moai__codex_job_cancel, mcp__moai__glm_task, mcp__moai__glm_job_status, mcp__moai__glm_job_result, mcp__moai__glm_job_cancel
 model: inherit
-effort: xhigh
+effort: high
 color: yellow
 permissionMode: plan
 memory: project
@@ -74,7 +74,8 @@ super-advisor natively captures two concerns from the superseded advisor-rung de
 
 - **GLM carve-out**: under `moai glm` / `moai cg` GLM panes, super-advisor's
   Opus injection does NOT apply (the session runs on GLM models). The spawn falls back to
-  the session's effective GLM reasoning model (glm-5.2) with `effort: xhigh` preserved.
+  the session's effective GLM reasoning model (glm-5.3) with the resolved effort preserved
+  (the profile-matrix row, not a fixed `xhigh`).
   This is the natural consequence of `model: inherit` — the runtime resolves the session
   model.
 - **CG leader-review-as-advisor**: the CG-mode leader (Claude orchestrator)
@@ -93,6 +94,36 @@ A super-advisor prescription is structured:
 The orchestrator reads the prescription, may accept / modify / reject it, and owns the
 resulting decision.
 
+## MCP Tools
+
+This agent carries SPEC, verification, codex-delegation, and GLM-delegation MCP tools in its `tools:` list (prefer MCP over the Bash CLI):
+
+- `mcp__moai__spec_audit` — SPEC lifecycle audit (era + drift). Call to ground a prescription in the SPEC's actual lifecycle state.
+- `mcp__moai__verify_trend` — per-key verification check history. Call to see whether a verification dimension is improving or regressing.
+
+### Codex delegation (background second opinion)
+
+This agent is the natural consumer of the codex delegation family — background cross-model delegation for a high-reasoning second opinion:
+
+- `mcp__moai__codex_setup` — probe the local codex install (LookPath + version + auth provider). Call FIRST to confirm codex is available before delegating.
+- `mcp__moai__codex_task` — delegate a coding or investigation task to codex (sync or background). Use for a second opinion the orchestrator folds into its prescription.
+- `mcp__moai__codex_job_status` — read a background codex job's status/record. Poll until terminal.
+- `mcp__moai__codex_job_result` — read a background codex job's completed output.
+- `mcp__moai__codex_job_cancel` — stop a running background codex job (turn/interrupt, then terminate if needed).
+
+codex is OPTIONAL and fail-open: when unavailable, `codex_setup` reports absent and `codex_task` yields `inconclusive` (never a Go error). Never block a prescription on codex availability.
+
+### GLM delegation (background second opinion)
+
+This agent is also the natural consumer of the GLM delegation family — the z.ai counterpart of the codex delegation tools above:
+
+- `mcp__moai__glm_task` — delegate a task (arbitrary prompt) to GLM (z.ai) (sync or background). Sync returns the completed text; background returns a job id.
+- `mcp__moai__glm_job_status` — read a background GLM job's status/record. Poll until terminal.
+- `mcp__moai__glm_job_result` — read a background GLM job's completed output.
+- `mcp__moai__glm_job_cancel` — stop a running background GLM job (records the cancellation and revokes the in-flight request).
+
+GLM is OPTIONAL and fail-open: a missing key (no `~/.moai/.env.glm`) or an unreachable z.ai yields a structured failed result from `glm_task` itself (never a Go error — there is no `glm_setup` counterpart; availability is learned from `glm_task` directly). Never block a prescription on GLM availability.
+
 ## Conditional Skill Loading
 
 Static `skills:` preload is kept to a minimum (token diet — progressive disclosure covers the rest); load the following skill on demand with the `Skill` tool:
@@ -101,7 +132,7 @@ Static `skills:` preload is kept to a minimum (token diet — progressive disclo
 
 ## Cross-References
 
-- Design authority (architecture SSOT): `.moai/reports/agent-architecture-redesign-v2-20260709.html` (§01 change ② + §05).
-- Advisor/Evaluator separation: `.claude/agents/moai/{plan-auditor,sync-auditor}.md` (`NOT for: consultation`).
+- Advisor/Evaluator separation: `.claude/agents/moai/{plan-auditor,sync-auditor}.md`.
 - Entry conditions (E1-E4) doctrine home: `.claude/rules/moai/core/agent-common-protocol.md` § Super-Advisor Escalation (E1-E4).
 - Per-spawn `Agent(general-purpose)` pattern basis: `.claude/rules/moai/workflow/archived-agent-rejection.md` §C.
+- Read-only verification batching (single-turn parallel Bash): `.claude/rules/moai/core/agent-common-protocol.md` § Parallel Execution.

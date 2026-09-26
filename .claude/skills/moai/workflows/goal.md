@@ -19,6 +19,38 @@ shared file). A turn ceiling (default 30) bounds the loop. At the ceiling, the
 evaluator emits a 5-section verdict (Claim / Evidence / Baseline-attribution /
 Gaps / Residual-risk) and stops blocking.
 
+### The runtime block cap bounds the loop before the turn ceiling does
+
+The turn ceiling is not the only bound, and on an unattended run it is usually
+not the binding one. `stop-goal` is a Stop hook, so it is subject to the runtime's
+**consecutive-block cap** — after that many consecutive Stop-hook blocks the
+runtime overrides the block and ends the turn regardless of what the hook decided.
+The cap defaults to 8 and is tunable via `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`
+(`.claude/rules/moai/core/hooks-system.md` § Stop Hook Block Cap).
+
+Two consequences follow, and both matter when authoring a goal:
+
+- **The effective bound is `min(ceiling, block cap)` for consecutive blocks.** With
+  the defaults (ceiling 30, cap 8), an unattended run that blocks every turn stops
+  at the cap — the remaining ceiling turns are never reached.
+- **The ceiling-exit verdict is not guaranteed to be emitted.** The 5-section
+  verdict is emitted at the *ceiling*, so a run terminated by the cap ends without
+  it. Do not treat "no verdict appeared" as "the goal converged".
+
+The counter is *consecutive*: a turn that ends without a block resets it. An
+interactive session where the user intervenes between turns can therefore reach a
+30-turn ceiling that an unattended `claude -p` run never will.
+
+Choose the bound deliberately rather than inheriting it. For a long unattended
+run that genuinely needs more than the cap's worth of iterations, raise
+`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` to at least the ceiling; otherwise set the
+ceiling at or below the cap so the ceiling is the bound that actually fires and
+the verdict is actually produced.
+
+#### Infinite goal (`--max-turns 0`) — SPEC-INFINITE-GOAL-001
+
+An infinite goal armed with `moai goal arm "<condition>" --max-turns 0 --max-duration <seconds>` (the wall-clock primary bound) is bounded only by the REAL bounds (wall-clock / cost / stagnation) — but the default `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=8` silently terminates it first. Raise `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` (e.g. to 200) when arming a `--max-turns 0` goal. The `moai cc` / `moai cg` launchers inject `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=200` automatically when an armed `--max-turns 0` goal exists at launch time; for an already-running session, set `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=200` in the env before arming so the runtime cap does not pre-empt the infinite loop.
+
 ## Verbs
 
 ### `/moai goal "<condition>"` — register + arm
@@ -80,6 +112,14 @@ progression-mode choice as a DISTINCT axis from the approve/decline decision.
 The selected mode is persisted in goal state as `progression_mode` (default
 `autonomous` when the user declines to choose).
 
+Because arming is arm-only — it records the condition but starts no work — the
+goal is always armed alongside a work-starting action, never in place of one.
+The resume-surface counterpart of this axis is
+`.claude/rules/moai/workflow/session-handoff.md` § Canonical Format (Block 5):
+Block 5's single primary action stays the work-starting command
+(`/moai run SPEC-X`), and the goal is armed alongside it once this gate has
+passed.
+
 ### Semi-autonomous checkpoint flow (the orchestrator bridge)
 
 When `progression_mode == "semi-autonomous"` and the goal is not yet satisfied
@@ -140,7 +180,7 @@ tight.
 
 ## Cross-references
 
-- `.claude/rules/moai/workflow/goal-directive.md` — native `/goal` semantics + the `/moai goal` PROGRAMMATIC counterpart row + Axis B.
+- `.claude/rules/moai/workflow/goal-directive.md` — the `/moai goal` doctrine: condition authoring, the proactive recommendation triggers, § Goal-Presentation Timing (the arm-only property and the Kickoff-gate timing), and § Native `/goal` Prohibition (why the pipeline emits no native `/goal`, plus the Axis B rationale and the runtime yield invariant).
 - `.claude/rules/moai/workflow/native-invocation-model.md` § Axis B — the HUMAN-ONLY automation justification.
-- `.claude/rules/moai/workflow/session-handoff.md` § Post-Paste /goal Follow-up Block — the post-paste native `/goal` is now an optional variant; Block 5 MAY carry `/moai goal "<condition>"`.
+- `.claude/rules/moai/workflow/session-handoff.md` § Canonical Format (Block 5) — the resume-surface counterpart: Block 5's single primary action stays the work-starting command, and its `Run:` line MAY carry `/moai goal "<condition>"` where the next SPEC declares a machine-verifiable end-state.
 - The goal-engine Go package and the `moai hook stop-goal` verb (implementation-owned; see the local project source tree).

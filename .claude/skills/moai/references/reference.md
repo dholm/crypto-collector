@@ -79,8 +79,8 @@ When team mode is enabled, use Agent Teams for persistent parallel coordination.
 
 Use Cases:
 
-- Plan Phase: Parallel research team (researcher + analyst + architect)
-- Run Phase: Parallel implementation team (backend-dev + frontend-dev + tester) with file ownership boundaries
+- Plan Phase: Parallel read-only exploration via the Explore subagent + per-spawn Agent(general-purpose) with domain instructions (the archived researcher/analyst/architect agents are retired)
+- Run Phase: Sequential implementation via manager-develop (write fan-out stays foreground-sequential; the archived backend-dev/frontend-dev/tester agents are retired) with file ownership boundaries
 - Debug Phase: Competing hypothesis investigation team
 
 Implementation:
@@ -144,10 +144,10 @@ Propagation Method:
 
 ### Plan Flags
 
-- --worktree: Create an isolated git worktree for the SPEC implementation
+- (retired) --worktree: plan no longer creates a workspace — enter one first with `moai cc -w <name>`
 - --branch: Create a feature branch for the SPEC (default branch naming: feature/SPEC-XXX)
 - --resume SPEC-XXX: Resume an interrupted plan session
-- --team: Force team-based exploration (researcher + analyst + architect)
+- --team: experimental — selects Agent Teams agent-team (re-allowed; constraints per `orchestration-mode-selection.md` §C.1). Parallel Agent(general-purpose) fan-out remains the default exploration pattern.
 
 ### Run Flags
 
@@ -226,4 +226,3 @@ Previous /moai:X-Y command format mapped to new /moai subcommand format:
 ---
 
 Version: 2.5.0
-Last Updated: 2026-02-22

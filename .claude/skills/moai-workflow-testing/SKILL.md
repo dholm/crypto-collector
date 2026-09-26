@@ -181,13 +181,12 @@ the [modules index](${CLAUDE_SKILL_DIR}/modules/INDEX.md), or jump to a stage:
 - moai-domain-backend: Backend testing patterns
 - moai-domain-frontend: Frontend UI testing
 - moai-foundation-core: SPEC system integration
-- moai-platform-supabase / moai-platform-vercel / moai-platform-firebase-auth: Platform-specific testing
+- moai-domain-database / moai-domain-frontend / moai-domain-backend: Platform-specific testing
 - moai-workflow-project: Project management workflows
 
 ---
 
 Status: Production Ready
-Last Updated: 2026-07-10
 Maintained by: MoAI-ADK Development Workflow Team
 Version: 2.5.0 (audit remediation: language-neutrality + module re-linking)
 

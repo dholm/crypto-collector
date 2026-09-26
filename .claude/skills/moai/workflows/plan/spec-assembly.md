@@ -66,7 +66,7 @@ Agent: manager-spec subagent
 
 Input: Approved plan from Phase 8, validated SPEC ID from Phase 9.
 
-File generation (all three files created simultaneously):
+File generation — **single writer, single-turn parallel Write**: `manager-spec` is the sole writer of every plan-phase artifact, and no second agent writes into `.moai/specs/SPEC-{ID}/` while it works. Within that single writer, issue one `Write` call per artifact in the SAME assistant turn (per `.claude/rules/moai/core/agent-common-protocol.md` § Parallel Execution) rather than one artifact per turn — the artifacts are independent files, so batching costs one turn instead of N. The artifact set is Tier-determined (Tier S = 2, Tier M = 3, Tier L = 5):
 
 - .moai/specs/SPEC-{ID}/spec.md
   - YAML frontmatter with **12 required fields** (canonical schema — see checklist below and `.claude/rules/moai/development/spec-frontmatter-schema.md` § Canonical 12 Required Fields)
@@ -88,7 +88,7 @@ Required 12 fields (canonical order):
 - [ ] `updated: YYYY-MM-DD` — ISO date (NEVER `updated_at`)
 - [ ] `author: <name>` — string, not empty
 - [ ] `priority: P1` — uppercase Pn style (P0|P1|P2|P3) or High|Medium|Low|Critical
-- [ ] `phase: "vX.Y.Z target"` — release phase string
+- [ ] `phase: "vX.Y.Z target"` — release or milestone target label. NEVER a lifecycle stage name (`plan`, `run`, `sync`, `mx`): the value names the release this SPEC is aimed at, not the stage you are standing in while writing it
 - [ ] `module: "path/to/module"` — affected module path
 - [ ] `lifecycle: spec-anchored` — enum: spec-anchored | spec-lite | exploratory
 - [ ] `tags: "tag1, tag2, ..."` — comma-separated string (NOT `labels:`, NOT YAML array)
@@ -105,7 +105,7 @@ Rejected legacy aliases (fail closed — do NOT accept):
 Pre-write gate behavior:
 1. manager-spec generates frontmatter draft in memory.
 2. manager-spec self-audits against the 12-field checklist above.
-3. If any required field is missing OR any rejected alias appears: manager-spec HALTS, reports the schema violation, and re-generates. It does NOT call Write.
+3. If any required field is missing OR any rejected alias appears OR a field carries a prohibited value — `phase:` holding a lifecycle token (`plan`, `run`, `sync`, `mx`) is the case that occurs in practice: manager-spec HALTS, reports the schema violation, and re-generates. It does NOT call Write.
 4. Phase 11 plan-auditor independently re-verifies the schema on the written file as a second line of defense.
 
 - .moai/specs/SPEC-{ID}/plan.md
@@ -169,6 +169,12 @@ Harness-level intensity (plan-audit ALWAYS runs — the level changes rigor, not
 - `minimal`: lightweight, non-blocking 1-iteration audit (`max_iterations: 1`, `require_must_pass: false`) — a FAIL verdict is logged but does not block Phase 12
 - `standard`/`thorough`: full retry loop up to 3 iterations, blocking (`max_iterations: 3`, `require_must_pass: true`)
 
+#### Parallel Review Lenses (read-only, conditional)
+
+**`FO-PLAN-2`.** **Where** the harness level is `standard` or `thorough`, the orchestrator shall gather review evidence by launching several read-only review lenses in a single turn — one `Agent()` per lens (frontmatter-schema conformance, requirement testability, scope coherence, acceptance-command validity), 3-5 concurrent per the fanout ceiling (`.claude/rules/moai/workflow/orchestration-mode-selection.md` §C.2) — instead of one serial reading pass. Every lens is read-only: it reads `.moai/specs/SPEC-{ID}/` and returns findings as text, writes no file, and never prompts the user (a lens missing a required input returns a structured blocker report per `.claude/rules/moai/core/agent-common-protocol.md` § Blocker Report Format, and the orchestrator re-delegates that lens alone). The orchestrator launches the lenses itself — this is scaling, not subagent nesting, so the flat agent hierarchy holds.
+
+**The lenses gather evidence; they do not produce the verdict.** The single binding PASS/FAIL stays with `plan-auditor` (Step 2.3.1 below), which may cite lens findings but is never replaced by them. **Where** the lens pass is skipped or unavailable, Phase 11 runs its existing single `plan-auditor` path unchanged — no error, no warning.
+
 #### Step 2.3.1: Invoke plan-auditor
 
 Agent: plan-auditor subagent
@@ -188,6 +194,28 @@ Extract the verdict line: `Verdict: PASS | FAIL`
 If verdict is PASS: proceed directly to Phase 12 (GitHub Issue Creation).
 
 Log: "SPEC review passed (iteration 1). Proceeding to Phase 12."
+
+#### Step 2.3.3a: Plan HTML Report Emission
+
+**After** the plan-auditor PASS verdict lands and **before** any further plan→run
+boundary work, the orchestrator emits a single self-contained plan HTML report
+that enriches the review surface for the Implementation Kickoff Approval gate.
+
+1. Execute the CLI verb: `moai plan render-html {SPEC-ID}` — the `moai` binary resolves `<root>/.moai/specs/{SPEC-ID}/` and the most recent `<root>/.moai/reports/plan-audit/{SPEC-ID}-review-{N}.md`, parses the review markdown (verdict / score / must-pass / defects) with fail-open, derives the 8-field autonomy contract deterministically from SPEC artifacts, and writes a self-contained report to `<root>/.moai/reports/plan-html/{SPEC-ID}-plan.html` (exit 0 on success; non-zero + stderr when the SPEC directory is absent). The renderer is fail-open on a missing or unparseable review file — the report is still written with the "audit verdict unavailable" placeholder and exit 0.
+2. Write the output to `.moai/reports/plan-html/{SPEC-ID}-plan.html` (gitignored directory; create it if absent).
+3. Surface the resulting HTML path to the orchestrator as additive prose context in the SAME turn the Implementation Kickoff Approval `AskUserQuestion` fires (see `orchestration-mode-selection.md` §E). The path is a pointer, NOT the report content — do NOT inline the HTML into the gate option text.
+
+[HARD] The Implementation Kickoff Approval `AskUserQuestion` gate stays MANDATORY
+and score-independent. The plan HTML report
+ENRICHES the review surface (inline prose → rich HTML); it does NOT replace the
+gate, does NOT auto-bypass it, and does NOT relax its three canonical options
+(run-phase entry / further review / abort) or the `(권장)` first-option label. A
+plan-auditor PASS or a high skip-eligible score does NOT substitute for the gate.
+This emission step is additive only (AP-4).
+
+Fail-open: if the renderer is unavailable or the review file is absent, the
+emission step is skipped silently — the plan-phase pipeline is NOT blocked. The
+plan HTML report is enrichment, not a gate.
 
 #### Step 2.3.4: FAIL Path — Retry Loop (max 3 iterations)
 
@@ -227,7 +255,7 @@ For `thorough` harness with `cross_validate_with_evaluator_active: true`: after 
 
 Purpose: Create a GitHub Issue linked to the SPEC document for bidirectional traceability between planning artifacts and issue tracker.
 
-[HARD] Per the late-branch opt-in policy, this phase MUST default to a silent skip. The flag semantics are now opt-in: `--issue` activates creation; the absence of `--issue` skips the entire phase. The legacy `--no-issue` opt-out is no longer required because skipping is the default. SPEC frontmatter MUST NOT carry an `issue_number` field for new SPECs (D2 — `issue_number` field-removal prospective only; existing SPECs retain the field per EXCL-LB-008).
+[HARD] Per the late-branch opt-in policy, this phase MUST default to a silent skip. The flag semantics are now opt-in: `--issue` activates creation; the absence of `--issue` skips the entire phase. The legacy `--no-issue` opt-out is no longer required because skipping is the default. SPEC frontmatter MUST NOT carry an `issue_number` field for new SPECs. The removal is prospective only — existing SPECs retain the field.
 
 Execution conditions (ALL must hold):
 - `--issue` flag IS set (explicit opt-in)
@@ -296,7 +324,6 @@ The SPEC ↔ Issue link enables:
 ### Phase 13: Git Environment Setup (Conditional)
 
 Execution conditions: Phase 10 completed successfully AND one of the following:
-- --worktree flag provided
 - --branch flag provided or user chose branch creation
 - Configuration permits branch creation (git_strategy settings)
 
@@ -314,65 +341,44 @@ Reference: see `.claude/agents/moai/manager-git.md` § Late-Branch Invocation Pa
 
 #### Phase 13: BODP Gate (공통)
 
-Both Worktree Path and Branch Path execute this gate immediately before delegating worktree/branch creation. Source: the CI-autonomy policy W7-T02.
+The Branch Path executes this gate immediately before delegating branch creation.
 
 Steps:
 
-1. **Relatedness Check** — Orchestrator calls `internal/bodp/Check()` with `CheckInput{CurrentBranch, NewSpecID, RepoRoot, EntryPoint}` (`EntryPlanBranch` for Branch Path; `EntryPlanWorktree` for Worktree Path). Result: `BODPDecision{SignalA, SignalB, SignalC, Recommended, Rationale, BaseBranch}`.
+1. **Relatedness Check** — the orchestrator runs the 3 signal checks itself (see `.claude/rules/moai/development/branch-origin-protocol.md` § Algorithm) and applies the 8-row decision matrix to get a recommended choice, a rationale, and a base branch.
 
 2. **AskUserQuestion Gate** — Orchestrator-only HARD (see `.claude/rules/moai/core/askuser-protocol.md`):
    - Preload: `ToolSearch(query: "select:AskUserQuestion")`.
    - Options (max 4, conversation_language=ko):
-     - First option: the recommended Choice with `(권장)` suffix; description = `BODPDecision.Rationale`.
+     - First option: the recommended Choice with `(권장)` suffix; description = the rationale from the matrix.
      - Remaining options: the other Choice values (e.g. when Recommended is `ChoiceMain`, present `ChoiceStacked` and `ChoiceContinue`).
    - The "Other" option is auto-appended by Claude Code.
    - User response yields the chosen Choice + base branch.
 
-3. **Audit Trail Write** — Call `internal/bodp.WriteDecision()` with EntryPoint matching the path (`EntryPlanBranch` or `EntryPlanWorktree`), `UserChoice` from the AskUserQuestion answer, and `ExecutedCmd` describing the upcoming git operation. Failure is non-fatal.
+3. **Delegation** — pass `base=<chosenBase>` to `manager-git`.
 
-4. **Path-Specific Delegation** — Branch Path: pass `base=<chosenBase>` parameter to `manager-git`. Worktree Path: invoke `moai worktree new <SPEC-ID> --base <chosenBase>` (or `--from-current` when chosenBase is `HEAD`).
+(The former audit-trail write is retired with the `internal/bodp` library — see branch-origin-protocol.md § Retired.)
 
 Out of Scope (BODP Gate):
 - "Other" free-form base interpretation: orchestrator parses input as a base branch name; invalid input falls back to `origin/main` with a warning.
-- Concurrent invocation safety: single-session orchestrator assumed (W7-R5 follow-up).
+- Concurrent invocation safety: a single-session orchestrator is assumed.
 
-#### Worktree Path (--worktree flag)
+#### Worktree Path — retired
 
-Prerequisite: SPEC files MUST be committed before worktree creation.
-- Run **Phase 13: BODP Gate** above (EntryPoint = `EntryPlanWorktree`).
-- Stage SPEC files: git add .moai/specs/SPEC-{ID}/
-- Create commit: feat(spec): Add SPEC-{ID} - {title}
-- Create worktree: `moai worktree new SPEC-{ID} --base <chosenBase>` (or `--from-current` when the user chose to continue on the current HEAD).
-- Display worktree path and navigation instructions
+`/moai plan --worktree` is retired along with `moai worktree new`. Plan no longer
+creates a workspace: entering one is the launcher's job, and doing it first is
+strictly simpler than having plan do it afterwards.
 
-##### Worktree-Anchored Resume Output [HARD]
+To plan inside an isolated workspace, enter it before invoking plan:
 
-When `--worktree` is used, the plan-phase output MUST include a paste-ready resume message with **Block 0 (cwd anchoring)** prepended before the standard 6-block structure. This anchors the user to start the next session inside the worktree, preventing main-cwd drift.
-
-Block 0 format (prepended before Block 1):
-
-```
-[New Terminal — START IN WORKTREE]
-$ cd <worktree-absolute-path>
-$ <session-launcher>            # claude | moai cc | moai cg | moai glm
-   └─ Claude Code session starts here (cwd = worktree)
+```bash
+moai cc -w <name>          # or: moai cc -w <name> --spawn  (teammate window)
+/moai plan "<description>"
 ```
 
-Block 4 (preconditions) MUST include `0)` as the first item:
+Plan then runs entirely inside that workspace, so no cwd-anchoring block is
+needed in the handoff — the next session re-enters with the same command.
 
-```
-0) git rev-parse --show-toplevel → <worktree-path> (★ critical pre-check)
-```
-
-Recommended session-launcher per execution mode:
-
-- `--team` → `tmux new-session -s moai-<spec> && moai cg` (teammate spawn via tmux split-window inherits worktree cwd + tmux session env)
-- single-session → `moai cc` (or `claude`) directly inside worktree
-- GLM-only → `moai glm`
-
-[HARD] Single-session corollary: If the user is NOT comfortable with multi-terminal/multi-session workflow, recommend converting to `--branch` next time. `--worktree` only realizes its isolation value when the user actually starts a separate session inside the worktree path. Forcing Block 0 onto a single-session user is friction without benefit.
-
-See `.claude/rules/moai/workflow/session-handoff.md` "Worktree-Anchored Resume Pattern" for the canonical Block 0 specification and lessons #14 for the failure-mode rationale.
 
 #### Branch Path (--branch flag or user choice)
 
@@ -490,17 +496,15 @@ When tmux is NOT available: AskUserQuestion with 1 option:
 - Option 1 (Recommended): Sub-agent Mode: Use sequential sub-agents for implementation. Tmux is not available for session isolation. (Agent Teams in-process mode retired.)
 
 **Step 4: Execute selected mode**
-- **Worktree mode**: Execute `moai worktree new SPEC-{ID} --tmux` to create worktree with tmux session. The tmux session will:
-  - CC mode: Create session, cd to worktree, run `/moai run SPEC-{ID}`
-  - GLM mode: Create session, inject GLM env, cd to worktree, run `/moai run SPEC-{ID}`
-  - CG mode: Create session, inject GLM env to session, clear GLM from settings.local.json, cd to worktree, run `/moai run SPEC-{ID}`
-  - Display: "Implementation started in tmux session: moai-{ProjectName}-{SPEC-ID}"
 - **Sub-agent mode**: Proceed to `/moai run SPEC-{ID} --solo`
+- **Isolated-workspace mode**: tell the user to enter a workspace and run there —
+  `moai cc -w <name>` in place, or `moai cg -w <name> --spawn` for a teammate
+  window that leaves this session running. Plan does not create the workspace.
 
 **Step 5: Gate result passing**
 - Pass the selected execution mode to the run workflow
-- If worktree mode: Run workflow executes in the tmux session (no further action needed from plan)
-- If team/sub-agent mode: Continue to run workflow in current session
+- If isolated-workspace mode: the run workflow executes in the session the user opened there
+- If sub-agent mode: continue to the run workflow in the current session
 
 ---
 
@@ -512,14 +516,13 @@ All of the following must be verified:
 - User approval obtained via AskUserQuestion before SPEC creation
 - Phase 10: All SPEC files created (spec.md, plan.md, acceptance.md, spec-compact.md)
 - Directory naming follows .moai/specs/SPEC-{ID}/ format
-- YAML frontmatter contains all 8 required fields (including issue_number)
+- YAML frontmatter contains all 12 required fields (issue_number excluded — optional)
 - GEARS structure is complete (EARS legacy form accepted for pre-v3 SPECs until 2026-11-22)
 - Exclusions section present with at least 1 entry
 - Delta markers applied for brownfield requirements (if applicable)
 - spec-compact.md auto-generated with requirements + acceptance criteria only
 - Phase 12: GitHub Issue created and linked (only when `--issue` opt-in flag is set; default skips Issue creation)
 - Phase 13: Appropriate git action taken based on flags and user choice
-- If --worktree: SPEC committed before worktree creation
 - Next steps presented to user
 - **Audit-ready signal**: Before transitioning to `/moai run`, append to `.moai/specs/SPEC-{ID}/progress.md`:
   ```

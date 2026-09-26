@@ -13,7 +13,8 @@ Git worktree provides isolated working directories per SPEC for parallel develop
 
 ```bash
 # Create parallel SPECs with separate worktrees
-/moai plan "login feature" "signup feature" --worktree
+moai cc -w parallel-specs
+/moai plan "login feature" "signup feature"
 ```
 
 Result: creates `project-worktrees` directory with SPEC-specific subdirectories.
@@ -46,7 +47,8 @@ Result: creates `project-worktrees` directory with SPEC-specific subdirectories.
 
 ```bash
 # Create multiple SPECs with worktrees
-/moai plan "backend API" "frontend UI" "database schema" --worktree
+moai cc -w tri-spec
+/moai plan "backend API" "frontend UI" "database schema"
 
 # Session 1 (backend API worktree)
 /moai run SPEC-001
@@ -58,8 +60,8 @@ Result: creates `project-worktrees` directory with SPEC-specific subdirectories.
 /moai run SPEC-003
 ```
 
-## Worktree Isolation Rules (Advisory — 2026-05-17 Policy)
+## Worktree Isolation Rules (Advisory Policy)
 
-Per user policy 2026-05-17, L2/L3 worktree usage is user opt-in. L1 `Agent(isolation: "worktree")` is Claude Code runtime autonomous — MoAI orchestrator does not mandate isolation.
+Per user policy, L2/L3 worktree usage is user opt-in. L1 `Agent(isolation: "worktree")` is Claude Code runtime autonomous — MoAI orchestrator does not mandate isolation.
 
 See [moai-workflow-worktree](../../moai-workflow-worktree/SKILL.md) for the canonical worktree management skill.

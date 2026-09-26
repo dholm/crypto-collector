@@ -3,24 +3,41 @@
   "mcpServers": {
     "context7": {
       "$comment": "Up-to-date documentation and code examples via Context7",
-      "command": "/bin/bash",
-      "args": ["-l", "-c", "exec npx -y @upstash/context7-mcp@latest"]
+      "args": [
+        "-l",
+        "-c",
+        "exec npx -y @upstash/context7-mcp@latest"
+      ],
+      "command": "/bin/bash"
     },
-    "sequential-thinking": {
-      "$comment": "Step-by-step reasoning for complex problems",
-      "command": "/bin/bash",
-      "args": ["-l", "-c", "exec npx -y @modelcontextprotocol/server-sequential-thinking"]
+    "moai": {
+      "args": [
+        "mcp-server"
+      ],
+      "command": "moai"
     },
     "moai-lsp": {
       "$comment": "LSP code intelligence via moai binary (goto definition, find references, hover, diagnostics, rename)",
+      "args": [
+        "mcp",
+        "lsp"
+      ],
       "command": "moai",
-      "args": ["mcp", "lsp"],
       "timeout": 30
+    },
+    "sequential-thinking": {
+      "$comment": "Step-by-step reasoning for complex problems",
+      "args": [
+        "-l",
+        "-c",
+        "exec npx -y @modelcontextprotocol/server-sequential-thinking"
+      ],
+      "command": "/bin/bash"
     }
   },
   "staggeredStartup": {
-    "enabled": true,
+    "connectionTimeout": 15000,
     "delayMs": 500,
-    "connectionTimeout": 15000
+    "enabled": true
   }
 }

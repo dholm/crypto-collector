@@ -11,7 +11,7 @@ MoAI's three-phase development workflow with token budget management.
 | Phase | Command | Agent | Token Budget | Purpose |
 |-------|---------|-------|--------------|---------|
 | Plan | /moai plan | manager-spec | 30K | Create SPEC document |
-| Run | /moai run | manager-develop (per quality.yaml development_mode; cycle_type=ddd / tdd / autofix) | 180K | DDD / TDD / autofix implementation |
+| Run | /moai run | manager-develop (per quality.yaml constitution.development_mode; cycle_type=ddd / tdd / autofix) | 180K | DDD / TDD / autofix implementation |
 | Sync | /moai sync | manager-docs | 40K | Documentation sync |
 
 Per the canonical agent catalog policy, the MoAI agent catalog consists of exactly 11 retained agents (`manager-spec`, `manager-develop`, `manager-docs`, `manager-git`, `manager-design`, `e2e-tester`, `plan-auditor`, `sync-auditor`, `builder-harness`, `super-advisor`, plus the Anthropic built-in `Explore` — per CLAUDE.md §4). 12 phantom and domain-expert agents (`manager-strategy`, `manager-quality`, `manager-brain`, `manager-project`, `claude-code-guide`, `researcher`, and the 6 `expert-*` agents) were archived offline during the catalog consolidation. For migration guidance and the per-archived-agent replacement pattern, see `.claude/rules/moai/workflow/archived-agent-rejection.md`.
@@ -40,7 +40,7 @@ The route governs the trigger vocabulary in § Phase Transitions below (commit/p
 | Step | Location | Command | Branch | PR strategy | Lifecycle event (trigger) |
 |------|----------|---------|--------|-------------|---------------------------|
 | 1 (plan) | main checkout | `/moai plan SPEC-XXX` | `plan/SPEC-XXX` | configured* | plan PR merged into main |
-| 2 (run)  | main checkout (default) OR L2 SPEC worktree (opt-in) | (opt-in) `moai worktree new SPEC-XXX --base origin/main` then `/moai run SPEC-XXX`; OR `/moai run SPEC-XXX` on `feat/SPEC-XXX` branch in main checkout | `feat/SPEC-XXX` | configured* | run PR merged into main |
+| 2 (run)  | main checkout (default) OR L2 SPEC worktree (opt-in) | (opt-in) `moai cc -w SPEC-XXX` then `/moai run SPEC-XXX` inside it; OR `/moai run SPEC-XXX` on `feat/SPEC-XXX` branch in main checkout | `feat/SPEC-XXX` | configured* | run PR merged into main |
 | 3 (sync) | same as Step 2 | `/moai sync SPEC-XXX` (same L2 worktree as Step 2 if L2 was used; otherwise same feature branch) | `sync/SPEC-XXX` (or `chore/SPEC-XXX-sync`) | configured* | sync PR merged into main |
 | 4 (cleanup) | host checkout (only if L2 was created) | `moai worktree done SPEC-XXX` | n/a | n/a | L2 worktree disposed |
 
@@ -104,7 +104,7 @@ Mode precedence (hard-coded):
 Auto-selection rules:
 
 - Harness `minimal` or `standard` → default mode = `autopilot`
-- Harness `thorough` → default mode = `autopilot` (the former `team` auto-select is retired with the Agent Teams static layer; a forced `--mode team` emits `MODE_TEAM_UNAVAILABLE` and falls back to `autopilot` with a `[mode-auto-downgrade]` info log).
+- Harness `thorough` → default mode = `autopilot` (the former `team` auto-select is retired; `team` is now an explicit-request experimental mode — a forced `--mode team` selects the Agent Teams layer per `orchestration-mode-selection.md` §C.1. The retired era emitted `MODE_TEAM_UNAVAILABLE` with an `autopilot` fallback and a `[mode-auto-downgrade]` info log — retained as genealogy).
 
 See `.claude/skills/moai/workflows/run.md` § Mode Dispatch for the per-skill dispatch rules.
 
@@ -140,6 +140,16 @@ The SPEC complexity classification taxonomy is referred to interchangeably as "T
 | S (Simple) | < 300 LOC | < 5 files | **2 files**: spec.md + plan.md (AC inline in spec.md §3) | 0.75 |
 | M (Medium) | 300 - 1000 LOC | 5 - 15 files | **3 files**: spec.md + plan.md + acceptance.md | 0.80 |
 | L (Large) | > 1000 LOC or constitutional | > 15 files | **5 files**: spec.md + plan.md + acceptance.md + design.md + research.md | 0.85 |
+
+REQ/AC budget: the tier also caps how many requirements and acceptance criteria a SPEC may carry.
+
+| Tier | Requirement ceiling | Acceptance-criterion ceiling |
+|------|---------------------|------------------------------|
+| S | 8 | 8 |
+| M | 16 | 16 |
+| L | 25 | 25 |
+
+The ceilings apply **independently** to the requirement count and to the acceptance-criterion count — never to their sum. A Tier M SPEC may therefore carry up to 16 requirements AND up to 16 acceptance criteria. Exceeding either ceiling is a signal to tier up or to split the SPEC, not to relax the budget: an over-budget SPEC is the same over-formalization failure the tier taxonomy exists to prevent, and it lands hardest on the plan-auditor, which must hold every requirement and criterion in view at once.
 
 Tier judgment: performed as a Socratic AskUserQuestion in `spec-assembly.md` (Tier judgment Socratic question). The LOC thresholds are guidance, not enforcement — the implementer's judgment supplements the question.
 
@@ -179,7 +189,7 @@ Output:
 
 ## Run Phase
 
-[SHOULD] When user has opted into L2/L3 worktree, execute in a fresh L2 SPEC worktree: `moai worktree new SPEC-XXX --base origin/main`; otherwise execute on the `feat/SPEC-XXX` branch in main checkout. See § SPEC Phase Discipline (Step 2). Per the opt-in policy, L2/L3 worktree is opt-in; default is main checkout + feature branch.
+[SHOULD] When the user has opted into a worktree, enter it with `moai cc -w SPEC-XXX` and execute there; otherwise execute on the `feat/SPEC-XXX` branch in the main checkout. See § SPEC Phase Discipline (Step 2). Worktree use is opt-in; the default is main checkout + feature branch.
 
 Implement specification using configured development methodology.
 
@@ -188,7 +198,7 @@ Token Strategy:
 - Selective file loading
 - Enables 70% larger implementations
 
-Development Methodology (configured in quality.yaml development_mode):
+Development Methodology (configured in quality.yaml constitution.development_mode):
 
 ### DDD Mode — ANALYZE-PRESERVE-IMPROVE
 
@@ -226,9 +236,9 @@ Before marking implementation complete: review full diff against SPEC acceptance
 
 After each methodology cycle, compare planned files against actual modifications. Warns at <= 30% drift. Triggers re-planning (Phase 14) above 30%.
 
-### Methodology delegation (team mode retired)
+### Methodology delegation (team mode experimental)
 
-The Agent Teams static layer is retired; the run-phase methodology (DDD/TDD) is applied by a single `manager-develop` sub-agent (Mode 5), with multi-domain research fanned out via Mode 4 (parallel read-only `Agent()`) where warranted. See § Agent Teams Variant — RETIRED. The native `moai cg` teammate runtime is unaffected.
+The run-phase methodology (DDD/TDD) is applied by a single `manager-develop` sub-agent (serial), with multi-domain research fanned out via fanout (parallel read-only `Agent()`) where warranted; the Agent Teams layer is an explicit-request experimental alternative (see § Agent Teams Variant). The native `moai cg` teammate runtime is unaffected.
 
 ### MX Tag Integration
 
@@ -308,34 +318,36 @@ Plan to Run:
 - Trigger (Route A): plan-phase artifacts committed + pushed to `main` AND SPEC document approved (annotation cycle completed, user confirmed "Proceed").
 - Trigger (Route B): Plan PR merged into main (squash) AND SPEC document approved (annotation cycle completed, user confirmed "Proceed").
 - Pre-condition: plan.md records `plan_complete_at` + `plan_status: audit-ready` in progress.md; on Route B the plan PR is additionally in MERGED state.
-- Action: Execute /clear, then `/moai run SPEC-XXX`. Route A runs directly on `main` in main checkout. Route B runs on `feat/SPEC-XXX` branch in main checkout (default); OR if the user opted into L2: `moai worktree new SPEC-XXX --base origin/main`, then `/moai run SPEC-XXX` inside the L2 worktree.
+- Action: Execute /clear, then `/moai run SPEC-XXX`. Route A runs directly on `main` in main checkout. Route B runs on `feat/SPEC-XXX` branch in main checkout (default); OR if the user opted into a worktree: `moai cc -w SPEC-XXX`, then `/moai run SPEC-XXX` inside it.
 - Gate: `/moai run` Phase 1 (Plan Audit Gate) executes automatically before any implementation.
   See "Phase 1: Plan Audit Gate" section below for details.
 - [ZONE:Evolvable] Plan Audit Gate skip policy (single authoritative contract):
   the orchestrator MAY skip Phase 1 re-execution and proceed directly to
-  Phase 1 **IF AND ONLY IF ALL FOUR** of the following hold for the most recent
+  Phase 1 **IF AND ONLY IF ALL THREE** of the following hold for the most recent
   plan-auditor verdict on the SPEC:
     1. **Verdict is `PASS`** (NOT FAIL, NOT INCONCLUSIVE, NOT BYPASSED).
-    2. **Overall score ≥ 0.90.**
+    2. **Overall score ≥ the SPEC's per-tier PASS threshold** — Tier S `0.75`,
+       Tier M `0.80`, Tier L `0.85` (matching § SPEC Complexity Tier). The flat
+       `≥ 0.90` predicate is RETIRED (SPEC-AUDIT-SNAPSHOT-001 A2): a SPEC whose
+       plan-phase audit verdict legitimately PASSED is skip-eligible by default.
+       The Go codification is `internal/runtime.SkipEligibleByScore(tier, score)`.
     3. **Artifact-hash unchanged** since that verdict — no plan-phase artifact
-       (spec.md / plan.md / acceptance.md / research.md / design.md) has been
-       modified since the audit that produced the verdict (equivalently on
-       Route B: no plan-PR commit has landed since that verdict). Note: the
-       mechanical hash subject is the `ComputeHash` 4-file plan-artifact set
-       (spec.md / plan.md / acceptance.md / tasks.md — see § Report
-       Persistence); research.md / design.md changes are a conservative input
-       to the manual skip judgment, not part of the mechanical plan-artifact
-       hash.
-    4. **Within 24h** — the verdict was produced no more than 24 hours ago.
-  If ANY of the four fails, Phase 1 re-executes (the gate is never disabled by
+       has been modified since the audit that produced the verdict (equivalently
+       on Route B: no plan-PR commit has landed since that verdict). The
+       mechanical hash subject is the `ComputeHash` plan-artifact set — see
+       § Report Persistence for the tier-conditional subject list.
+  If ANY of the three fails, Phase 1 re-executes (the gate is never disabled by
   harness level; see Gate Entry Condition below). When the skip is taken, the
-  skip decision AND the four satisfied conditions MUST be recorded in the
+  skip decision AND the three satisfied conditions MUST be recorded in the
   run-phase delegation prompt (Section A: Context) so downstream actors
   (manager-develop, auditors) can verify the skip rationale. This is the ONE
   authoritative skip contract — any other surface (e.g. the skill-layer
   `run/phase-execution.md`) MUST cite this contract rather than restating a
   divergent condition set. Origin: the workflow-optimization layer (redundant
-  audit re-execution removal), tightened to the 4-condition compound predicate.
+  audit re-execution removal). SPEC-AUDIT-SNAPSHOT-001 (A1+A2) retired the
+  prior 4th condition ("Within 24h") and aligned the 2nd condition to per-tier
+  PASS: the cache is now sticky (hash-only validity, no time bound) so a
+  legitimately-passed SPEC with unchanged artifacts stays skip-eligible.
   This skip is distinct from Implementation Kickoff Approval: skip-eligibility
   governs ONLY Phase 1 verdict re-execution — it NEVER auto-bypasses the
   plan-to-implement human gate (the mandatory blocking `AskUserQuestion` gate;
@@ -397,9 +409,9 @@ Two report streams coexist deliberately in `.moai/reports/plan-audit/`; they are
 - **plan-phase review stream** — `{SPEC-ID}-review-{N}.md`, iteration-based. Written by the plan-auditor during plan-phase adversarial review; iteration `N` follows the plan-auditor Retry Loop Contract (max 3). Consumed by the plan workflow's assembly/annotation cycle.
 - **run-gate stream** — `<SPEC-ID>-<YYYY-MM-DD>.md`, date-based. Written by the Phase 1 Plan Audit Gate (`internal/runtime/audit_report.go`). Every gate call persists a record here; multiple calls on the same day append to the same file. This date-file is the verdict **record surface** only — it is never the hash subject for skip-eligibility (see below).
 
-Skip-eligibility inputs (normative, matching the Go implementation): (a) the "most recent plan-auditor verdict" the run-gate consults is the plan-phase review stream's **final-iteration verdict**; (b) the artifact-hash check recomputes and compares the **plan-artifact hash** — `internal/runtime/audit_cache.go` `ComputeHash` hashes the SPEC directory's plan artifacts (spec.md / plan.md / acceptance.md / tasks.md) as whitespace-normalized SHA-256, with cache key = (specID, planArtifactHash); (c) the run-gate stream's date-file records the verdict but is not hashed.
+Skip-eligibility inputs (normative, matching the Go implementation): (a) the "most recent plan-auditor verdict" the run-gate consults is the plan-phase review stream's **final-iteration verdict**; (b) the artifact-hash check recomputes and compares the **plan-artifact hash** — `internal/runtime/audit_cache.go` `ComputeHash` hashes the SPEC directory's plan artifacts (the union subject set below) as whitespace-normalized SHA-256, with cache key = (specID, planArtifactHash); (c) the run-gate stream's date-file records the verdict but is not hashed.
 
-**Plan-artifact hash subject list (Go verbatim):** the 4-file hash subject set is `{spec.md, plan.md, acceptance.md, tasks.md}` — matching `internal/runtime/audit_cache.go` `planArtifactNames` verbatim. The `tasks.md` entry is a V3R4-era plan artifact name retained in the hash subject list for backward compatibility with grandfathered SPECs (V3R6 Tier L replaces it with design.md + research.md, which are NOT hash subjects). `design.md` and `research.md` are **manual-skip judgment inputs** — changes to them do NOT mechanically invalidate a cached skip verdict but MUST be considered by the orchestrator's manual skip decision alongside the 4-file hash.
+**Plan-artifact hash subject list (Go verbatim):** the hash subject set is the union `{acceptance.md, design.md, plan.md, research.md, spec.md, tasks.md}` — matching `internal/runtime/audit_cache.go` `planArtifactNames` verbatim. The set is tier-conditional by construction via the "skip if missing" rule in `ComputeHash`: a Tier S directory (spec.md, plan.md) hashes only those present; a Tier M directory adds acceptance.md; a Tier L directory contributes design.md AND research.md as mechanical subjects (SPEC-AUDIT-SNAPSHOT-001 A1 Tier L extension — changes to design.md/research.md NOW mechanically invalidate a cached skip verdict, replacing the former "manual judgment input" treatment); a grandfathered V3R4 directory carrying tasks.md retains it as a subject (K-2 backward compat).
 
 **Amendment as cache-invalidating event:** when a SPEC is amended in-place per the `completed → in-progress (amendment)` transition (completed → in-progress, `## Amendments` HISTORY row added), the plan-artifact hash changes because `spec.md` is modified — this is a cache-invalidating event that invalidates any cached plan-auditor PASS verdict for the SPEC, forcing Phase 1 plan-audit re-execution on the next `/moai run`. During the amendment transition, the SPEC remains V3R6 modern era (subject to drift detection) because frontmatter status is `in-progress` (not `completed`), so the `internal/spec/audit.go` completed-no-drift predicate does not fire.
 
@@ -426,21 +438,18 @@ Sync to Cleanup (Route B only):
 - Action (only if L2 worktree was created): `moai worktree done SPEC-XXX` (executed from host checkout, not from inside the worktree)
 - See § SPEC Phase Discipline (Step 4). Route A has no PR and no worktree cleanup step.
 
-## Agent Teams Variant — RETIRED
+## Agent Teams Variant — Re-allowed (experimental)
 
-The MoAI Agent Teams static-orchestration layer is RETIRED. Mode 3 (`agent-team`)
-of the Phase 4 catalog is a tombstone (`.claude/rules/moai/workflow/orchestration-mode-selection.md`
-§C.1), and the `--team` / `--mode team` dispatch value emits `MODE_TEAM_UNAVAILABLE`
-and falls back to sub-agent mode. The former team-mode plan/run/fix/review skill
-files and the `workflow.yaml` team-config block were removed.
+Agent Teams usage is ALLOWED as an experimental surface (operator decision): the flag `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` ships enabled in `.claude/settings.json` and the distributed template, and `agent-team` is selectable via an explicit `--team` / `--mode team` request (`.claude/rules/moai/workflow/orchestration-mode-selection.md` §C.1). The Phase 4 decision tree still never auto-selects it.
 
-The practical multi-agent surface is covered without the static team layer:
-- Multi-domain research/review → Mode 4 (parallel fan-out: 3-5 concurrent read-only `Agent()` in one turn).
-- Coding-heavy implementation → Mode 5 (sequential sub-agent) per Anthropic's coding-task parallelism caveat.
-- High-volume mechanical transformation → Mode 6 (workflow / dynamic-workflow fan-out).
+Genealogy: agent-team was previously RETIRED (tombstone; `--team` emitted `MODE_TEAM_UNAVAILABLE` and fell back to sub-agent mode; the former team-mode plan/run/fix/review skill files and the `workflow.yaml` team-config block were removed). The sentinel string is retained as documented history. Re-allow evidence: 5 named workers completed normally with result returns under the enabled flag.
 
-The native Claude Code teammate runtime is UNAFFECTED: `moai cg` GLM teammate
-panes, `worktree --team` P1-P4 launch, the `~/.claude/teams/` registry, and
+The default multi-agent surface remains:
+- Multi-domain research/review → fanout (parallel fan-out: 3-5 concurrent read-only `Agent()` in one turn — advisory band; hard bound is the runtime subagent cap, per orchestration-mode-selection.md §C.2).
+- Coding-heavy implementation → serial (sequential sub-agent) per Anthropic's coding-task parallelism caveat.
+- High-volume mechanical transformation → sweep (dynamic-workflow fan-out).
+
+The native Claude Code teammate runtime is UNAFFECTED and sanctioned: `moai cg` GLM teammate
+panes, `moai cc -w <name> --spawn` teammate windows, the `~/.claude/teams/` registry, and
 `teammateMode` launcher handling remain supported (see
-`.claude/rules/moai/core/glm-web-tooling.md` § CG Mode). Only MoAI's static
-team-orchestration layer built on top of that runtime is retired.
+`.claude/rules/moai/core/glm-web-tooling.md` § CG Mode).

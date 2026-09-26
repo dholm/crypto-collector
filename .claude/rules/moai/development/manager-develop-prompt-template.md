@@ -15,16 +15,16 @@ Per the canonical agent catalog policy, the `manager-develop` agent operates in 
 
 | cycle_type | Loop pattern | When to use | Iteration contract | Canonical reference |
 |------------|--------------|-------------|---------------------|---------------------|
-| `ddd` | ANALYZE-PRESERVE-IMPROVE | Existing codebases with minimal test coverage (< 10% per quality.yaml `development_mode: ddd` selection); characterization-test-first preservation of behavior | No fixed iteration limit; one cycle per logical refactoring chunk | `.claude/rules/moai/workflow/spec-workflow.md` § Run Phase DDD Mode |
-| `tdd` | RED-GREEN-REFACTOR | Default — all new development work, brownfield projects with pre-RED analysis (≥ 10% coverage per quality.yaml `development_mode: tdd` selection); test-first development | No fixed iteration limit; one cycle per behavior specification | `.claude/rules/moai/workflow/spec-workflow.md` § Run Phase TDD Mode |
-| `autofix` | **DIAGNOSE-PATCH-VERIFY** | CI auto-fix loop after `scripts/ci-watch/run.sh` detects a failing required check; semantic-failure-safe patching of lint / build / type errors | **Maximum 3 iterations** per PR push (per-PR-push counter, not per-session); escalation to `AskUserQuestion` after iteration 3 with no auto-resume timeout | `.claude/rules/moai/workflow/ci-autofix-protocol.md` |
+| `ddd` | ANALYZE-PRESERVE-IMPROVE | Existing codebases with minimal test coverage (< 10% per quality.yaml `constitution.development_mode: ddd` selection); characterization-test-first preservation of behavior | No fixed iteration limit; one cycle per logical refactoring chunk | `.claude/rules/moai/workflow/spec-workflow.md` § Run Phase DDD Mode |
+| `tdd` | RED-GREEN-REFACTOR | Default — all new development work, brownfield projects with pre-RED analysis (≥ 10% coverage per quality.yaml `constitution.development_mode: tdd` selection); test-first development | No fixed iteration limit; one cycle per behavior specification | `.claude/rules/moai/workflow/spec-workflow.md` § Run Phase TDD Mode |
+| `autofix` | **DIAGNOSE-PATCH-VERIFY** | CI auto-fix loop entered when the orchestrator hands off a failing required check; semantic-failure-safe patching of lint / build / type errors | **Maximum 3 iterations** per PR push (per-PR-push counter, not per-session); escalation to `AskUserQuestion` after iteration 3 with no auto-resume timeout | `.claude/rules/moai/workflow/ci-autofix-protocol.md` |
 
 ### cycle_type=autofix DIAGNOSE-PATCH-VERIFY pattern
 
 Each iteration of the autofix loop executes the three-step DIAGNOSE-PATCH-VERIFY pattern:
 
-1. **DIAGNOSE**: Read the failing CI check output (provided by the orchestrator from `scripts/ci-watch/run.sh`). Identify the root cause — lint rule violation, build error, type error, missing dependency, etc.
-2. **PATCH**: Apply a minimal fix that addresses the root cause without expanding scope. The autofix loop MUST NOT modify `.env`, `.env.*`, credentials files, secrets, or `scripts/ci-watch/run.sh` or any Wave 2 infrastructure scripts.
+1. **DIAGNOSE**: Read the failing CI check output (provided by the orchestrator in its handoff). Identify the root cause — lint rule violation, build error, type error, missing dependency, etc.
+2. **PATCH**: Apply a minimal fix that addresses the root cause without expanding scope. The autofix loop MUST NOT modify `.env`, `.env.*`, credentials files, secrets, or any CI watch infrastructure script or workflow definition.
 3. **VERIFY**: Re-run the failing check locally; if exit 0, push the patch as a new commit on the PR branch. If still failing, increment the iteration counter and repeat from DIAGNOSE.
 
 ### autofix escalation contract
@@ -145,6 +145,7 @@ go build ./...
 GOOS=windows GOARCH=amd64 go build ./...
 
 # 3. Measure the existing lint baseline (to distinguish NEW vs pre-existing)
+# Linter set + default timeout governed by root .golangci.yml; the --timeout=2m flag here overrides it for the quick-check budget.
 golangci-lint run --timeout=2m 2>&1 | tail -5
 
 # 4. Print the list of PRESERVE target files
@@ -166,6 +167,13 @@ Explicit list in each delegation prompt:
 ### Section E — Self-Verification Deliverables
 
 > Each E-item is reported per the verification-claim-integrity 5-section format (Claim / Evidence / Baseline-attribution / Gaps / Residual-risk) — see `.claude/rules/moai/core/verification-claim-integrity.md` §3.
+
+**Attribution discipline (the attributable diff-check pattern).** Each §E item (E1-E8) is a formal attributable artifact, not a self-report summary. For every item, the manager-develop MUST name, verbatim:
+- **(a) the command** — the exact invocation that produced the evidence (e.g. `go test ./internal/<pkg>/...`);
+- **(b) the observed output** — the verbatim result block the invocation produced in this run, against this tree (summarized evidence like "all tests passed" is NOT acceptable);
+- **(c) the baseline-attribution** — `(this run, this tree)` plus the HEAD SHA the evidence was captured against, so a later consumer can diff-check the attribution chain.
+
+This attribution triple is what the orchestrator's trust-but-verify batch diff-checks against the shared diagnostic snapshot (`.claude/rules/moai/core/agent-common-protocol.md` § Parallel Execution → attributable diff-check doctrinal switch; `.claude/rules/moai/workflow/verification-batch-pattern.md` → attributable diff-check pattern). A §E item missing any of (a)/(b)/(c) is reported as a Gap per VCI §3.4, never as a silent PASS.
 
 When manager-develop reports completion, it MUST include self-verification of the following items:
 
@@ -194,6 +202,7 @@ $ grep -rn 'AskUserQuestion' <pkg> | grep -v "_test.go" | grep -v "// "
 **E5. Lint Status (distinguish NEW vs baseline)**
 ```
 $ golangci-lint run --timeout=2m
+# Linter set + default timeout governed by root .golangci.yml; the --timeout=2m flag here overrides it for the quick-check budget.
 # On NEW issues, report explicitly; mark pre-existing baseline separately
 ```
 
@@ -203,6 +212,13 @@ $ golangci-lint run --timeout=2m
 
 **E7. Blocker Report (if any)**
 - When the delegation prompt did not specify a needed user decision, report it as a structured blocker (NEVER call AskUserQuestion)
+
+**E8. RED Failure Output (TDD only — verbatim pre-GREEN evidence)**
+```
+$ <test-runner command>   # captured BEFORE the implementation makes the test pass
+# verbatim failing-test output, e.g. "--- FAIL: TestX ... expected Y, got Z"
+```
+The verbatim RED failing-test output captured before GREEN MUST be shown. A run that skipped RED (test-after) has no such output to supply, so without this item the self-verification matrix is structurally incomplete — test-first is falsifiable via this item (a test-after run cannot produce pre-GREEN failing output).
 
 ## 2. Delegation Prompt Authoring Workflow (from the orchestrator's perspective)
 

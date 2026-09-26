@@ -40,7 +40,7 @@ Skill injection: at each `manager-docs` spawn the orchestrator injects `At start
 
 Phase Owners: `manager-docs` (sync-phase artifact authoring — CHANGELOG.md + README.md + docs-site + progress.md §F.3 + frontmatter `in-progress → implemented` transition for all SPEC artifacts; MUST NOT modify spec.md/plan.md/acceptance.md body content per `.claude/rules/moai/development/spec-frontmatter-schema.md` § Status Transition Ownership Matrix) + `manager-git` (PR creation per branching strategy when Tier L OR `--pr` flag per the canonical Tier-based PR routing policy).
 
-Sync-phase quality gate (per the canonical sync-phase quality gate policy) is enforced by the `.claude/hooks/moai/sync-phase-quality-gate.sh` Stop hook — lint + test + coverage delta verification + dependency manifest audit. The hook returns exit 2 to block sync completion on lint/test failure or coverage regression > 5pp. The hook replaces the prior pattern of spawning an inline quality agent for coverage and security analysis during sync (that agent is archived per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 2; the Stop hook is its canonical replacement).
+Sync-phase quality gate (per the canonical sync-phase quality gate policy) is enforced by the `.claude/hooks/moai/sync-phase-quality-gate.sh` Stop hook — lint + test + coverage delta verification + dependency manifest audit. The hook exits 0 always; in blocking mode (MOAI_SYNC_GATE_BLOCKING=1) it emits stdout JSON {"decision":"block"} on lint/test failure or coverage regression > 5pp. Per Claude Code hook semantics, stdout JSON is honored only on exit 0. The hook replaces the prior pattern of spawning an inline quality agent for coverage and security analysis during sync (that agent is archived per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 2; the Stop hook is its canonical replacement).
 
 ## Phase Routing Table
 
@@ -50,6 +50,25 @@ Sync-phase quality gate (per the canonical sync-phase quality gate policy) is en
 | Phase 7~Phase 10: Quality Verification | `Read workflows/sync/quality-gates-quality.md` | Phase 7 Quality Check, Phase 8 Security Scan, Phase 9 MX Tag Validation, Phase 10 Coverage Analysis |
 | Phase 11~Phase 12: Analysis + Doc Sync | `Read workflows/sync/doc-execution.md` | Phase 11 Analysis, HUMAN GATE 2 Documentation Scope, Phase 12 Execute Doc Synchronization |
 | Phase 13~Phase 14: Git Delivery + Completion | `Read workflows/sync/delivery.md` | Phase 13 Git Operations, Phase 14 Completion, GitStrategy PR-ready transition, Graceful Exit, Test Scenarios |
+
+## Fan-Out Index
+
+Every sync-phase fan-out site, listed here rather than only at the site itself. Three of the four live in sub-skills that are `Read` on demand, so without this index the orchestrator cannot know they exist until it has already entered the phase serially.
+
+| Fan-Out ID | Trigger condition | Target file | What is parallelised |
+|---|---|---|---|
+| `FO-SYNC-1` | the quality-evidence fan-out script is on disk AND the runtime supports dynamic workflows | `workflows/sync.md` (below) | Phase 7 quality check — four quality dimensions in one parallel read-only pass |
+| `FO-SYNC-2` | the modified files span several languages or packages | `workflows/sync/quality-gates-quality.md` | Phase 9 MX tag scan — one read-only shard per language or package |
+| `FO-SYNC-3` | the coverage gaps span several independent packages | `workflows/sync/quality-gates-quality.md` | Phase 10 test drafting — one read-only drafter per package |
+| `FO-SYNC-4` | the sync scope spans several independent document families | `workflows/sync/doc-execution.md` | Phase 12 document drafting — five read-only drafters, one applier |
+
+## Parallel Quality-Evidence Fan-Out (capability-gated)
+
+**`FO-SYNC-1`.** **Where** `.claude/workflows/sync-audit-4dim.js` exists on disk **AND** the runtime supports dynamic workflows, the orchestrator shall launch it at Phase 7 (Quality Check) to gather the four quality dimensions in one parallel read-only pass. **Where** either condition is absent — the script was removed, or the runtime predates dynamic-workflow support — Phase 7 proceeds on its existing path with no error, no warning, and no interruption.
+
+The orchestrator launches the script itself; this is scaling, not subagent nesting, so the flat agent hierarchy is preserved. Every judge is read-only and reports an `evidence_gaps` entry or a structured blocker report rather than prompting the user.
+
+**Binding promotion (SPEC-AUDIT-SNAPSHOT-001 A3, REQ-AUDIT-SNAPSHOT-003).** On the **happy path** — the workflow verdict is `PASS`, no dimension scored 0, the verdict is not `INCOMPLETE`, and no contested finding is present — the orchestrator SHALL treat the workflow's harmonic-mean verdict as **BINDING** for the sync-phase quality decision and SHALL NOT spawn the cold `sync-auditor` subagent. The four parallel xhigh judges subsume the one serial judge on the clean path (attributable diff-check, not a deletion of the auditor role). The mechanical binding predicate is codified in `internal/runtime.FourDimVerdict.IsBinding()`; the orchestrator constructs a `FourDimVerdict` from the workflow run output and consults `IsBinding()`. On any of the fallback triggers — (a) verdict `INCOMPLETE`, (b) any must-pass dimension scoring 0 (`zero_scored` array non-empty), or (c) a **contested finding** (any one judge reports `critical` severity, OR two or more judges return conflicting severity classifications for the same dimension) — the orchestrator SHALL spawn the cold `sync-auditor` subagent as the fallback binding-verdict owner, and the auditor's PASS/FAIL is treated as binding for that cycle. Neither `gate-sync-1` nor `gate-sync-2` is bypassed or auto-passed by either path; the cold auditor remains the fallback verdict owner under trigger (a)/(b)/(c).
 
 ## HUMAN GATE Map
 

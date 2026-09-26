@@ -45,7 +45,10 @@ Non-overlap: run a `/moai review` to SEE findings without changing anything; run
 - --design: Extract design patterns from UI code and create/update `.moai/design/system.md`
 - --critique: Post-build craft review focusing on subtle layering, surface elevation, token architecture, and typography hierarchy
 - --lean: Over-engineering-ONLY lean audit mode. Short-circuits the comprehensive 4-perspective analysis (Security / Performance / Quality / UX) and runs ONLY the over-engineering scan with the 5-tag finding format + net-reduction summary. Read-only and advisory: applies no fixes, modifies no files, renders no PASS/FAIL verdict. See the "--lean Mode" section below.
-- --repo: Repo-wide scope. With --lean, sweeps the WHOLE tree instead of the diff-scope default. Ignored without --lean.
+- --repo: Repo-wide scope. With --lean, sweeps the WHOLE tree instead of the diff-scope default. With --deep, scopes the deep scan to the whole tree. Ignored without --lean or --deep.
+- --deep: On-demand multi-agent DEEP vulnerability scan mode — a six-phase, adversarially-verified pipeline (architecture map -> threat model -> hunt -> adversarial verify -> report -> patch). A bare `--deep` is treated as a security-focused deep scan and composes with `--security`. Additive and non-breaking: it never modifies the existing single-pass `--security` lens. See the "--deep Mode" section below.
+- --patch: (--deep only) Opt-in patch drafting. OFF by default: while `--patch` is absent, the deep scan stops after the report phase and drafts no patch. Present only when the user explicitly passes it.
+- --commit SHA: (--deep diff scope) Scope the deep scan to a single commit `<SHA>` (the single-commit diff scope, alongside `--staged` and `--branch`).
 
 ## Phase 1: Identify Changes
 
@@ -65,7 +68,7 @@ Collect:
 
 If --lean flag: SHORT-CIRCUIT this phase entirely. Skip the comprehensive 4-perspective analysis (Perspectives 1-4 below) and jump directly to the "--lean Mode — Over-Engineering-Only Lean Audit" section. The narrowness IS the feature: correctness, security, and performance findings stay in the default (non-`--lean`) comprehensive review.
 
-[HARD] The 4 perspectives execute as a Mode-4 parallel read-only fan-out: up to 4 concurrent read-only judges — one per perspective (Security / Performance / Quality / UX) — spawned in a single turn, within the 3-5 concurrent `Agent()` ceiling (`orchestration-mode-selection.md` §C.2). The sync-auditor subagent remains the binding synthesis and verdict owner (independent skeptical quality scoring per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 2): the parallel judges' findings feed the sync-auditor synthesis, which renders the consolidated assessment. The fan-out changes execution shape only — never verdict ownership. (The `--team` parallel-review mode remains retired with the Agent Teams static layer; this is Mode 4 subagent fan-out, not a team.)
+[HARD] The 4 perspectives execute as a Mode-4 parallel read-only fan-out: up to 4 concurrent read-only judges — one per perspective (Security / Performance / Quality / UX) — spawned in a single turn, within the 3-5 concurrent `Agent()` ceiling (`orchestration-mode-selection.md` §C.2). The sync-auditor subagent remains the binding synthesis and verdict owner (independent skeptical quality scoring per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 2): the parallel judges' findings feed the sync-auditor synthesis, which renders the consolidated assessment. The fan-out changes execution shape only — never verdict ownership. (The `--team` parallel-review mode remains retired with the Agent Teams static layer; this is fanout subagent fan-out, not a team.)
 
 Per-perspective skill injection (skill-routing.md §1): each read-only judge is a `Agent(general-purpose)` spawned with the perspective's skill injected — Security → `At start, invoke Skill("moai-ref-owasp-checklist")`; Quality → `Skill("moai-foundation-quality")`; UX → `Skill("moai-ref-react-patterns")` (per `.moai/config/sections/delegation.yaml`).
 
@@ -162,6 +165,34 @@ After perspective analysis, check @MX tag compliance for changed files:
 
 Report missing or outdated @MX tags as findings.
 
+## Phase 3.5: Cross-Model Convergence (audit_multi)
+
+Gating: this phase runs ONLY when the project's `audit_model` selects cross-backend convergence. The convergence call is the `mcp__moai__audit_multi` MCP tool — the codex and GLM backends review in parallel, and their verdicts fuse with the in-session Claude verdict. The mode table and the full call contract are owned by the cross-model audit usage SSOT — this section cross-references that skill and does not restate its tables. Under `audit_model` single-model or none, the phase is skipped entirely and the existing single-model path is unchanged.
+
+Owner: the Phase 2-3 reviewer (sync-auditor subagent) performs the convergence call — verdict ownership stays with the reviewer (mirrors the Phase 2 HARD rule: fan-out changes execution shape only, never verdict ownership). The orchestrator injects into the reviewer spawn (skill-routing.md §1 pattern), gated on the same audit_model condition: `At start, invoke Skill("moai-ref-cross-model-audit") for the audit_multi call contract and the independence rule.`
+
+Call contract (compact form; the skill is the SSOT):
+
+| Parameter | Value |
+|---|---|
+| `claude_verdict` | The reviewer's consolidated verdict object: `{verdict, summary, findings, next_steps}` |
+| `target` | Mapped from review scope — `--staged` / `--file` / no flag → `uncommittedChanges`; `--branch B` → `baseBranch` |
+| `focus` | A short area name only (independence rule: NEVER paste the reviewer's analysis into focus) |
+| `session_id` | Current session id — persists the result so the Stop-hook gate reads it instead of re-invoking convergence |
+
+Folding the convergence result into the review verdict:
+
+- `overall_verdict: fail` (a required backend failed, or the required gate split) → the review verdict FAILs, naming the failing required backend(s) from `per_backend_verdicts`.
+- `disagreement_flag: true` with overall pass → an advisory residual-risk row; the disagreement never blocks on its own.
+- Surface `residual_risk_note` verbatim; name any `fail_open_backends` in the report.
+
+Fail-open fallback: unavailable, unauthenticated, or erroring backends return `inconclusive` and never block — when ALL non-Claude backends are inconclusive, convergence falls open to the in-session Claude verdict, which IS the pre-existing single-model path. When the `moai` MCP server or the `audit_multi` tool itself is absent, skip this phase and label the report single-model. This fail-open contract adds no hard dependency.
+
+Mode carve-outs:
+
+- `--lean` short-circuits this phase — the lean audit is advisory-only and renders no verdict, so there is nothing to converge.
+- `--deep` keeps its own adversarial 3-voter verification panel unchanged; this phase is the standard-path verdict convergence, not a deep-scan layer.
+
 ## Phase 4: Report Consolidation
 
 Produce a consolidated review report organized by severity:
@@ -187,6 +218,12 @@ Produce a consolidated review report organized by severity:
 - Outdated tags: N
 - Compliant files: N/M
 
+### Cross-Model Convergence (when audit_model selects it)
+- Overall: PASS/FAIL + disagreement flag
+- Per-backend verdicts: claude=..., codex=..., glm=... (verdict + gate)
+- Residual risk note: (verbatim from the convergence result, when present)
+- Fail-open backends: (named, when present)
+
 ### Overall Assessment
 - Security: PASS/FAIL
 - Performance: PASS/WARN
@@ -194,6 +231,8 @@ Produce a consolidated review report organized by severity:
 - UX: PASS/WARN
 - TRUST 5 Score: N/5
 ```
+
+The Cross-Model Convergence block above is omitted entirely when the convergence phase did not run (single-model path) — its absence reflects mode selection, not a skipped check.
 
 ## Phase 6: Next Steps
 
@@ -215,7 +254,7 @@ The mode is inspired by the "lazy senior dev" minimalist-coding review pattern: 
 The --lean mode supports two scopes, mirroring the diff-vs-repo split of the minimalist-coding audit pattern:
 
 - Diff-scope (default): audit ONLY the changed code, reusing the existing Phase 1 scope selection (`--staged` / `--branch BRANCH` / `--file PATH`, or the most recent commit when no scope flag is given). This is the "review the changes" variant.
-- Repo-scope (with --repo): sweep the WHOLE tree. This is the "sweep everything" variant. The `--repo` flag is honored only in --lean mode.
+- Repo-scope (with --repo): sweep the WHOLE tree. This is the "sweep everything" variant. The `--repo` flag is honored in both --lean and --deep modes: in --lean it widens the leanness audit to the whole tree, and in --deep it scopes the deep scan to the whole working tree (see the --deep Mode section below, which reuses the same scope-selection machinery).
 
 Both variants run the identical 5-tag scan and net-reduction summary below; only the set of files scanned differs.
 
@@ -275,6 +314,134 @@ The --lean mode is read-only and advisory. It applies NO fixes, modifies NO file
 - The 5 lean tags are the OPERATIONAL scan surface for the over-engineering anti-patterns already catalogued in `.claude/skills/moai/references/anti-patterns.md` (the Premature Abstraction and Over-Engineering categories, mapped to Agent Core Behavior #4 Enforce Simplicity). Consult that catalogue for the wrong/right examples; this section does not restate it.
 - The lean audit is the post-hoc DETECTION counterpart to the pre-code PREVENTION ladder in `.claude/rules/moai/core/moai-constitution.md` § Agent Core Behaviors #4 Enforce Simplicity (the simplicity decision ladder). The ladder prevents over-engineering before code is written; the lean audit detects what slipped through. Consult that ladder for the ordered prevention steps; this section does not restate it.
 
+## --deep Mode — On-Demand Multi-Agent Deep Vulnerability Scan
+
+When the `--deep` flag is present, `/moai review` runs an on-demand, adversarially-verified deep vulnerability scan. `--deep` is a *depth* modifier layered on the existing *breadth* review: it reuses the same scope-selection machinery (`--repo` / `--staged` / `--branch B` / `--commit SHA`) and the Security perspective, then adds independent adversarial verification, a machine-readable findings artifact, and (opt-in) reviewer-vouched patch drafts. A bare `--deep` is treated as a security-focused deep scan and composes with `--security`; `--security --deep` is the explicit form. `--deep` is additive and non-breaking — the existing single-pass `--security` lens is unchanged.
+
+This deep scan is the heavy, explicitly-invoked layer. It composes with the lighter always-on review lens rather than replacing it. It lives entirely under `/moai review --deep`; there is no separate top-level security subcommand (the former `/moai security` entry was retired and is not revived — the deep scan is a mode of `/moai review`, and no `security` / `audit` / `sec` alias is added).
+
+### Job menu — mapped onto review scope flags
+
+`/moai review --deep` offers the following jobs, each mapped onto the existing scope-selection mechanism (Phase 1). The orchestrator collects the job + scope + `--patch` opt-in via `AskUserQuestion` BEFORE the pipeline launches (see the User-Interaction Boundary below).
+
+| Job | Scope flag | What it scans |
+|-----|-----------|---------------|
+| Scan the whole repository | `--repo` | The entire working tree |
+| Scan staged changes | `--staged` | The staged diff |
+| Scan a branch diff | `--branch B` | `current...B` |
+| Scan a single commit | `--commit SHA` | Exactly the one commit `<SHA>` |
+| Draft patches for confirmed findings | `--patch` (opt-in) | Enables the patch phase (see below); OFF by default |
+
+`--patch` is an independent opt-in and is OFF by default: while `--patch` is absent, the deep scan stops after the report phase and drafts, writes, or applies no patch. Patch drafting happens only when `--patch` is explicitly present.
+
+### Prerequisite & graceful degradation ladder
+
+The deep scan's PRIMARY execution path requires Dynamic Workflows (Claude Code v2.1.154+). Availability is checked BEFORE launch (pipeline agents cannot prompt mid-run, so the degradation choice is made up front). Observable signals that mean Dynamic Workflows are unavailable: the runtime version is below v2.1.154, the `CLAUDE_CODE_DISABLE_WORKFLOWS` environment variable is set, or workflows are disabled in settings. When Dynamic Workflows are unavailable the scan degrades gracefully rather than failing:
+
+| Rung | Condition | Path | Rigor |
+|------|-----------|------|-------|
+| PRIMARY | Dynamic Workflows available (v2.1.154+, not disabled) | Runtime-constructed `Workflow()` — full fan-out across phases | Full |
+| FALLBACK | Workflows unavailable, but bounded parallel is viable | Mode-4 bounded parallel fan-out (3-5 concurrent read-only agents), findings batched | **2-of-3 quorum preserved** — degradation drops concurrency/scale, NOT verification rigor |
+| DEGRADED | Neither viable | Single-pass `/moai review --security` plus the native `/security-review` | Reduced (single-pass, no per-finding 3-voter panel) — the report MUST label this rung as rigor-reduced so a reduced result is never mistaken for a full adversarially-verified scan |
+
+The FALLBACK rung is a genuine degradation of scale only: it preserves the 3-voter panel and the 2-of-3 quorum. Only the DEGRADED last-resort rung reduces rigor, and it self-labels as such in the report.
+
+The shipped artifact of this mode is THIS playbook (template-safe markdown), not a static workflow script. The orchestrator constructs the `Workflow()` at runtime from the phase descriptions below. A user MAY save the generated script into their own `.claude/workflows/` for reuse, but no static script is shipped.
+
+### The six-phase pipeline
+
+The deep scan executes six phases in order. Phases 1-4 are strictly READ-ONLY against the working tree; phase 5 writes only under the results directory; phase 6 writes only inside an isolated scratch clone.
+
+1. **Architecture map** — a single read-only recon agent (or `Explore`) maps modules, entry points, and trust boundaries. READ-ONLY (Read / Grep / Glob only).
+2. **Threat model** — a single agent consumes the phase-1 map and enumerates the attack surface. READ-ONLY. Loads `Skill("moai-ref-owasp-checklist")` for the baseline vocabulary.
+3. **Vulnerability hunt** — a parallel fan-out of hunt agents (per area / per manifest) surfaces candidate findings. READ-ONLY. Each hunt agent loads the relevant security reference skill(s) on demand via `Skill()` injection (NOT via static frontmatter preload): `Skill("moai-ref-owasp-checklist")` for web-app classes, `Skill("moai-ref-llm-security")` for LLM/agentic classes, `Skill("moai-ref-secops")` for CI/CD, container, and API-operational classes, and `Skill("moai-ref-supply-chain")` for dependency and provenance classes.
+4. **Adversarial verification** — each candidate finding is cross-examined by an independent 3-voter panel (detail below). READ-ONLY.
+5. **Report** — the orchestrator (or a synthesizer agent) writes the results directory (schema below). Writes ONLY under the results directory.
+6. **Patch** — gated by `--patch`; drafts one reviewer-vouched patch per confirmed finding in an isolated scratch clone (detail below). Writes ONLY inside the scratch clone; never the live tree.
+
+The scan reasons across all supported languages equally — it names vulnerability classes and platform-native features generically, not by any single language's toolchain, standard library, or package manager.
+
+### Phase 4 — adversarial verification panel
+
+Every candidate finding from the hunt phase passes a 3-voter panel before it may enter the report. The three voters are perspective-diverse and REFUTE-skewed:
+
+- **REACHABILITY** — Is the vulnerable code path actually reachable by attacker-controlled input? (affirm | refute)
+- **IMPACT** — If reached, what is the concrete blast radius? Is the stated impact real, not theoretical? (affirm | refute)
+- **DEFENSES** — Do existing defenses (validation, authorization, framework guards) already neutralize this? (affirm undefended | refute defended)
+
+Quorum admission rule:
+
+- A finding is ADMITTED to the report only when at least **2 of the 3** voters affirm it (the 2-of-3 quorum).
+- When all 3 voters affirm (unanimous), the finding's confidence MAY be stated as "high".
+- A non-unanimous panel (2-of-3, not 3-of-3) caps the finding's stated confidence at medium and MUST NOT state "high" — the cap binds confidence only, not severity (a high-severity finding may keep high severity while its confidence is capped at medium).
+- A candidate that fails the 2-of-3 quorum is REJECTED: it is excluded from the confirmed-findings body and recorded only under a trailing "Unconfirmed candidates" appendix, never mixed with confirmed findings.
+
+Voter independence: each voter is a separate agent given ONLY the finding claim plus the surrounding code context — never the hunt agent's own reasoning chain. Each voter's default posture is to disprove the finding (REFUTE-skewed), reusing the skeptical-evaluation stance. No voter reuses the hunt agent's reasoning as its sole basis.
+
+### Phase 6 — patch drafting & reviewer vouch (`--patch` only)
+
+When `--patch` is present and at least one confirmed finding exists, each patch is drafted in isolation and independently reviewed:
+
+- **Drafter** — an `Agent(isolation: "worktree")` operates in an isolated scratch clone of the repository, drafts the minimal fix for exactly one finding, and emits a unified diff. The drafter never touches the user's live working tree.
+- **Independent reviewer** — a SEPARATE agent spawn (distinct from the drafter) reads the drafted diff plus the finding and surrounding code (read-only) and vouches, all-or-nothing, for THREE claims: (a) it addresses only the one finding, (b) it introduces no new vulnerability, (c) it leaves behavior otherwise unchanged.
+- When all three claims are vouched, the diff is written into the results directory as a patch artifact. When the reviewer cannot vouch for all three, the pipeline emits a short explanatory note for that finding instead of a patch; other findings' patches are unaffected.
+
+Patches are NEVER auto-applied: the pipeline never runs `git apply`, and never stages, commits, or pushes any drafted patch to the user's repository. Each confirmed-and-vouched finding yields exactly one patch artifact the user applies manually — one finding = one patch = one PR. The drafter and reviewer are always different spawns (independence is a hard requirement).
+
+### Results directory — a report, not a SPEC
+
+The deep scan writes its outputs to a timestamped results directory classified as a REPORT (an analysis of existing code), under `.moai/reports/` — never under `.moai/specs/` (a scan is a report, not a specification). The timestamp is injected as an input argument or stamped after the run returns; it is never generated inside the workflow script body (so resume-caching stays valid).
+
+```
+.moai/reports/security-deepscan-<timestamp>/
+  .gitignore        # a single line: *  (so a stray `git add` can never sweep the results into a commit)
+  report.md         # the human report
+  findings.jsonl    # machine-readable, one finding per line
+  revision.json     # the revision stamp
+  patches/          # only when --patch: one F<i>.patch or F<i>.note.md per confirmed finding
+```
+
+Every results directory ships its own `.gitignore` (ignoring its entire contents) so a stray `git add` never sweeps a scan into a commit.
+
+`report.md` — each confirmed finding carries a stable finding ID (`F1`, `F2`, ...) plus five fields:
+
+```
+### F<i> — <title>
+- Severity:        <critical | high | medium | low>
+- Confidence:      <high | medium>        (medium max when the panel was non-unanimous)
+- Impact:          <concrete blast radius>
+- Exploit scenario: <step-by-step reachability narrative>
+- Recommendation:  <fix direction>
+- Panel:           REACHABILITY=<affirm|refute> IMPACT=<...> DEFENSES=<...> (<N>/3)
+```
+
+Rejected candidates appear ONLY under a trailing `## Unconfirmed candidates (did not reach 2-of-3)` appendix.
+
+`findings.jsonl` — machine-readable, exactly one finding per line (JSONL); each line carries the finding ID plus its structured fields:
+
+```json
+{"id":"F1","severity":"high","confidence":"medium","title":"...","impact":"...","exploit":"...","recommendation":"...","panel":{"reachability":true,"impact":true,"defenses":false},"location":{"path":"...","hint":"..."}}
+```
+
+`revision.json` — the revision stamp records which commit was scanned, the effort tier used, and whether the working tree was included in the scan:
+
+```json
+{"scanned_commit":"<sha>","effort_tier":"<low|medium|high|xhigh|max>","working_tree_included":true,"scope":"repo|branch|commit|staged|file","generated_at":"<injected-timestamp>"}
+```
+
+### User-interaction boundary
+
+All user decisions for the deep scan — scope selection, the `--patch` opt-in, and the degradation-path choice — are collected by the orchestrator via `AskUserQuestion` BEFORE the pipeline launches. The pipeline agents (recon, threat-modeler, hunters, voters, drafter, reviewer) never prompt the user: an agent that lacks a required input returns a structured blocker report to the orchestrator, which resolves it and re-delegates. No pipeline or workflow agent asks the user anything directly.
+
+### Edge cases
+
+- **Zero confirmed findings** — the scan completes cleanly, writes a results directory stating "0 confirmed findings", and drafts no patch. No error, no empty patch.
+- **Confirmed finding but `--patch` absent** — the report is written; the patch phase does not run.
+- **Reviewer cannot vouch** — a note (not a patch) is emitted for that finding; other findings' patches are unaffected.
+- **Non-unanimous panel on a high-severity finding** — severity may remain high, but the stated CONFIDENCE is capped at medium (severity and confidence are independent axes).
+- **Dynamic Workflows disabled** — the availability signal is checked BEFORE launch; the degradation rung is chosen up front, not mid-run.
+- **Large repository, hundreds of candidates** — the PRIMARY `Workflow()` path handles scale; the FALLBACK Mode-4 path batches findings within the 3-5 concurrent ceiling. Neither path drops the quorum.
+
 ## Task Tracking
 
 [HARD] Task management tools mandatory:
@@ -301,7 +468,7 @@ Output: Design pattern report with deviation list (file:line references)
 
 ### --critique: Post-Build Craft Review
 
-Agent: per-spawn `Agent(general-purpose)` frontend specialist (frontend whitelist per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 8) — inject `At start, invoke Skill("moai-ref-react-patterns")` and `Skill("moai-domain-frontend")` (per `.moai/config/sections/delegation.yaml` domain_skills.frontend; skill-routing.md §1)
+Agent: per-spawn `Agent(general-purpose)` frontend specialist (frontend whitelist per `.claude/rules/moai/workflow/archived-agent-rejection.md` §C row 8) — inject `At start, invoke Skill("moai-ref-react-patterns")` and `Skill("moai-domain-frontend")` (per `.moai/config/sections/delegation.yaml` domain_skills.frontend; skill-routing.md §1). When the reviewed build emits pages a search engine or automated reader will fetch, also inject `Skill("moai-ref-seo")` for the canonical-address, per-page metadata, structured-data, and document-semantics pre-ship baseline.
 
 Tasks:
 1. Read `.moai/design/system.md` for design direction context
@@ -319,7 +486,7 @@ Output: Craft critique report with severity-ranked findings and rebuild suggesti
 ## Agent Chain Summary
 
 - Phase 1: MoAI orchestrator (change identification via git)
-- Phase 2-3: sync-auditor subagent (multi-perspective analysis; the Security perspective receives deeper focus when --security is set) — the dependency vulnerability sub-scan additionally delegates to a per-spawn `Agent(general-purpose)` security reviewer
+- Phase 2-3: sync-auditor subagent (multi-perspective analysis; the Security perspective receives deeper focus when --security is set) — the dependency vulnerability sub-scan additionally delegates to a per-spawn `Agent(general-purpose)` security reviewer; when the audit_model gate fires, the reviewer additionally folds its verdict through `mcp__moai__audit_multi` (cross-model convergence; fail-open) per Phase 3.5
 - Phase 4-5: MoAI orchestrator (consolidation and user interaction)
 - Phase 5 (conditional): per-spawn `Agent(general-purpose)` frontend specialist (if --design or --critique)
 
@@ -330,9 +497,10 @@ Output: Craft critique report with severity-ranked findings and rebuild suggesti
 3. Identify code changes (git diff based on flags)
 4. Delegate multi-perspective review to the sync-auditor subagent
 5. Check @MX tag compliance for changed files
-6. If --design or --critique: Run design review phase 4.5 (per-spawn `Agent(general-purpose)` frontend specialist per the frontend whitelist)
-7. Consolidate findings by severity
-8. Present report with next step options
+6. If the audit_model gate fires: reviewer folds the verdict through the audit_multi convergence step (Phase 3.5; fail-open)
+7. If --design or --critique: Run design review phase 4.5 (per-spawn `Agent(general-purpose)` frontend specialist per the frontend whitelist)
+8. Consolidate findings by severity
+9. Present report with next step options
 
 ---
 

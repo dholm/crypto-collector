@@ -2,7 +2,6 @@
 
 Purpose: Complete reference for MoAI-ADK's 6 core commands used in SPEC-First DDD workflow.
 
-Last Updated: 2025-11-25
 Version: 2.0.0
 
 ---
@@ -49,13 +48,13 @@ Usage:
 
 What It Does:
 1. Creates `.moai/` directory structure
-2. Generates `config.json` with default settings
+2. Generates `.moai/config/sections/` config files with default settings
 3. Initializes Git repository (if `--with-git` flag provided)
 4. Sets up MoAI-ADK workflows
 
 Output:
 - `.moai/` directory
-- `.moai/config/config.yaml`
+- `.moai/config/sections/` (per-section YAML config SSOT)
 - `.moai/state/` (empty, ready for session state)
 - `.moai/logs/` (empty, ready for logging)
 
@@ -65,7 +64,7 @@ Example:
 ```
 User: /moai project
 MoAI: Project initialized successfully.
- - .moai/config/config.yaml created
+ - .moai/config/sections/ config files created
  - Git workflow set to 'manual' mode
  Ready for SPEC generation.
 ```
@@ -382,7 +381,7 @@ Iterative Workflow (Multiple SPECs):
 
 ### Integration with Git Workflow
 
-Commands automatically integrate with Git based on `config.json` settings:
+Commands automatically integrate with Git based on `.moai/config/sections/git-strategy.yaml` settings:
 
 Manual Mode (Local Git):
 - `/moai plan`: Prompts for branch creation

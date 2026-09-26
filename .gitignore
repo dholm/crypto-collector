@@ -2,7 +2,6 @@
 # MoAI-ADK Package Distribution .gitignore
 # ============================================
 # Version: 0.33.0
-# Updated: 2026-01-10
 # Purpose: Essential patterns for user projects
 # ============================================
 
@@ -157,6 +156,14 @@ secret-*.*
 .aws/config
 .aws/credentials
 
+# MoAI git-credential runtime files (defense-in-depth). The reconfigure wizard
+# delegates git provider credentials to the gh/glab CLI and never writes an
+# access token to a tracked config; these patterns ensure that if a
+# credential-bearing runtime file is ever introduced under .moai/, it is not
+# committed.
+.moai/**/credentials.yaml
+.moai/**/*.credentials
+
 # MINK agent credentials (plaintext API keys, per AC-CR-026).
 # Ignored anywhere in the tree so per-project auth dirs are never committed.
 **/.mink/auth/
@@ -185,12 +192,7 @@ secret-*.*
 # Local-Only Files (never sync via git pull)
 # ===========================================
 .moai/status_line.sh
-.moai/cache/
-.moai/logs/
 .moai/memory/
-.moai/reports/**/*.md
-.moai/state/
-.moai/temp/
 .moai/worktrees/
 .moai/branches/
 
@@ -238,5 +240,9 @@ dist-ssr/
 .netlify/
 .firebase/
 
+# User Custom Patterns (preserved by moai update)
+.moai/logs/
+.moai/reports/**/*.md
+.moai/temp/
 /target/
 *.local.md

@@ -18,12 +18,12 @@ This skill orchestrates but does NOT replace existing agents. All named agents b
 ## Builders
 
 - `builder-harness` (artifact_type=agent) — Generates `.claude/agents/harness/*.md` content
-- `builder-harness` (artifact_type=skill) — Generates `.claude/skills/moai-harness-*/SKILL.md` content
+- `builder-harness` (artifact_type=skill) — Generates **`hns-*`** skill content under the user-owned harness namespace (per the Skills Namespace Policy in `.claude/rules/moai/development/skill-authoring.md` § Skills Namespace Policy and this skill's own SKILL.md § Namespace Separation). The `hns-*` prefix is the ONLY per-project skill namespace `builder-harness` emits; emitting under `moai-harness-*` (or any other `moai-*` prefix) inverts the namespace contract — `moai-harness-*` is template-managed and currently comprises only `moai-harness-learner` (plus the deprecated legacy-redirect `moai-meta-harness`), never per-project artifacts.
 - `builder-harness` (artifact_type=plugin) — Optional plugin bundling of generated artifacts
 
 ## Workflow Managers
 
-- `manager-develop` (`cycle_type=ddd` or `cycle_type=tdd` per `.moai/config/sections/quality.yaml` `development_mode`) — DDD or TDD-flavored harness workflow templates (the retired-DDD policy M3 consolidated the prior DDD and TDD specialist managers into the unified `manager-develop` agent with cycle-type dispatch)
+- `manager-develop` (`cycle_type=ddd` or `cycle_type=tdd` per `.moai/config/sections/quality.yaml` `constitution.development_mode`) — DDD or TDD-flavored harness workflow templates (the retired-DDD policy M3 consolidated the prior DDD and TDD specialist managers into the unified `manager-develop` agent with cycle-type dispatch)
 - Quality gate configuration in generated harnesses — the `/moai gate` skill or the `sync-phase-quality-gate.sh` Stop hook (former manager-quality quality-gate role)
 - `manager-docs` — Documentation generation patterns
 - `manager-git` — Git workflow patterns for generated harnesses

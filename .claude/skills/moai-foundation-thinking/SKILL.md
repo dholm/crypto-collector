@@ -192,7 +192,8 @@ Agent Teams:
 
 Agents:
 - manager-spec: Combined with Philosopher for full decision framework (planning absorbs strategic analysis)
-- manager-spec: Deep Questioning during requirement analysis
+- manager-develop: Deep Questioning + Critical Evaluation during run-phase reasoning (DDD/TDD root-cause analysis, architecture trade-offs)
+- super-advisor: E1-E4 escalation reasoning (bug-deadlock diagnosis, architecture decision points, second-opinion consultation, loop-deadlock verdicts)
 - team-reader (analyst role): Primary consumer for plan phase analysis
 - team-reader (researcher role): Comprehensive research methodology
 
@@ -279,16 +280,16 @@ Examples and reference: [examples.md](references/philosopher-examples.md), [refe
 
 ---
 
-## Adaptive Thinking (Opus 4.7+ built-in, including 4.8)
+## Adaptive Thinking (Opus 4.7+ built-in, including Opus 5 and 4.8)
 
-The model's built-in reasoning mode (Opus 4.7 and later, including 4.8) that dynamically allocates reasoning tokens based on task complexity.
+The model's built-in reasoning mode (Opus 4.7 and later, including Opus 5 and 4.8) that dynamically allocates reasoning tokens based on task complexity.
 
 ### Reasoning Modes
 
 | Mode | Trigger | Mechanism | GLM Compatible? |
 |------|---------|-----------|-----------------|
 | `ultrathink` | Keyword | Claude native extended reasoning | YES |
-| Adaptive Thinking | Automatic | Opus 4.7+ built-in (incl. 4.8) | YES |
+| Adaptive Thinking | Automatic | Opus 4.7+ built-in (incl. Opus 5 and 4.8) | YES |
 
 Rules: `ultrathink` → ALWAYS use Claude native extended reasoning with xhigh effort.
 

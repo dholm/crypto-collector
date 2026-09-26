@@ -6,6 +6,8 @@ Long-horizon session continuity guidance for both users and the MoAI orchestrato
 
 Anthropic SSE streams stall (`stream_idle_partial`) near the context window ceiling — intermittent but predictable above the model-specific threshold. Reference: large-SPEC SSE-stall mitigation.
 
+> **CC 2.1.196 watchdog note**: The streaming idle watchdog is now default-on for all providers — it aborts and retries a response stream that produces no events for 5 minutes (`CLAUDE_ENABLE_STREAM_WATCHDOG=0` disables). This softens the mid-stream-hang *consequence* (auto-abort+retry) but not the stall *hazard* itself — a stall near the ceiling still wastes a turn. The `/clear` thresholds below are unchanged.
+
 ## Claude Code's Graduated-Compaction Layers (consumed, not implemented)
 
 Before the context window reaches the ceiling, the Claude Code runtime applies a **graduated-compaction** mechanism — five escalating layers that progressively reduce the live input before each model call, in escalation order:
@@ -24,23 +26,48 @@ The orchestrator CONSUMES Claude Code's graduated-compaction layers; it does NOT
 
 | Model class | Window | Handoff threshold | Absolute ceiling |
 |-------------|--------|-------------------|------------------|
+| Opus 5 (1M) | 1,000,000 tokens | **50%** | ~500,000 tokens |
 | Opus 4.8 (1M) | 1,000,000 tokens | **50%** | ~500,000 tokens |
-| GLM-5.2 via `moai glm`/`moai cg` (1M) | 1,000,000 tokens | **50%** | ~500,000 tokens |
-| Opus/Fable (256K) | 256,000 tokens | **90%** | ~230,000 tokens |
+| GLM-5.3 via `moai glm`/`moai cg` (1M) | 1,000,000 tokens | **50%** | ~500,000 tokens |
+| Fable (256K) | 256,000 tokens | **90%** | ~230,000 tokens |
 | Sonnet/Opus standard (200K) | 200,000 tokens | **90%** | ~180,000 tokens |
 | Haiku (200K) | 200,000 tokens | **90%** | ~180,000 tokens |
 
 The model-specific threshold is the operational ceiling — beyond it, plan for a `/clear` before the next non-trivial action. Both this rule and `session-handoff.md` Trigger #1 read from this same table.
 
-### GLM-5.2 context window (Issue #653)
+### GLM-5.3 context window (Issue #653)
 
-GLM-5.2 (z.ai, served via `moai glm` / `moai cg` GLM panes) is a genuine 1M-context model; operate it at the **50% (~500K)** handoff threshold, the same class as Opus 4.8 (1M). Do NOT treat a `moai glm` session as a 200K session.
+GLM-5.3 (z.ai, served via `moai glm` / `moai cg` GLM panes) is a genuine 1M-context model; operate it at the **50% (~500K)** handoff threshold, the same class as Opus 5 / Opus 4.8 (1M). Do NOT treat a `moai glm` session as a 200K session.
 
-Caveat (Issue #653): Claude Code reports `context_window_size` based on the Claude slot (Opus=1M, Sonnet/Haiku=200K) regardless of provider, so raw telemetry (`effectiveWindow`) may show ~180K under GLM. This is an upstream misreport. MoAI corrects it: the statusline gauge uses `MOAI_STATUSLINE_CONTEXT_SIZE` and Claude Code auto-compact uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, both resolved from the `glmContextWindows` table in `internal/statusline/memory.go` (glm-5.2 → 1,000,000) or the `llm.glm.context_windows` override. Trust the MoAI statusline CW%, not raw `effectiveWindow`.
+Caveat (Issue #653): Claude Code reports `context_window_size` based on the Claude slot (Opus=1M, Sonnet/Haiku=200K) regardless of provider, so raw telemetry (`effectiveWindow`) may show ~180K under GLM. This is an upstream misreport. MoAI corrects it: the statusline gauge uses `MOAI_STATUSLINE_CONTEXT_SIZE` and Claude Code auto-compact uses `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, both resolved from the `glmContextWindows` table in `internal/statusline/memory.go` (glm-5.3 → 1,000,000) or the `llm.glm.context_windows` override. Trust the MoAI statusline CW%, not raw `effectiveWindow`.
+
+
+## Reduction Ladder — cheaper moves before `/clear`
+
+`/clear` is the heaviest reduction available: it discards the whole window, including the warm prompt cache, and forces the next turn to re-pay the entire always-loaded prefix. That cost is not incidental — it scales with the always-loaded footprint, so `/clear` gets more expensive as the rule tree grows. Reach for it when a full reset is genuinely what is wanted, not as the reflexive answer to a full window.
+
+Four cheaper moves come first. Each targets a different cause of context growth, so pick by cause rather than working down the list:
+
+| Move | Use when | Effect |
+|------|----------|--------|
+| `/btw <question>` | A side question would otherwise land in the transcript | Answer renders in a dismissible overlay and never enters conversation history — context does not grow at all |
+| `/compact <instructions>` | The window is full but the *current* task must continue | Summarizes in place; the instructions steer what survives |
+| `Esc Esc` / `/rewind` → **Summarize up to here** | Early exploration is spent but recent turns must stay verbatim | Compacts the old prefix, keeps the tail intact |
+| `Esc Esc` / `/rewind` → restore a checkpoint | A line of attempts polluted the context, or the tree needs reverting | Restores conversation, files, or both, from a per-prompt snapshot |
+
+Checkpoints are automatic (one per prompt) and persist across sessions, so an approach can be tried and abandoned rather than deliberated over. They track only Claude's own edits — external processes are invisible to them, and they are not a substitute for git.
+
+`/clear` remains correct for a genuine task switch, and remains **mandatory** at the thresholds below. The ladder shortens how often those thresholds are reached; it does not move them.
+
+### Multi-session work: resume rather than re-establish
+
+Work that spans sessions does not have to be rebuilt from a paste each time. `claude --continue` reopens the most recent session and `claude --resume` picks one from a list, both with context intact; `/rename` gives a session a durable name (`oauth-migration`) so it stays findable. Treat named sessions as branches — one per work stream, each with its own accumulated context.
+
+This composes with the paste-ready handoff rather than replacing it. Resume is for continuing a session that still exists; the handoff (`session-handoff.md`) is for crossing a `/clear` or a machine boundary, where the previous context is gone by construction.
 
 ## User Responsibilities
 
-User monitors via Claude Code statusline / `/cost` and intervenes at threshold (50% on 1M / GLM-5.2, 90% on 200K/256K).
+User monitors via Claude Code statusline / `/cost` and intervenes at threshold (50% on 1M / GLM-5.3, 90% on 200K/256K).
 
 [ZONE:Evolvable] [HARD] When usage crosses the model-specific threshold:
 1. Save in-flight state to `.moai/specs/<SPEC-ID>/progress.md` if not already saved (orchestrator does this automatically)
@@ -56,7 +83,7 @@ User monitors via Claude Code statusline / `/cost` and intervenes at threshold (
 
 The orchestrator MUST proactively recognize the model-specific boundary and prepare the user for a clean handoff.
 
-[ZONE:Evolvable] [HARD] Pre-clear announcement: When the orchestrator detects accumulated context (input + output) approaching the model-specific threshold (50% on 1M / GLM-5.2, 90% on 200K/256K), it MUST:
+[ZONE:Evolvable] [HARD] Pre-clear announcement: When the orchestrator detects accumulated context (input + output) approaching the model-specific threshold (50% on 1M / GLM-5.3, 90% on 200K/256K), it MUST:
 1. Stop initiating new large tool calls or `Agent()` delegations
 2. Persist all in-flight progress to `.moai/specs/<SPEC-ID>/progress.md`
 3. Emit a structured "resume message" the user can paste verbatim after `/clear`

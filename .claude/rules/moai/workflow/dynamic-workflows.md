@@ -26,6 +26,37 @@ MoAI now recognizes three runtime primitives for multi-step work. The difference
 
 Subagents and skills keep the plan in Claude's context (it decides turn by turn). A workflow moves the plan into code: the script holds the loop, the branching, and the intermediate results, so the session context holds only the final answer. This also lets a workflow apply a repeatable quality pattern — e.g. independent agents adversarially reviewing each other's findings before reporting.
 
+All three primitives share one property: they run **inside a session**, so every agent's output lands in some context that a single session ultimately owns. The next section covers the case where that property is the constraint.
+
+## Out-of-Session Fan-Out (`claude -p` batch)
+
+The three primitives above scale the work a session can hold. When the work exceeds what any single session should hold — a mechanical transformation across hundreds or thousands of files — the unit of parallelism moves outside the session entirely: a shell loop invokes non-interactive `claude -p` once per item, and each invocation gets a fresh context that dies with it.
+
+```bash
+# 1. Build the work list (one item per line) — have Claude enumerate it
+#    interactively first, so the list itself is reviewable.
+#
+# 2. Loop, one fresh non-interactive invocation per item:
+for file in $(cat files.txt); do
+  claude -p "Migrate $file from <source pattern> to <target pattern>. Return OK or FAIL." \
+    --allowedTools "Edit,Bash(git commit *)"
+done
+```
+
+Three properties make this the right tool for that shape of work, and the wrong tool for anything else:
+
+- **Per-item context isolation.** Item 900 does not carry item 1's file contents, so context growth is flat rather than cumulative. This is the whole reason to leave the session.
+- **`--allowedTools` is the safety boundary, not a convenience.** The loop runs unattended, so there is no user to decline a prompt. Scope the flag to exactly the tools the transformation needs; anything omitted cannot run. A batch launched without this flag is an unattended agent with unscoped tool access.
+- **The prompt is fixed across all items.** Because no one is watching, the prompt cannot be corrected mid-run.
+
+**Calibrate on 2-3 items before running the full set.** The first few items reveal what the prompt actually does versus what it was meant to do; the remaining N inherit whatever that turns out to be. Fixing a prompt after 2 items is cheap, and after 2,000 it is a revert.
+
+Structured output makes results consumable rather than merely printed: `--output-format json` for a parseable result per item, `--output-format stream-json --verbose` when a long-running item's progress must be observed. Keep `--verbose` for development and drop it in production runs.
+
+Choose between this and a dynamic workflow by **where the results need to meet**. A workflow's script variables collect intermediate results for synthesis, cross-checking, or an adversarial review pass — reach for it when the items inform each other. A `claude -p` batch has no shared state and no synthesis step, which is exactly right when the items are genuinely independent and the only aggregate that matters is a pass/fail tally.
+
+The MoAI-side obligations are unchanged and are not relaxed by the batch form: `AskUserQuestion` is orchestrator-only, so a `-p` invocation cannot prompt the user (§ the subagent boundary in `.claude/rules/moai/core/agent-common-protocol.md`), and the Implementation Kickoff Approval gate governs launching the batch — the batch itself is the implementation, not the approval.
+
 ## When to Use a Dynamic Workflow
 
 Reach for a workflow when a task needs **more agents than one conversation can coordinate**, or when the orchestration should be codified as a script you can read and rerun:
@@ -58,7 +89,7 @@ The deciding question is **who should hold the plan**: the script (workflow), a 
 
 - The runtime executes the script in an isolated environment, separate from the conversation.
 - Up to **16 concurrent agents** (fewer on machines with limited CPU cores); **1,000 agents total per run** as a runaway-loop backstop.
-- **Workflow size is user-tunable** — the `/config` **Dynamic workflow size** setting (`small` / `medium` / `large`, v2.1.202+) sets a guideline for how many agents a workflow targets, scaling the effective agent count within the 16-concurrent / 1,000-total ceilings above. MoAI does not pin a size in the deployed template — the choice is left to the user/org, so a size guideline surfaced in a session (e.g. "keep workflows under 15 agents") is user configuration, not a MoAI default.
+- **Workflow size is user-tunable** — the `/config` **Dynamic workflow size** setting (`small` / `medium` / `large` / `unrestricted`, v2.1.202+; `unrestricted` added in v2.1.219) sets a guideline for how many agents a workflow targets, scaling the effective agent count within the 16-concurrent / 1,000-total ceilings above. The default is explicitly `medium` (aim for fewer than 15 agents) as of v2.1.219. The guideline can also be set from any settings file via the `workflowSizeGuideline` settings key (v2.1.219+; the `/config` row is hidden while one is set — see `.claude/rules/moai/core/settings-management.md`). MoAI does not pin a size in the deployed template — the choice is left to the user/org, so a size guideline surfaced in a session (e.g. "keep workflows under 15 agents") is user configuration, not a MoAI default.
 - **No mid-run user input** — only agent permission prompts can pause a run. For sign-off between stages, run each stage as its own workflow.
 - The workflow script itself has **no direct filesystem or shell access** — its agents read, write, and run commands; the script only coordinates them.
 - Runs are **resumable within the same session**: completed agents return cached results, the rest run live. Exiting Claude Code restarts a running workflow fresh in the next session.
@@ -75,24 +106,29 @@ While a workflow run is active, the `/workflows` TUI lets you manage it: list ac
 - **AskUserQuestion boundary still holds**: workflow agents cannot prompt the user (same asymmetric boundary as subagents per `.claude/rules/moai/core/agent-common-protocol.md` § User Interaction Boundary). The MoAI orchestrator collects all preferences via `AskUserQuestion` BEFORE launching a workflow, never inside it.
 - **Implementation Kickoff Approval is unaffected**: a workflow is a run-phase execution mechanism. The plan-to-implement human gate is decided by the orchestrator before any workflow launches, not by the workflow.
 - **Cost awareness**: a single workflow run can spend meaningfully more tokens than the same task in conversation. It counts toward the session's usage and the context-window thresholds in `.claude/rules/moai/workflow/context-window-management.md`. Surface the cost trade-off to the user before launching a large fan-out.
-- **Bundled `/deep-research`**: Claude Code ships a built-in research workflow (`/deep-research <question>`) that fans out web searches, cross-checks sources, votes on claims, and returns a cited report. It requires the WebSearch tool. This complements MoAI's WebSearch + Explore exploration pattern for research-heavy questions.
-- **`ultracode` per-prompt trigger vs session effort**: the `ultracode` trigger keyword (or asking to "use a workflow") is a **per-prompt** trigger — it launches a workflow for that one request. This is distinct from the **session-wide** `/effort ultracode` mode, which combines `xhigh` reasoning with automatic workflow orchestration so Claude plans a workflow for each substantive task across the whole session. Use the session mode deliberately; every task then uses more tokens. Session mode reverts on a new session; step back with `/effort high` for routine work. Because it resets on a new session, `ultracode` is **not** restored by the `ultrathink.` opener of a paste-ready resume message — that opener restores reasoning effort only. A resumed session that needs auto-orchestration must explicitly re-issue `/effort ultracode`, parallel to how a `/goal` must be re-set after a session boundary.
-- **Saved workflows**: a run's script can be saved as a `/command` in `.claude/workflows/` (project, shared) or `~/.claude/workflows/` (personal). A project workflow with the same name wins over a personal one. A saved workflow accepts an `args` global input — the arguments string passed when the workflow command is invoked. MoAI does not ship any saved workflows by default; the user-owned `.claude/workflows/` directory is not template-managed.
+- **Bundled `/deep-research`**: Claude Code ships a built-in research workflow (`/deep-research <question>`) that fans out web searches, cross-checks sources, votes on claims, and returns a cited report. As of v2.1.218 it starts only when invoked manually — Claude no longer launches it on its own. It requires the WebSearch tool. This complements MoAI's WebSearch + Explore exploration pattern for research-heavy questions.
+- **`ultracode` per-prompt trigger vs session effort**: the `ultracode` trigger keyword (or asking to "use a workflow") is a **per-prompt** trigger — it launches a workflow for that one request. This is distinct from the **session-wide** `/effort ultracode` mode, which combines `xhigh` reasoning with automatic workflow orchestration so Claude plans a workflow for each substantive task across the whole session. Use the session mode deliberately; every task then uses more tokens. Session mode reverts on a new session; step back with `/effort high` for routine work. Because it resets on a new session, `ultracode` is **not** restored by the `ultrathink.` opener of a paste-ready resume message — that opener restores reasoning effort only. A resumed session that needs auto-orchestration must explicitly re-issue `/effort ultracode`, parallel to how a `/moai goal` must be re-armed after a session boundary (goal state is per-session).
+- **Saved workflows**: a run's script can be saved as a `/command` in `.claude/workflows/` (project, shared) or `~/.claude/workflows/` (personal). A project workflow with the same name wins over a personal one. A saved workflow accepts an `args` global input — the arguments string passed when the workflow command is invoked.
+
+  `.claude/workflows/` holds two kinds of script, split by filename prefix:
+
+  - **MoAI-shipped generic fan-out** — `plan-research-fanout.js`, `sync-audit-4dim.js`, and `codemaps-extract.js` ship with the template and **are** template-managed. `moai update` **overwrites** their local copies, so a local edit to one of them is lost on the next update; edit the template source instead. These are the scripts the plan / run / sync / codemaps workflow docs reference behind a capability gate.
+  - **User-owned Runner Workflows** — the `hns-*` and `harness-*` prefixes are **not template-managed**. MoAI never ships them, and `moai update` preserves whatever the user has authored there.
 - **Plan / provider availability**: dynamic workflows require a paid plan and are available on the Claude API, Amazon Bedrock, Google Vertex AI, and Microsoft Foundry; on the Pro plan the feature is enabled via `/config`.
 
 ## Purpose-driven model+effort selection
 
 The dynamic workflow `agent()` primitive accepts an opts object `{model, effort, agentType, isolation, phase, schema, label}` (per `https://code.claude.com/docs/en/workflows`). Omitting `model` inherits the main-loop model; omitting `effort` inherits the session effort. Because a paste-ready resume message's `ultrathink.` opener commonly leaves the session at `xhigh`, a workflow `agent()` call that omits `effort` silently runs every spawned agent at `xhigh` — including mechanical read-only extraction, which the official guidance recommends at `low`. That silent inheritance is a cost leak.
 
-[ZONE:Evolvable] [HARD] When a `.claude/workflows/*.js` script invokes `agent()`, the script author SHALL set `effort` explicitly per the purpose taxonomy below rather than inheriting the session default. Set `model` explicitly only when the purpose demands a specific tier (haiku for mechanical extraction; opus for deep architectural reasoning); otherwise omit it to inherit the main-loop model.
+[ZONE:Evolvable] [HARD] When a `.claude/workflows/*.js` script invokes `agent()`, the script author SHALL set `effort` explicitly per the purpose taxonomy below rather than inheriting the session default. Set `model` explicitly only when the purpose demands a specific tier (sonnet with `effort: low` for mechanical extraction; opus for deep architectural reasoning); otherwise omit it to inherit the main-loop model.
 
 The official effort levels are `low`, `medium`, `high` (default), `xhigh`, `max` (`https://platform.claude.com/docs/en/build-with-claude/effort`). The taxonomy below maps each workflow-agent purpose to a recommended `(model, effort)`.
 
-> **Config surface.** The `workflow_agents:` block in `.moai/config/sections/workflow.yaml` is the SSOT for these per-purpose `(model, effort)` DEFAULTS — the web console and tooling read/write that block, and per-script literals in `.claude/workflows/*.js` remain overrides that win over the config defaults. Values are validated against the closed sets above (model: inherit/haiku/sonnet/opus; effort: low/medium/high/xhigh/max).
+> **Config surface.** The `workflow_agents:` block in `.moai/config/sections/workflow.yaml` is the SSOT for these per-purpose `(model, effort)` DEFAULTS — the web console and tooling read/write that block, and per-script literals in `.claude/workflows/*.js` remain overrides that win over the config defaults. Values are validated against the closed sets above (model: inherit/sonnet/opus; effort: low/medium/high/xhigh/max — the Go validator additionally tolerates a retired legacy model value for backward compatibility).
 
 | Purpose | Example surfaces | Recommended model | Recommended effort | Official citation |
 |---------|------------------|-------------------|--------------------|-------------------|
-| **read-only-extract** | per-package dep-graph + public-surface extraction; mechanical AST/grep sweeps | haiku | **low** | "`low` — Simpler tasks that need the best speed and lowest costs, such as subagents" |
+| **read-only-extract** | per-package dep-graph + public-surface extraction; mechanical AST/grep sweeps | sonnet | **low** | "`low` — Simpler tasks that need the best speed and lowest costs, such as subagents" |
 | **mechanical-transform** | large migrations (call-site rename, API shape change); mechanical refactors | sonnet | **medium** | "`medium` — Balanced reasoning for general tasks" |
 | **synthesize** | architectural synthesis layered on deterministic extraction; multi-source research synthesis | sonnet | **high** | "`high` — Most tasks; good balance of quality and speed" |
 | **research** | cross-checked research with adversarial voting; deep single-topic investigation | sonnet or opus | **high** or **xhigh** | research effort should scale with claim density the research must adjudicate (project-internal heuristic, not a verbatim prescription) |
@@ -128,15 +164,15 @@ Validated patterns from MoAI dynamic-workflow pilots — each entry records the 
 
 **When to use**: high-count codebase codemaps where architecture INSIGHT beyond mechanical extraction is wanted AND parallel speed matters. **When NOT to use**: pure dependency-graph / public-surface extraction (use the deterministic `go list -deps -json` + `go doc` path), or small scale (use a single sub-agent).
 
-**Artifact**: the validated script lives in the local, user-owned `.claude/workflows/` directory (not template-managed, per the statement above).
+**Artifact**: `codemaps-extract.js` is one of the MoAI-shipped generic fan-out scripts under `.claude/workflows/` — template-managed, so `moai update` overwrites the local copy (see the Saved workflows note above). A user's own validated scripts sit alongside it under the user-owned `hns-*` / `harness-*` prefixes and stay untouched by updates.
 
 ## Cross-references
 
 - https://code.claude.com/docs/en/workflows — canonical Claude Code workflows documentation
 - `.claude/rules/moai/core/moai-constitution.md` § Parallel Execution — orchestration primitive selection
-- `.claude/rules/moai/workflow/orchestration-mode-selection.md` §C.1 — Agent Teams static layer (RETIRED; Mode 3 `agent-team` tombstone)
+- `.claude/rules/moai/workflow/orchestration-mode-selection.md` §C.1 — Agent Teams layer (experimental, re-allowed; agent-team `agent-team`)
 - `.claude/rules/moai/core/agent-common-protocol.md` § User Interaction Boundary — AskUserQuestion asymmetry (applies to workflow agents)
-- `.claude/rules/moai/workflow/goal-directive.md` — `/goal` autonomous-continuation primitive (complementary)
+- `.claude/rules/moai/workflow/goal-directive.md` — `/moai goal` autonomous-continuation primitive (complementary)
 
 ---
 

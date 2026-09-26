@@ -14,7 +14,7 @@ metadata:
 
 #### Step 3.0: Detect Git Workflow Strategy
 
-Read `github.git_workflow` from `.moai/config/sections/system.yaml`. This determines how changes are delivered.
+Read `github.spec_git_workflow` from `.moai/config/sections/system.yaml`. This determines how changes are delivered.
 
 | Strategy | Branch Model | PR Behavior | Best For |
 |----------|-------------|-------------|----------|
@@ -24,9 +24,9 @@ Read `github.git_workflow` from `.moai/config/sections/system.yaml`. This determ
 
 Default strategy (if not configured): `github_flow`
 
-Also read `github.spec_git_workflow` to determine SPEC branch handling:
+The same `github.spec_git_workflow` key also determines SPEC branch handling:
 - `feature_branch`: Each SPEC gets its own branch (recommended for github_flow/gitflow)
-- `main_direct`: SPEC changes committed to current branch (only when git_workflow is main_direct)
+- `main_direct`: SPEC changes committed to current branch (only when spec_git_workflow is main_direct)
 
 #### Step 3.1: Commit Changes
 
@@ -212,7 +212,7 @@ Pass CI mirror results to Step 3.2 for inclusion in the PR body:
 
 #### Step 3.2: Push and Deliver (Strategy-Aware)
 
-Behavior varies based on `github.git_workflow` setting and current branch context.
+Behavior varies based on `github.spec_git_workflow` setting and current branch context.
 
 **Base Branch Resolution** (applies to all strategies below):
 1. Read `git_strategy.mode` from `.moai/config/sections/git-strategy.yaml`
@@ -236,7 +236,6 @@ Detect current branch:
    - Labels: auto-detected from changed files
 4. If PR exists: Update with comment summarizing sync changes
 5. Display PR URL to user
-6. After `gh pr create` success: invoke `Skill("moai-workflow-ci-loop")` to start the CI watch + auto-fix loop (HARD invocation contracts per `.claude/rules/moai/workflow/ci-watch-protocol.md` + `.claude/rules/moai/workflow/ci-autofix-protocol.md`; the sync delegation skill per `.moai/config/sections/delegation.yaml`).
 
 **Main branch** (direct commit):
 - Push directly: `git push origin {main_branch}`
@@ -414,7 +413,7 @@ All of the following must be verified:
 - Phase 10: Coverage analysis completed (measurement, gap analysis, test generation, verification)
 - Phase 11: Prerequisites verified, project analyzed, divergence analysis completed, sync plan approved by user
 - Phase 12: Safety backup created and verified, documents synchronized, SPEC documents updated per lifecycle level, project documents updated (if applicable), quality verified, SPEC status updated
-- Phase 13: Changes committed, local CI mirror validated (Step 3.1.5: vet + test-race + lint + cross-compile — Windows skipped), delivered per git_workflow strategy (PR created for github_flow/gitflow, direct push for main_direct), auto-merge executed (if flagged and PR exists)
+- Phase 13: Changes committed, local CI mirror validated (Step 3.1.5: vet + test-race + lint + cross-compile — Windows skipped), delivered per spec_git_workflow strategy (PR created for github_flow/gitflow, direct push for main_direct), auto-merge executed (if flagged and PR exists)
 - Phase 14: Completion report displayed with delivery result, appropriate next steps presented based on strategy and context
 
 ---
@@ -451,19 +450,8 @@ All of the following must be verified:
 
 ---
 
-## Related Skills
-
-정적 routing:
-
-- **moai-workflow-ci-loop** — Phase 14 (`gh pr create`) 성공 후 CI watch + auto-fix loop을 자동 호출하는 skill. HARD invocation contracts: `.claude/rules/moai/workflow/ci-watch-protocol.md` + `.claude/rules/moai/workflow/ci-autofix-protocol.md`. 30s polling, 30분 hard timeout, required vs auxiliary check 분류 후 ready-to-merge handoff 또는 max 3-iteration auto-fix 시도, semantic 실패는 즉시 escalation.
-
-이 skill은 `auto` 모드 sync에서 PR 생성 직후 무조건 호출되며, invocation contract에 따라 orchestrator가 다음을 보장한다: gh 인증 확인 → `.github/required-checks.yml` 존재 확인 → 양의 정수 PR 번호 → 90s 이내 활성 watch 부재.
-
----
-
-Version: 3.8.0
-Updated: 2026-05-17
-Changes: Added test scenarios (3.7.0) + Related Skills section (3.8.0) + consolidated moai-workflow-ci-watch reference to moai-workflow-ci-loop per the skill consolidation policy (3.9.0).
+Version: 4.0.0
+Changes: Added test scenarios (3.7.0) + Related Skills section (3.8.0) + removed the Related Skills CI watch/auto-fix routing entry (4.0.0 — the CI watch loop is not part of the distributed toolchain).
 
 ---
 

@@ -231,7 +231,7 @@ The orchestrator composes the domain instructions inline at delegation time rath
 
 ### When to Author a Static Agent File Instead
 
-Reserve `.claude/agents/*.md` static files for agents meeting Anthropic's "keep spawning the same kind of worker with the same instructions" criterion. The 10 MoAI-custom retained agents (`manager-spec`, `manager-develop`, `manager-design`, `manager-docs`, `manager-git`, `plan-auditor`, `sync-auditor`, `super-advisor`, `builder-harness`, `e2e-tester`) all satisfy this criterion via recurring SPEC-phase invocations. Domain-specific work that does NOT recur with identical instructions across SPEC sessions belongs in per-spawn pattern, not in a static file.
+Reserve `.claude/agents/*.md` static files for agents meeting Anthropic's "keep spawning the same kind of worker with the same instructions" criterion. The 11 MoAI-custom retained agents (`manager-spec`, `manager-develop`, `manager-design`, `manager-docs`, `manager-git`, `plan-auditor`, `sync-auditor`, `super-advisor`, `builder-harness`, `e2e-tester`, `manager-lead`) all satisfy this criterion via recurring SPEC-phase invocations. Domain-specific work that does NOT recur with identical instructions across SPEC sessions belongs in per-spawn pattern, not in a static file.
 
 See `.claude/rules/moai/development/agent-authoring.md` § Static Agent File vs Per-Spawn Specialization Decision Tree for the authoring decision tree.
 
@@ -266,7 +266,7 @@ Agent(subagent_type: "Explore", prompt: "<investigation task description>")
 
 ## Orchestrator 4-Loop Mechanism → Catalog Mapping
 
-The MoAI orchestrator operates a 4-Loop mechanism (plan → decompose → direct → collect) that maps each loop step to specific 11-agent catalog roles. This mapping is the architectural rationale for the catalog composition (per SPEC-AGENT-ARCH-V2-001 SSOT §03/§06 M4).
+The MoAI orchestrator operates a 4-Loop mechanism (plan → decompose → direct → collect) that maps each loop step to specific 12-agent catalog roles. This mapping is the architectural rationale for the catalog composition (per SPEC-AGENT-ARCH-V2-001 SSOT §03/§06 M4).
 
 | Loop step | Korean | Catalog roles invoked | Example |
 |-----------|--------|----------------------|---------|
@@ -299,7 +299,7 @@ The v2 agent architecture (SPEC-AGENT-ARCH-V2-001) explicitly rejected 4 alterna
 
 **Rejected approach**: Pin concrete model IDs (e.g., `model: opus`) in agent frontmatter to control per-agent model selection at the file level.
 
-**Why rejected**: The `[1m]` entitlement inheritance bug (Anthropic issues #45847 / #51060 / #36670) — a frontmatter model pin breaks `[1m]` entitlement flow from the parent session, causing spawn failures. The v2 design uses `model: inherit` (all 10 MoAI-custom agents) + per-spawn runtime-arg injection for tier-dependent model selection instead. See `.claude/rules/moai/development/model-policy.md` § Inherit-by-Default Convention.
+**Why rejected**: The `[1m]` entitlement inheritance bug (Anthropic issues #45847 / #51060 / #36670) — a frontmatter model pin breaks `[1m]` entitlement flow from the parent session, causing spawn failures. The v2 design uses `model: inherit` (all 11 MoAI-custom agents) + per-spawn runtime-arg injection for tier-dependent model selection instead. See `.claude/rules/moai/development/model-policy.md` § Inherit-by-Default Convention.
 
 ### 4. Time-루프 에이전트 (Time-loop Agent)
 
@@ -311,7 +311,7 @@ The v2 agent architecture (SPEC-AGENT-ARCH-V2-001) explicitly rejected 4 alterna
 
 ## Deprecated: Hierarchical Manager Chain Pattern
 
-The `manager-strategy → manager-develop` hierarchical chain pattern (previously documented as a viable Pattern 6 Hierarchical Delegation variant for MoAI workflows) is **deprecated** under the current agent catalog policy. Subagent nesting DOES exist upstream as of Claude Code v2.1.172 — a subagent can spawn nested subagents when the `Agent` tool is present in its `tools` list. MoAI nonetheless disallows this chain **by configuration and catalog policy**: the retained agents omit the `Agent` tool from their `tools` lists, so no retained MoAI sub-agent can spawn another, and the catalog mandates that all multi-agent coordination happen at the orchestrator (L1) level. The `manager-strategy → manager-develop` chain is therefore disallowed in MoAI, not because runtime nesting is impossible, but because MoAI deliberately withholds the `Agent` tool from sub-agents.
+The `manager-strategy → manager-develop` hierarchical chain pattern (documented earlier as a viable Pattern 6 Hierarchical Delegation variant for MoAI workflows) is **deprecated** under the current agent catalog policy. Subagent nesting was introduced upstream in Claude Code v2.1.172; as of v2.1.219 it is enabled by default (changelog: up to depth 3; `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1` disables — the brief v2.1.217–2.1.218 default-off state was reversed). MoAI disallows this chain **by configuration and catalog policy**: the retained agents omit the `Agent` tool from their `tools` lists — the sole flat-hierarchy guarantee — so no retained MoAI sub-agent can spawn another, and the catalog mandates that all multi-agent coordination happen at the orchestrator (L1) level. The former `sync-auditor` read-only nesting pilot is retired (its env-default-off safety premise no longer holds on v2.1.219+). The `manager-strategy → manager-develop` chain is therefore disallowed in MoAI, not because runtime nesting is impossible, but because MoAI deliberately withholds the `Agent` tool from sub-agents.
 
 All multi-agent coordination MUST happen at the **orchestrator (L1) level** in the main conversation. The retained agent catalog respects this constraint: all retained sub-agents are leaves of the L1 orchestrator, never branches that recurse into further sub-agent spawns.
 

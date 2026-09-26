@@ -30,9 +30,11 @@ The genuine Claude Code `/config` slash command (distinct from MoAI's `.moai`-pr
 
 ### MCP Configuration
 
-MoAI-ADK no longer ships or provisions MCP servers via `.mcp.json`. Users may still configure Claude Code's native MCP support directly — see the official Claude Code MCP documentation. The GLM-backend z.ai web-tooling servers (`zai-mcp-server`, `web_search_prime`, `web_reader`) remain available via `moai glm tools enable` under a GLM session; see `.claude/rules/moai/core/glm-web-tooling.md` for the HARD routing table.
+MoAI-ADK provisions a neutral MCP surface via a template-managed `.mcp.json` (project scope) or `~/.claude.json` (user scope). The distributed default ships exactly ONE active entry — the self-hosted `moai` local stdio server (`moai mcp-server`), provisioned default-on by `moai init` (a fresh project receives it; an explicit decline is honored silently). Four documented-but-disabled entries (`context7`, `chrome-devtools`, `playwright`, `ast-grep`) are activated via `moai mcp add <name> ...`. The contract is "no entry THAT CARRIES SECRETS, requires credentials, or fails the neutrality check" — secret-free neutral surfaces are permitted, while the load-bearing secret-hygiene invariant holds absolutely (every env value is a `${VAR}` literal expanded by the Claude Code runtime; resolved secrets are NEVER serialized into a git-tracked `.mcp.json`).
 
-> Sequential Thinking MCP was retired in an earlier deep-reasoning consolidation. Use the `ultrathink` keyword (Adaptive Thinking on Opus 4.7+ / 4.8) for deep reasoning.
+The generic `moai mcp add|remove|list` CLI manages third-party entries via the SAME atomic-RMW seam the GLM tools CLI uses (flock + compare-retry + backup-before-publish + idempotent-skip); users NEVER hand-edit `.mcp.json`. Authenticated HTTP servers (z.ai, Semgrep, Sentry) keep their `${VAR}`-literal env-expansion pattern; the GLM-backend z.ai web-tooling servers (`zai-mcp-server`, `web_search_prime`, `web_reader`) remain available via `moai glm tools enable` under a GLM session (see `.claude/rules/moai/core/glm-web-tooling.md` for the HARD routing table). Users may also configure Claude Code's native MCP support directly — see the official Claude Code MCP documentation.
+
+> Sequential Thinking MCP was retired in an earlier deep-reasoning consolidation. Use the `ultrathink` keyword (Adaptive Thinking on Opus 4.7+, including Opus 5 and 4.8) for deep reasoning.
 
 **`alwaysLoad` field (Claude Code v2.1.119+)** — Claude Code supports an `"alwaysLoad": true` field on MCP server entries in a user-authored `.mcp.json`; when set, the server's tool schema loads at session start instead of via the deferred-load default. This is a Claude Code platform feature documented for reference; MoAI-ADK does not emit it from its own templates.
 
@@ -54,6 +56,7 @@ MCP tools (when a user configures their own `.mcp.json`) are deferred by default
 | `requiredMinimumVersion` | v2.1.163+ | Managed | Hard version-gate — Claude Code refuses to start when its version is below the floor. An org/admin decision, parallel to the `disableWorkflows` stance. Distinct from the older advisory `minimumVersion`. |
 | `requiredMaximumVersion` | v2.1.163+ | Managed | Hard version-ceiling — refuses to start above the cap. Likewise an org/admin decision. |
 | `effortLevel` | v2.1.110+ | User/Project/Local | Intentionally NOT shipped in `settings.json.tmpl`. Per-session effort is controlled by the `ultrathink` keyword or the `CLAUDE_CODE_EFFORT_LEVEL` environment variable; pinning a fixed high effort level project-wide would force elevated token cost on every user session. |
+| `workflowSizeGuideline` | v2.1.219+ | Any settings file | Sets the advisory Dynamic workflow size guideline (`small` / `medium` / `large` / `unrestricted`; default `medium` — aim for fewer than 15 agents); the `/config` row is hidden while one is set. MoAI does not pin a size — the choice is left to the user/org (see `.claude/rules/moai/workflow/dynamic-workflows.md`). |
 
 Reference: https://code.claude.com/docs/en/settings.
 
@@ -65,13 +68,13 @@ Reference: https://code.claude.com/docs/en/settings.
 - Architecture decisions
 - Technology trade-off analysis
 
-Use the `ultrathink` keyword in user prompts to activate Adaptive Thinking (Opus 4.7+ / 4.8). This is the canonical deep-reasoning path; Sequential Thinking MCP was retired in an earlier consolidation.
+Use the `ultrathink` keyword in user prompts to activate Adaptive Thinking (Opus 4.7+, including Opus 5 and 4.8). This is the canonical deep-reasoning path; Sequential Thinking MCP was retired in an earlier consolidation.
 
 ### MoAI Configuration
 
 `.moai/config/` - MoAI-specific settings:
 
-- config.yaml: Main configuration
+- sections/*.yaml: Section-file family — the configuration SSOT (no aggregate config.yaml file exists)
 - sections/quality.yaml: Quality gates, coverage targets
 - sections/language.yaml: Language preferences
 - sections/user.yaml: User information
@@ -95,7 +98,6 @@ Loads the following 15 sections in fixed order. All return defaults on absent fi
 | state.yaml | `state` | `cfg.State` |
 | workflow.yaml | `workflow` | `cfg.Workflow` |
 | statusline.yaml | `statusline` | `cfg.Statusline` |
-| research.yaml | `research` | `cfg.Research` |
 | constitution.yaml | `constitution` | `cfg.Constitution` |
 | context.yaml | `context_search` | `cfg.ContextSearch` |
 | interview.yaml | `interview` | `cfg.Interview` |
@@ -120,6 +122,15 @@ Loads the following 15 sections in fixed order. All return defaults on absent fi
 
 - `YAML_SECTION_NO_LOADER` (`audit_loader_completeness_test.go:TestAuditLoaderCompleteness`): fails if a new `.moai/config/sections/*.yaml` file has no loader and is not in the acknowledged allowlist.
 - `CONFIG_STRUCT_YAML_MISMATCH` (`audit_struct_yaml_symmetry_test.go:TestStructYAMLSymmetry_*`): fails if a Go struct field lacks a matching YAML key or vice versa.
+
+**Acknowledged config orphans** (single documented inventory): the following section
+files currently have no doc cross-references and/or no `Loader.Load()` consumer and are
+acknowledged as-is — `security.yaml`, `observability.yaml`, `report.yaml`, `sunset.yaml`
+(DORMANT by design), `archive.yaml`, `cache.yaml` (dedicated `LoadCacheConfig`),
+`feedback.yaml`, `project.yaml`. Maintainer-only surfaces (`tool-policy.yaml`,
+`mcp-matrix.yaml`) are not distributed to user projects; `lsp.yaml` is the LSP-gate
+threshold SSOT referenced from CLAUDE.md §6. The Go-side registry of these dispositions
+is `internal/config/audit_registry.go` + the loader-completeness allowlist.
 
 **Adding a new YAML section** (5-step procedure):
 1. Add `<name>.yaml` to `internal/template/templates/.moai/config/sections/`
@@ -212,18 +223,14 @@ Language preferences in language.yaml:
 - agent_prompt_language: Internal communication
 - code_comments: Code comment language
 
-## Agent Teams Settings — RETIRED
+## Agent Teams Settings — Re-allowed (experimental)
 
-The MoAI Agent Teams static-orchestration layer is RETIRED. The former Teams-API
-experimental env-var gate, the `workflow.team` config block, and the team
-auto-selection thresholds were removed with it. A forced `--mode team` emits
-`MODE_TEAM_UNAVAILABLE` and falls back to sub-agent mode. The Phase 4
-auto-select thresholds (≥ 3 domains / ≥ 10 files / score ≥ 7) now live as
-prose-only SSOT in
-`.claude/rules/moai/workflow/orchestration-mode-selection.md` §B.1.
+Agent Teams usage is ALLOWED as an experimental surface (operator decision): the env-var gate `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` ships enabled in `.claude/settings.json` and the distributed template, and a `--team` / `--mode team` request selects the Agent Teams layer (constraints per `orchestration-mode-selection.md` §C.1). Genealogy: the static layer was previously RETIRED (the former Teams-API gate, `workflow.team` config block, and team auto-selection thresholds were removed; a forced `--mode team` emitted `MODE_TEAM_UNAVAILABLE` and fell back — the sentinel is retained as documented history). The Phase 4
+auto-select thresholds (≥ 3 domains / ≥ 10 files / score ≥ 7) remain prose-only SSOT in
+`.claude/rules/moai/workflow/orchestration-mode-selection.md` §B.1 (no team auto-selection was reinstated).
 
 The native Claude Code teammate runtime (`moai cg` GLM teammate panes,
-`worktree --team` launch) is unaffected — see
+`moai cc -w <name> --spawn` teammate windows) is unaffected and sanctioned — see
 `.claude/rules/moai/core/glm-web-tooling.md` § CG Mode.
 
 ## Output Style Configuration

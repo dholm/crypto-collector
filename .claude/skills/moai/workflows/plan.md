@@ -40,7 +40,7 @@ Cross-reference: per-SPEC Phase 1 SKIP rationale recorded at `.moai/specs/SPEC-{
 
 ## Purpose
 
-Create comprehensive SPEC documents using **GEARS notation** (Generalized EARS — the canonical SPEC authoring form as of v3.0.0) as the first step of the Plan-Run-Sync workflow. EARS notation is retained as the explicit 6-month backward-compatibility legacy reference for the 88 pre-v3 SPECs (legacy window expires 2026-11-22 per the canonical GEARS migration policy). Handles project exploration, SPEC file generation, validation, and optional Git environment setup with worktree or branch creation.
+Create comprehensive SPEC documents using **GEARS notation** (Generalized EARS — the canonical SPEC authoring form as of v3.0.0) as the first step of the Plan-Run-Sync workflow. EARS notation is retained as the explicit 6-month backward-compatibility legacy reference for pre-v3 SPECs (see the canonical GEARS migration policy for the backward-compatibility window). Handles project exploration, SPEC file generation, validation, and optional Git environment setup with worktree or branch creation.
 
 Canonical GEARS authoring guide: `.claude/skills/moai-workflow-spec/SKILL.md` § GEARS Format.
 
@@ -83,7 +83,6 @@ Constraints: 10k concurrent users, 100ms read latency target
 
 | Phase / Section | Sub-skill | Description |
 |---|---|---|
-| Phase 1: Brain Proposal Detection | `plan/context-discovery.md` | Brain IDEA scan and SPEC candidate surfacing |
 | Phase 2: Project Exploration | `plan/context-discovery.md` | Explore subagent codebase analysis |
 | Phase 3: Clarity Evaluation | `plan/context-discovery.md` | Clarity scoring (1-10) and skip conditions |
 | Phase 4: Deep Interview Loop | `plan/clarity-interview.md` | 1-5 round topic-focused interview |
@@ -103,14 +102,28 @@ Constraints: 10k concurrent users, 100ms read latency target
 | Completion Criteria | `plan/spec-assembly.md` | All checklist items + audit-ready signal |
 | Test Scenarios | `plan/spec-assembly.md` | Normal/Existing Assets/Error flow examples |
 
+## Fan-Out Index
+
+Every plan-phase fan-out site, listed here rather than only at the site itself. Sub-skills are `Read` on demand, so without this index the orchestrator cannot know a fan-out exists until it has already entered the phase serially.
+
+| Fan-Out ID | Trigger condition | Target file | What is parallelised |
+|---|---|---|---|
+| `FO-PLAN-1` | the research fan-out script is on disk AND the runtime supports dynamic workflows | `workflows/plan.md` (below) | Phase 2 + Phase 6 research — lens explorers plus one synthesizer |
+| `FO-PLAN-2` | harness level is `standard` or `thorough` | `workflows/plan/spec-assembly.md` | Phase 11 review evidence — one read-only lens per review dimension |
+
+## Parallel Research Fan-Out (capability-gated)
+
+**`FO-PLAN-1`.** **Where** `.claude/workflows/plan-research-fanout.js` exists on disk **AND** the runtime supports dynamic workflows, the orchestrator shall launch it to run Phase 2 (Project Exploration) and Phase 6 (Deep Research) as a single parallel read-only sweep — three-to-four lens explorers plus one synthesizer that returns the `research.md` body as a string. **Where** either condition is absent — the script was removed, or the runtime predates dynamic-workflow support — research proceeds on the standard single-`Explore` path with no error, no warning, and no change to the produced SPEC artifact set.
+
+The orchestrator launches the script itself; this is scaling, not subagent nesting, so the flat agent hierarchy is preserved. Every lens agent is read-only and writes no file — `research.md` is persisted by `manager-spec` / the orchestrator outside the workflow. A lens with nothing to report records it under its `confidence_and_gaps` heading, and an agent missing required input returns a structured blocker report; workflow agents never prompt the user (`agent-common-protocol.md` § User Interaction Boundary). The script gathers evidence only — the binding plan-phase verdict remains owned by `plan-auditor` at Phase 11, and Decision Point 1 is neither bypassed nor auto-passed by a workflow run.
+
 ---
 
 ## Invocation Flow
 
 ```
-/moai plan [description] [--worktree|--branch] [--no-issue]
+/moai plan [description] [--branch] [--no-issue]
   └─ context-discovery.md
-       ├─ Phase 1: Brain proposal scan
        ├─ Phase 2: Explore (optional)
        └─ Phase 3: Clarity evaluation (1-10 score)
             └─ clarity-interview.md
@@ -158,7 +171,6 @@ This signal marks the plan artifacts as finalized and enables the Plan Audit Gat
 ---
 
 Version: 2.8.0
-Updated: 2026-05-25
 Changes: Added test scenarios, Phase 3 JIT Language Detection.
 
 ---
