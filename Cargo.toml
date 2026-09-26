@@ -54,10 +54,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # OpenTelemetry OTLP tracing (SPEC-OBS-001 REQ-OBS-021..024).
-opentelemetry = { version = "0.32", features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", features = ["trace", "grpc-tonic"] }
-tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.33", features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.34"
 
 # Prometheus metrics exposition (SPEC-OBS-001 REQ-OBS-010..015).
 metrics = "0.24"
@@ -69,7 +69,7 @@ axum = { version = "0.8", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["full"] }
 tower-http = { version = "0.7", features = ["trace"] }
 # Base64url encoding for opaque keyset cursors (REQ-API-070).
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
