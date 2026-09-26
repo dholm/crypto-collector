@@ -7,6 +7,7 @@
 #   target/aarch64-unknown-linux-gnu/release/crypto-collector  (cross)
 #
 # Run `make rust-build` before `make image`.
+# aarch64 is opt-in (PLATFORMS=linux/amd64,linux/arm64); the default is amd64 only.
 
 ARG TARGETARCH
 

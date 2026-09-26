@@ -2,6 +2,8 @@
 .PHONY: help build build-release check lint fmt fmt-check test image push rust-build rust-build-amd64 rust-build-arm64 clean
 
 TAG       ?= latest
+# Image platforms. aarch64 is opt-in: `make push PLATFORMS=linux/amd64,linux/arm64`.
+PLATFORMS ?= linux/amd64
 IMAGE     ?= registry.helles.farm/crypto-collector:$(TAG)
 
 # Deploy target (override for other clusters/namespaces).
@@ -65,15 +67,15 @@ rust-build-amd64: ## Compile release binary for x86_64 (native, no `cross` neede
 rust-build-arm64: ## Cross-compile release binary for aarch64 (requires `cross`)
 	cross build --release --target aarch64-unknown-linux-gnu
 
-rust-build: rust-build-amd64 rust-build-arm64 ## Compile release binaries for both platforms
+rust-build: rust-build-amd64 $(if $(findstring arm64,$(PLATFORMS)),rust-build-arm64) ## Compile release binaries for $(PLATFORMS)
 
 # ── Container image ──────────────────────────────────────────────────────────
 
-image: ## Build multiarch image (linux/amd64 + linux/arm64) into a local manifest
-	$(CONTAINER_ENGINE) build --platform linux/amd64,linux/arm64 \
+image: ## Build image for $(PLATFORMS) (default amd64) into a local manifest
+	$(CONTAINER_ENGINE) build --platform $(PLATFORMS) \
 		--manifest $(IMAGE) -f Dockerfile .
 
-push: lint test rust-build image ## Gated build of both arches, then push the multiarch manifest
+push: lint test rust-build image ## Gated build for $(PLATFORMS), then push the manifest
 	$(CONTAINER_ENGINE) manifest push --all $(IMAGE) docker://$(IMAGE)
 
 .PHONY: deploy
